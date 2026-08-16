@@ -132,6 +132,7 @@ const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER_KIND = ProviderDriverKind.make("cursor");
 const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
+export const ANTIGRAVITY_DRIVER_KIND = ProviderDriverKind.make("antigravity");
 
 export const DEFAULT_MODEL = "gpt-5.6-sol";
 
@@ -153,6 +154,7 @@ export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, strin
   [CURSOR_DRIVER_KIND]: "auto",
   [GROK_DRIVER_KIND]: "grok-build",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
+  [ANTIGRAVITY_DRIVER_KIND]: "gemini-3.7-flash-high",
 };
 
 /** Per-provider text generation model defaults. */
@@ -163,6 +165,7 @@ export const DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER: Partial<
   [CLAUDE_DRIVER_KIND]: "claude-haiku-4-5",
   [CURSOR_DRIVER_KIND]: "composer-2",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
+  [ANTIGRAVITY_DRIVER_KIND]: "gemini-3.7-flash-high",
 };
 
 export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
@@ -212,6 +215,15 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
     "opus-4.5": "claude-opus-4-5",
   },
   [OPENCODE_DRIVER_KIND]: {},
+  [ANTIGRAVITY_DRIVER_KIND]: {
+    "flash-3.7": "gemini-3.7-flash-high",
+    "flash-3.7-high": "gemini-3.7-flash-high",
+    "flash-3.7-medium": "gemini-3.7-flash-medium",
+    "flash-3.7-low": "gemini-3.7-flash-low",
+    "pro-3.1": "gemini-3.1-pro-high",
+    "gemini-3.7": "gemini-3.7-flash-high",
+    "gemini-flash": "gemini-3.7-flash-high",
+  },
 };
 
 // ── Provider display names ────────────────────────────────────────────
@@ -222,4 +234,5 @@ export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>>
   [CURSOR_DRIVER_KIND]: "Cursor",
   [GROK_DRIVER_KIND]: "Grok",
   [OPENCODE_DRIVER_KIND]: "OpenCode",
+  [ANTIGRAVITY_DRIVER_KIND]: "Antigravity",
 };
