@@ -69,7 +69,7 @@ it.layer(NodeServices.layer)("checkAntigravityProviderStatus", (it) => {
       );
       expect(snapshot.installed).toBe(false);
       expect(snapshot.status).toBe("error");
-      expect(snapshot.message).toContain("not found in PATH");
+      expect(snapshot.message).toMatch(/not found|Failed to execute/);
     }),
   );
 

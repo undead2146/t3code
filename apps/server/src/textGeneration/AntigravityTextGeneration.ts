@@ -107,10 +107,7 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
         "Failed to encode output JSON schema.",
       );
 
-      const effortOption = getModelSelectionStringOptionValue(
-        modelSelection.options,
-        "effort",
-      );
+      const effortOption = getModelSelectionStringOptionValue(modelSelection.options, "effort");
 
       const runAgyCommand = Effect.fn("runAntigravityJson.runAgyCommand")(function* () {
         const binaryPath = antigravitySettings.binaryPath || "agy";
@@ -157,7 +154,12 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
             readStreamAsString(operation, child.stderr),
             child.exitCode.pipe(
               Effect.mapError((cause) =>
-                normalizeCliError("agy", operation, cause, "Failed to read Antigravity CLI exit code"),
+                normalizeCliError(
+                  "agy",
+                  operation,
+                  cause,
+                  "Failed to read Antigravity CLI exit code",
+                ),
               ),
             ),
           ],
@@ -187,7 +189,10 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
           Option.match({
             onNone: () =>
               Effect.fail(
-                new TextGenerationError({ operation, detail: "Antigravity CLI request timed out." }),
+                new TextGenerationError({
+                  operation,
+                  detail: "Antigravity CLI request timed out.",
+                }),
               ),
             onSome: (value) => Effect.succeed(value),
           }),
@@ -199,11 +204,7 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
       try {
         parsedJson = JSON.parse(rawStdout);
         // Handle possible wrapping envelope { "structured_output": ... } or { "response": ... }
-        if (
-          parsedJson &&
-          typeof parsedJson === "object" &&
-          !Array.isArray(parsedJson)
-        ) {
+        if (parsedJson && typeof parsedJson === "object" && !Array.isArray(parsedJson)) {
           const record = parsedJson as Record<string, unknown>;
           if ("structured_output" in record) {
             parsedJson = record.structured_output;
@@ -232,33 +233,51 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
       );
     });
 
-  const generateCommitMessage: TextGeneration.TextGeneration["Service"]["generateCommitMessage"] =
-    (input) =>
-      Effect.gen(function* () {
-        const prompt = buildCommitMessagePrompt(input);
-        const result = yield* runAntigravityJson({
-          operation: "generateCommitMessage",
-          cwd: input.cwd,
-          prompt,
-          outputSchemaJson: TextGeneration.CommitMessageOutputSchema,
-          modelSelection: input.modelSelection,
-        });
-        return {
-          subject: sanitizeCommitSubject(result.subject),
-          body: result.body?.trim() ? result.body.trim() : null,
-        };
+  const generateCommitMessage: TextGeneration.TextGeneration["Service"]["generateCommitMessage"] = (
+    input,
+  ) =>
+    Effect.gen(function* () {
+      const { prompt, outputSchema } = buildCommitMessagePrompt({
+        branch: input.branch,
+        stagedSummary: input.stagedSummary,
+        stagedPatch: input.stagedPatch,
+        includeBranch: input.includeBranch === true,
+        policy: input.policy,
       });
+      const result = yield* runAntigravityJson({
+        operation: "generateCommitMessage",
+        cwd: input.cwd,
+        prompt,
+        outputSchemaJson: outputSchema,
+        modelSelection: input.modelSelection,
+      });
+      return {
+        subject: sanitizeCommitSubject(result.subject),
+        body: result.body?.trim() ? result.body.trim() : "",
+        ...("branch" in result && typeof result.branch === "string"
+          ? { branch: sanitizeFeatureBranchName(result.branch) }
+          : {}),
+      };
+    });
 
   const generatePrContent: TextGeneration.TextGeneration["Service"]["generatePrContent"] = (
     input,
   ) =>
     Effect.gen(function* () {
-      const prompt = buildPrContentPrompt(input);
+      const { prompt, outputSchema } = buildPrContentPrompt({
+        baseBranch: input.baseBranch,
+        headBranch: input.headBranch,
+        commitSummary: input.commitSummary,
+        diffSummary: input.diffSummary,
+        diffPatch: input.diffPatch,
+        policy: input.policy,
+        changeRequestTemplate: input.changeRequestTemplate,
+      });
       const result = yield* runAntigravityJson({
         operation: "generatePrContent",
         cwd: input.cwd,
         prompt,
-        outputSchemaJson: TextGeneration.PrContentOutputSchema,
+        outputSchemaJson: outputSchema,
         modelSelection: input.modelSelection,
       });
       return {
@@ -271,16 +290,19 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
     input,
   ) =>
     Effect.gen(function* () {
-      const prompt = buildBranchNamePrompt(input);
+      const { prompt, outputSchema } = buildBranchNamePrompt({
+        message: input.message,
+        attachments: input.attachments,
+      });
       const result = yield* runAntigravityJson({
         operation: "generateBranchName",
         cwd: input.cwd,
         prompt,
-        outputSchemaJson: TextGeneration.BranchNameOutputSchema,
+        outputSchemaJson: outputSchema,
         modelSelection: input.modelSelection,
       });
       return {
-        branchName: sanitizeFeatureBranchName(result.branchName),
+        branch: sanitizeBranchFragment(result.branch),
       };
     });
 
@@ -288,12 +310,16 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
     input,
   ) =>
     Effect.gen(function* () {
-      const prompt = buildThreadTitlePrompt(input);
+      const { prompt, outputSchema } = buildThreadTitlePrompt({
+        message: input.message,
+        previousTitle: input.previousTitle,
+        attachments: input.attachments,
+      });
       const result = yield* runAntigravityJson({
         operation: "generateThreadTitle",
         cwd: input.cwd,
         prompt,
-        outputSchemaJson: TextGeneration.ThreadTitleOutputSchema,
+        outputSchemaJson: outputSchema,
         modelSelection: input.modelSelection,
       });
       return {

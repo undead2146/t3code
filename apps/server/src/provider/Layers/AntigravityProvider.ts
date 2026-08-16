@@ -12,10 +12,11 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import { HttpClient } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import { createModelCapabilities, buildSelectOptionDescriptor } from "@t3tools/shared/model";
+import { createModelCapabilities } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
 import {
+  buildSelectOptionDescriptor,
   buildServerProvider,
   isCommandMissingCause,
   parseGenericCliVersion,
@@ -120,7 +121,13 @@ export function parseAntigravityModelsOutput(output: string): ReadonlyArray<Serv
 
   for (const line of lines) {
     const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("⠋") || trimmed.startsWith("⠙") || trimmed.startsWith("⠹") || trimmed.startsWith("Fetching")) {
+    if (
+      !trimmed ||
+      trimmed.startsWith("⠋") ||
+      trimmed.startsWith("⠙") ||
+      trimmed.startsWith("⠹") ||
+      trimmed.startsWith("Fetching")
+    ) {
       continue;
     }
 
@@ -209,10 +216,13 @@ export function checkAntigravityProviderStatus(
     const versionSpawn = yield* resolveSpawnCommand(binaryPath, ["--version"], {
       env: resolvedEnv,
     });
-    const versionResult = yield* spawnAndCollect(versionSpawn, {
-      env: resolvedEnv,
-      timeoutMs: VERSION_PROBE_TIMEOUT_MS,
-    }).pipe(Effect.exit);
+    const versionResult = yield* spawnAndCollect(
+      binaryPath,
+      ChildProcess.make(versionSpawn.command, versionSpawn.args, {
+        env: resolvedEnv,
+        shell: versionSpawn.shell,
+      }),
+    ).pipe(Effect.exit);
 
     if (versionResult._tag === "Failure") {
       const isMissing = isCommandMissingCause(versionResult.cause);
@@ -233,20 +243,23 @@ export function checkAntigravityProviderStatus(
       });
     }
 
-    const { stdout, exitCode } = versionResult.value;
-    const parsedVersion = parseGenericCliVersion(stdout) ?? (exitCode === 0 ? "installed" : null);
+    const { stdout, code } = versionResult.value;
+    const parsedVersion = parseGenericCliVersion(stdout) ?? (code === 0 ? "installed" : null);
 
     // 2. Probe models via `agy models`
     let dynamicModels = DEFAULT_ANTIGRAVITY_MODELS;
     const modelsSpawn = yield* resolveSpawnCommand(binaryPath, ["models"], {
       env: resolvedEnv,
     });
-    const modelsResult = yield* spawnAndCollect(modelsSpawn, {
-      env: resolvedEnv,
-      timeoutMs: MODELS_PROBE_TIMEOUT_MS,
-    }).pipe(Effect.exit);
+    const modelsResult = yield* spawnAndCollect(
+      binaryPath,
+      ChildProcess.make(modelsSpawn.command, modelsSpawn.args, {
+        env: resolvedEnv,
+        shell: modelsSpawn.shell,
+      }),
+    ).pipe(Effect.exit);
 
-    if (modelsResult._tag === "Success" && modelsResult.value.exitCode === 0) {
+    if (modelsResult._tag === "Success" && modelsResult.value.code === 0) {
       const parsed = parseAntigravityModelsOutput(modelsResult.value.stdout);
       if (parsed.length > 0) {
         dynamicModels = parsed;
@@ -267,9 +280,9 @@ export function checkAntigravityProviderStatus(
       probe: {
         installed: true,
         version: parsedVersion,
-        status: exitCode === 0 ? "ready" : "warning",
+        status: code === 0 ? "ready" : "warning",
         auth: { status: "authenticated" },
-        message: exitCode === 0 ? undefined : "Antigravity CLI returned non-zero version check.",
+        message: code === 0 ? undefined : "Antigravity CLI returned non-zero version check.",
       },
     });
   });
