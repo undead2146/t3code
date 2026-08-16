@@ -121,13 +121,17 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
       );
 
       const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
-      const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<AntigravitySettings>>({
+      const snapshot = yield* makeManagedServerProvider<
+        ProviderSnapshotSettings<AntigravitySettings>
+      >({
         maintenanceCapabilities,
         getSettings: snapshotSettings.getSettings,
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
         initialSnapshot: (settings) =>
-          buildInitialAntigravityProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
+          buildInitialAntigravityProviderSnapshot(settings.provider).pipe(
+            Effect.map(stampIdentity),
+          ),
         checkProvider,
         enrichSnapshot: ({ settings, snapshot: currentSnapshot, publishSnapshot }) =>
           enrichAntigravitySnapshot({
@@ -143,7 +147,7 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
             new ProviderDriverError({
               driver: DRIVER_KIND,
               instanceId,
-              detail: `Failed to build Antigravity snapshot: ${cause.message ?? String(cause)}`,
+              detail: "Failed to build the Antigravity provider snapshot.",
               cause,
             }),
         ),

@@ -112,9 +112,6 @@ export const FontFamilyPreference = Schema.String.check(Schema.isMaxLength(200))
 export type FontFamilyPreference = typeof FontFamilyPreference.Type;
 
 export const ClientSettingsSchema = Schema.Struct({
-  // Desktop-only: require holding the quit shortcut (Cmd/Ctrl+Q) before the
-  // app quits; a quick tap only shows a hint. Browser clients ignore it.
-  confirmQuit: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   confirmThreadArchive: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   confirmThreadDelete: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   dismissedProviderUpdateNotificationKeys: Schema.Array(TrimmedNonEmptyString).pipe(
@@ -484,28 +481,45 @@ export const AntigravitySettings = makeProviderSettingsSchema(
     binaryPath: makeBinaryPathSetting("agy").pipe(
       Schema.annotateKey({
         title: "Binary path",
-        description: "Path to the Antigravity CLI binary (agy).",
-        providerSettingsForm: { placeholder: "agy", clearWhenEmpty: "omit" },
-      }),
-    ),
-    homePath: TrimmedString.pipe(
-      Schema.withDecodingDefault(Effect.succeed("")),
-      Schema.annotateKey({
-        title: "Home directory",
-        description: "Override directory containing ~/.gemini/antigravity-cli.",
+        description: "Path to the Antigravity (agy) binary.",
         providerSettingsForm: {
-          placeholder: "Defaults to ~/.gemini/antigravity-cli",
+          placeholder: "agy",
           clearWhenEmpty: "omit",
         },
       }),
     ),
-    launchArgs: Schema.String.pipe(
+    dangerouslySkipPermissions: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(true)),
+      Schema.annotateKey({
+        title: "Skip permissions",
+        description: "Auto-approve all tool permission requests without prompting.",
+      }),
+    ),
+    effort: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("high")),
+      Schema.annotateKey({
+        title: "Reasoning effort",
+        description: "Reasoning effort for CLI sessions (low, medium, high).",
+      }),
+    ),
+    accountEmail: TrimmedString.pipe(
       Schema.withDecodingDefault(Effect.succeed("")),
       Schema.annotateKey({
-        title: "Launch arguments",
-        description: "Additional CLI arguments passed on session start.",
+        title: "Account email",
+        description: "Account email displayed in status cards. Defaults to detected user account.",
         providerSettingsForm: {
-          placeholder: "e.g. --dangerously-skip-permissions",
+          placeholder: "user@example.com",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    subscriptionLabel: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("Gemini Pro Subscription")),
+      Schema.annotateKey({
+        title: "Subscription label",
+        description: "Subscription tier label displayed in status cards.",
+        providerSettingsForm: {
+          placeholder: "Gemini Pro Subscription",
           clearWhenEmpty: "omit",
         },
       }),
@@ -516,7 +530,13 @@ export const AntigravitySettings = makeProviderSettingsSchema(
     ),
   },
   {
-    order: ["binaryPath", "homePath", "launchArgs"],
+    order: [
+      "binaryPath",
+      "accountEmail",
+      "subscriptionLabel",
+      "effort",
+      "dangerouslySkipPermissions",
+    ],
   },
 );
 export type AntigravitySettings = typeof AntigravitySettings.Type;
@@ -755,6 +775,16 @@ const OpenCodeSettingsPatch = Schema.Struct({
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 
+const AntigravitySettingsPatch = Schema.Struct({
+  enabled: Schema.optionalKey(Schema.Boolean),
+  binaryPath: Schema.optionalKey(TrimmedString),
+  dangerouslySkipPermissions: Schema.optionalKey(Schema.Boolean),
+  effort: Schema.optionalKey(TrimmedString),
+  accountEmail: Schema.optionalKey(TrimmedString),
+  subscriptionLabel: Schema.optionalKey(TrimmedString),
+  customModels: Schema.optionalKey(Schema.Array(Schema.String)),
+});
+
 export const ServerSettingsPatch = Schema.Struct({
   // Server settings
   enableLegacyTokenStreaming: Schema.optionalKey(Schema.Boolean),
@@ -795,6 +825,7 @@ export const ServerSettingsPatch = Schema.Struct({
       cursor: Schema.optionalKey(CursorSettingsPatch),
       grok: Schema.optionalKey(GrokSettingsPatch),
       opencode: Schema.optionalKey(OpenCodeSettingsPatch),
+      antigravity: Schema.optionalKey(AntigravitySettingsPatch),
     }),
   ),
   // Whole-map replacement for the new instance config. Patching individual
@@ -806,7 +837,6 @@ export const ServerSettingsPatch = Schema.Struct({
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 
 export const ClientSettingsPatch = Schema.Struct({
-  confirmQuit: Schema.optionalKey(Schema.Boolean),
   confirmThreadArchive: Schema.optionalKey(Schema.Boolean),
   confirmThreadDelete: Schema.optionalKey(Schema.Boolean),
   diffIgnoreWhitespace: Schema.optionalKey(Schema.Boolean),
