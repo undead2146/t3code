@@ -85,7 +85,7 @@ it.layer(NodeServices.layer)("makeAntigravityAdapter", (it) => {
       const threadId = ThreadId.make("thread-turn-test");
       yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
 
-      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 5).pipe(
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 6).pipe(
         Stream.runCollect,
         Effect.forkChild,
       );

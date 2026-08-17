@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -134,7 +135,7 @@ export function makeAntigravityAdapter(
     const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("antigravity");
     const sessions = new Map<ThreadId, AntigravitySessionContext>();
     const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
-    const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+    const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
 
     const getThreadSemaphore = (threadId: string) =>
       SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
@@ -158,7 +159,7 @@ export function makeAntigravityAdapter(
       Effect.flatMap(getThreadSemaphore(threadId), (semaphore) => semaphore.withPermit(effect));
 
     const publishEvent = (event: ProviderRuntimeEvent) =>
-      PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
+      Queue.offer(runtimeEventQueue, event).pipe(Effect.asVoid);
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -369,9 +370,6 @@ export function makeAntigravityAdapter(
             cwd: ctx.cwd,
             env: processEnv,
             shell: spawnCommand.shell,
-            stdin: {
-              stream: Stream.empty,
-            },
           });
 
           const processHandle = yield* childProcessSpawner.spawn(command).pipe(
@@ -422,7 +420,7 @@ export function makeAntigravityAdapter(
                     stderrChunks.push(trimmed);
                   }
                 }),
-            ).pipe(Effect.forkChild);
+            ).pipe(Effect.forkIn(ctx.scope));
 
             const stdoutLines = processHandle.stdout.pipe(Stream.decodeText(), Stream.splitLines);
 
@@ -664,7 +662,7 @@ export function makeAntigravityAdapter(
             ),
           );
 
-          yield* Effect.forkChild(monitorEffect);
+          yield* Effect.forkIn(monitorEffect, ctx.scope);
 
           return {
             threadId,
@@ -801,14 +799,14 @@ export function makeAntigravityAdapter(
 
     yield* Effect.addFinalizer(() =>
       Effect.ignore(stopAll()).pipe(
-        Effect.tap(() => PubSub.shutdown(runtimeEventPubSub)),
+        Effect.tap(() => Queue.shutdown(runtimeEventQueue)),
         Effect.tap(() =>
           managedNativeEventLogger ? managedNativeEventLogger.close() : Effect.void,
         ),
       ),
     );
 
-    const streamEvents = Stream.fromPubSub(runtimeEventPubSub);
+    const streamEvents = Stream.fromQueue(runtimeEventQueue);
 
     return {
       provider: PROVIDER,
