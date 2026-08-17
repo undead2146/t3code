@@ -368,7 +368,18 @@ export function parseAntigravityLine(
   let stepIndex: number | null = null;
   let eventModel: string | null = null;
 
-  if (record["event"] === "step_update") {
+  if (record["type"] === "thread.token-usage.updated") {
+    const payload = record["payload"];
+    if (typeof payload === "object" && payload !== null) {
+      const payloadRecord = payload as Record<string, unknown>;
+      if (typeof payloadRecord["usage"] === "object" && payloadRecord["usage"] !== null) {
+        usageObj = payloadRecord["usage"] as Record<string, unknown>;
+      }
+    }
+    if (typeof record["threadId"] === "string") {
+      state.sessionId = record["threadId"];
+    }
+  } else if (record["event"] === "step_update") {
     const stepUpdate = record["step_update"];
     if (typeof stepUpdate === "object" && stepUpdate !== null) {
       const stepUpdateRecord = stepUpdate as Record<string, unknown>;
@@ -417,29 +428,36 @@ export function parseAntigravityLine(
   state.lastUsageSignature = signature;
 
   const rawInput = int(
-    usageObj["input_tokens"] ?? usageObj["prompt_tokens"] ?? usageObj["prompt_token_count"],
+    usageObj["input_tokens"] ??
+      usageObj["prompt_tokens"] ??
+      usageObj["prompt_token_count"] ??
+      usageObj["inputTokens"],
   );
   const cachedInput = int(
     usageObj["cache_read_tokens"] ??
       usageObj["cache_read_input_tokens"] ??
       usageObj["cached_tokens"] ??
-      usageObj["cached_content_token_count"],
+      usageObj["cached_content_token_count"] ??
+      usageObj["cachedInputTokens"],
   );
   const cacheCreation = int(
     usageObj["cache_creation_tokens"] ??
       usageObj["cache_creation_input_tokens"] ??
-      usageObj["cache_write_tokens"],
+      usageObj["cache_write_tokens"] ??
+      usageObj["cacheCreationTokens"],
   );
   const output = int(
     usageObj["output_tokens"] ??
       usageObj["candidates_tokens"] ??
       usageObj["completion_tokens"] ??
-      usageObj["candidates_token_count"],
+      usageObj["candidates_token_count"] ??
+      usageObj["outputTokens"],
   );
   const reasoning = int(
     usageObj["thinking_tokens"] ??
       usageObj["reasoning_tokens"] ??
-      usageObj["reasoning_output_tokens"],
+      usageObj["reasoning_output_tokens"] ??
+      usageObj["reasoningOutputTokens"],
   );
 
   const totals: UsageTokenTotals = {

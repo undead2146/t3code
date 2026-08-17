@@ -219,24 +219,23 @@ export const make = Effect.gen(function* () {
     const claudeDir = yield* resolveClaudeTranscriptDir(claudeHome);
     const codexLayout = yield* resolveCodexHomeLayout(settings.providers.codex);
 
-    const antigravityDirs: string[] = [];
     const providerLogsDir = path.join(config.stateDir, "logs", "provider");
-    const providerLogsExist = yield* fileSystem
-      .exists(providerLogsDir)
-      .pipe(Effect.catchCause(() => Effect.succeed(false)));
-    if (providerLogsExist) {
-      antigravityDirs.push(providerLogsDir);
-    }
+    const antigravityDirs: string[] = [providerLogsDir];
 
-    const agyAppData =
-      process.env.ANTIGRAVITY_APP_DATA_DIR ??
-      path.join(NodeOS.homedir(), ".gemini", "antigravity-cli");
-    const brainDir = path.join(agyAppData, "brain");
-    const brainExists = yield* fileSystem
-      .exists(brainDir)
-      .pipe(Effect.catchCause(() => Effect.succeed(false)));
-    if (brainExists) {
-      antigravityDirs.push(brainDir);
+    const defaultUserdataLogsDir = path.join(
+      NodeOS.homedir(),
+      ".t3",
+      "userdata",
+      "logs",
+      "provider",
+    );
+    if (defaultUserdataLogsDir !== providerLogsDir) {
+      const defaultExists = yield* fileSystem
+        .exists(defaultUserdataLogsDir)
+        .pipe(Effect.catchCause(() => Effect.succeed(false)));
+      if (defaultExists) {
+        antigravityDirs.push(defaultUserdataLogsDir);
+      }
     }
 
     const result: Array<{ provider: UsageProviderKind; dir: string }> = [
@@ -245,12 +244,6 @@ export const make = Effect.gen(function* () {
     ];
     for (const dir of antigravityDirs) {
       result.push({ provider: "antigravity" as const, dir });
-    }
-    if (antigravityDirs.length === 0) {
-      result.push({
-        provider: "antigravity" as const,
-        dir: providerLogsDir,
-      });
     }
 
     return result;
