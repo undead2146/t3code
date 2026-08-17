@@ -10,10 +10,7 @@ import {
 } from "./electron-launcher.mjs";
 import { waitForResources } from "./wait-for-resources.mjs";
 
-const devServerUrl = process.env.VITE_DEV_SERVER_URL?.trim();
-if (!devServerUrl) {
-  throw new Error("VITE_DEV_SERVER_URL is required for desktop development.");
-}
+const devServerUrl = process.env.VITE_DEV_SERVER_URL?.trim() || "http://127.0.0.1:5733";
 
 const devServer = new URL(devServerUrl);
 const port = Number.parseInt(devServer.port, 10);

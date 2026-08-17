@@ -68,7 +68,10 @@ export function totalTokens(totals: UsageTokenTotals): number {
  * an order of magnitude.
  */
 export function mightCarryUsage(line: string, provider: UsageProviderKind): boolean {
-  return provider === "claude" ? line.includes('"usage"') : line.includes('"token_count"');
+  if (provider === "claude") return line.includes('"usage"');
+  if (provider === "codex") return line.includes('"token_count"');
+  if (provider === "antigravity") return line.includes('"usage"') || line.includes('"tokens"');
+  return false;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -294,6 +297,175 @@ export function parseCodexLine(line: string, state: CodexScanState): UsageRecord
     // Events surviving the fork-copy suppression above are unique to this
     // rollout, so they need no global dedup.
     dedupeKey: null,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Antigravity                                                                */
+/* -------------------------------------------------------------------------- */
+
+export interface AntigravityScanState {
+  model: string;
+  sessionId: string;
+  lastUsageSignature: string | null;
+}
+
+export function initialAntigravityScanState(): AntigravityScanState {
+  return {
+    model: "",
+    sessionId: "",
+    lastUsageSignature: null,
+  };
+}
+
+/**
+ * Parses one line of an Antigravity transcript or provider log.
+ *
+ * Supports both raw stream-JSON/brain transcripts and T3 Code provider logs
+ * prefixed with `[timestamp] NTIVE: {...}`.
+ */
+export function parseAntigravityLine(
+  line: string,
+  state: AntigravityScanState,
+): UsageRecord | null {
+  let rawLine = line.trim();
+  if (!rawLine) return null;
+
+  let timestampMs: number | null = null;
+  const prefixMatch = /^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]\s+(?:NTIVE|CANON):\s+(.*)$/.exec(rawLine);
+  if (prefixMatch && prefixMatch[1] && prefixMatch[2]) {
+    timestampMs = parseTimestampMs(prefixMatch[1]);
+    rawLine = prefixMatch[2];
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawLine);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+
+  const record = parsed as Record<string, unknown>;
+
+  // Handle init event
+  if (record["event"] === "init") {
+    if (typeof record["conversation_id"] === "string") {
+      state.sessionId = record["conversation_id"];
+    }
+    const init = record["init"];
+    if (typeof init === "object" && init !== null) {
+      const initRecord = init as Record<string, unknown>;
+      if (typeof initRecord["model"] === "string" && initRecord["model"].length > 0) {
+        state.model = initRecord["model"];
+      }
+    }
+    return null;
+  }
+
+  // Extract usage, step index, and model
+  let usageObj: Record<string, unknown> | null = null;
+  let stepIndex: number | null = null;
+  let eventModel: string | null = null;
+
+  if (record["event"] === "step_update") {
+    const stepUpdate = record["step_update"];
+    if (typeof stepUpdate === "object" && stepUpdate !== null) {
+      const stepUpdateRecord = stepUpdate as Record<string, unknown>;
+      if (typeof stepUpdateRecord["conversation_id"] === "string") {
+        state.sessionId = stepUpdateRecord["conversation_id"];
+      }
+      if (typeof stepUpdateRecord["step_index"] === "number") {
+        stepIndex = stepUpdateRecord["step_index"];
+      }
+      if (typeof stepUpdateRecord["model"] === "string") {
+        eventModel = stepUpdateRecord["model"];
+      }
+      if (typeof stepUpdateRecord["usage"] === "object" && stepUpdateRecord["usage"] !== null) {
+        usageObj = stepUpdateRecord["usage"] as Record<string, unknown>;
+      }
+    }
+  } else if (typeof record["usage"] === "object" && record["usage"] !== null) {
+    usageObj = record["usage"] as Record<string, unknown>;
+    if (typeof record["step_index"] === "number") {
+      stepIndex = record["step_index"];
+    }
+    if (typeof record["conversation_id"] === "string") {
+      state.sessionId = record["conversation_id"];
+    }
+    if (typeof record["model"] === "string") {
+      eventModel = record["model"];
+    }
+  }
+
+  if (!usageObj) return null;
+
+  if (eventModel) {
+    state.model = eventModel;
+  }
+
+  if (timestampMs === null) {
+    timestampMs = parseTimestampMs(record["created_at"] ?? record["timestamp"]);
+  }
+  if (timestampMs === null) {
+    return null;
+  }
+
+  // Deduplicate consecutive identical usage payloads
+  const signature = `${state.sessionId}:${stepIndex ?? ""}:${JSON.stringify(usageObj)}`;
+  if (signature === state.lastUsageSignature) return null;
+  state.lastUsageSignature = signature;
+
+  const rawInput = int(
+    usageObj["input_tokens"] ?? usageObj["prompt_tokens"] ?? usageObj["prompt_token_count"],
+  );
+  const cachedInput = int(
+    usageObj["cache_read_tokens"] ??
+      usageObj["cache_read_input_tokens"] ??
+      usageObj["cached_tokens"] ??
+      usageObj["cached_content_token_count"],
+  );
+  const cacheCreation = int(
+    usageObj["cache_creation_tokens"] ??
+      usageObj["cache_creation_input_tokens"] ??
+      usageObj["cache_write_tokens"],
+  );
+  const output = int(
+    usageObj["output_tokens"] ??
+      usageObj["candidates_tokens"] ??
+      usageObj["completion_tokens"] ??
+      usageObj["candidates_token_count"],
+  );
+  const reasoning = int(
+    usageObj["thinking_tokens"] ??
+      usageObj["reasoning_tokens"] ??
+      usageObj["reasoning_output_tokens"],
+  );
+
+  const totals: UsageTokenTotals = {
+    uncachedInputTokens: Math.max(0, rawInput - cachedInput - cacheCreation),
+    cachedInputTokens: cachedInput,
+    cacheCreationTokens: cacheCreation,
+    outputTokens: output,
+    reasoningTokens: Math.min(output, reasoning),
+  };
+
+  if (totalTokens(totals) === 0) return null;
+
+  const cost =
+    usageObj["costUSD"] ?? usageObj["cost_usd"] ?? record["costUSD"] ?? record["cost_usd"];
+  const reportedCostUsd = typeof cost === "number" && Number.isFinite(cost) ? cost : null;
+
+  const dedupeKey = state.sessionId ? `${state.sessionId}:${stepIndex ?? timestampMs}` : null;
+
+  return {
+    provider: "antigravity",
+    timestampMs,
+    model: state.model || "gemini-3.7-flash",
+    sessionId: state.sessionId,
+    totals,
+    reportedCostUsd,
+    dedupeKey,
   };
 }
 

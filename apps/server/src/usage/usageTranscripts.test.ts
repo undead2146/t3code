@@ -1,7 +1,9 @@
 import { describe, expect, it } from "@effect/vitest";
 
 import {
+  initialAntigravityScanState,
   initialCodexScanState,
+  parseAntigravityLine,
   parseClaudeLine,
   parseCodexLine,
   totalTokens,
@@ -233,6 +235,86 @@ describe("parseCodexLine", () => {
       );
       expect(record).not.toBeNull();
     });
+  });
+});
+
+describe("parseAntigravityLine", () => {
+  it("parses init event and carries model and sessionId forward", () => {
+    const state = initialAntigravityScanState();
+    const initLine = JSON.stringify({
+      event: "init",
+      conversation_id: "conv-agy-1",
+      init: { model: "gemini-3.7-flash" },
+    });
+    expect(parseAntigravityLine(initLine, state)).toBeNull();
+    expect(state.sessionId).toBe("conv-agy-1");
+    expect(state.model).toBe("gemini-3.7-flash");
+
+    const stepLine = JSON.stringify({
+      event: "step_update",
+      step_update: {
+        conversation_id: "conv-agy-1",
+        step_index: 2,
+        state: "DONE",
+        step_type: "agent_response",
+        usage: {
+          input_tokens: 15000,
+          cache_read_tokens: 10000,
+          output_tokens: 500,
+          thinking_tokens: 200,
+          total_tokens: 15500,
+        },
+      },
+      created_at: "2026-08-17T19:15:52.000Z",
+    });
+
+    const record = parseAntigravityLine(stepLine, state);
+    expect(record).not.toBeNull();
+    expect(record?.provider).toBe("antigravity");
+    expect(record?.model).toBe("gemini-3.7-flash");
+    expect(record?.sessionId).toBe("conv-agy-1");
+    expect(record?.totals).toEqual({
+      uncachedInputTokens: 5000,
+      cachedInputTokens: 10000,
+      cacheCreationTokens: 0,
+      outputTokens: 500,
+      reasoningTokens: 200,
+    });
+    expect(record?.dedupeKey).toBe("conv-agy-1:2");
+  });
+
+  it("parses lines from T3 Code provider logs with [timestamp] NTIVE: prefix", () => {
+    const state = initialAntigravityScanState();
+    state.model = "gemini-2.5-flash";
+    const line =
+      '[2026-08-17T19:15:52.761Z] NTIVE: {"event":"step_update","step_update":{"conversation_id":"184e91f2-b855-463b-a4e9-1e1a4bf13685","step_index":7,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":5127,"output_tokens":153,"thinking_tokens":62,"cache_read_tokens":12203,"total_tokens":5280}}}';
+
+    const record = parseAntigravityLine(line, state);
+    expect(record).not.toBeNull();
+    expect(record?.provider).toBe("antigravity");
+    expect(record?.timestampMs).toBe(Date.parse("2026-08-17T19:15:52.761Z"));
+    expect(record?.totals.cachedInputTokens).toBe(12203);
+    expect(record?.totals.reasoningTokens).toBe(62);
+    expect(record?.totals.outputTokens).toBe(153);
+  });
+
+  it("deduplicates identical consecutive usage payloads", () => {
+    const state = initialAntigravityScanState();
+    const line = JSON.stringify({
+      event: "step_update",
+      step_update: {
+        conversation_id: "conv-dup",
+        step_index: 1,
+        usage: { input_tokens: 100, output_tokens: 20 },
+      },
+      created_at: "2026-08-17T19:00:00.000Z",
+    });
+
+    const first = parseAntigravityLine(line, state);
+    const second = parseAntigravityLine(line, state);
+
+    expect(first).not.toBeNull();
+    expect(second).toBeNull();
   });
 });
 

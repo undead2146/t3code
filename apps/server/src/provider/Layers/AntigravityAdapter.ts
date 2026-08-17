@@ -316,12 +316,12 @@ export function makeAntigravityAdapter(
             args.push("--model", selectedModel);
           }
 
-          // If effort is not specified and model doesn't embed it in the slug, default to "high"
+          // If effort is not specified and model doesn't embed it in the slug, default to "medium"
           if (
             !effectiveEffort &&
             (!selectedModel || !selectedModel.match(/-(low|medium|high)$/i))
           ) {
-            effectiveEffort = "high";
+            effectiveEffort = "medium";
           }
 
           if (effectiveEffort) {
@@ -487,17 +487,19 @@ export function makeAntigravityAdapter(
                         const count = (v: unknown): number | undefined =>
                           typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
                         const usedTokens = count(usage.total_tokens) ?? 0;
+                        const inputTokens = count(usage.input_tokens);
+                        const outputTokens = count(usage.output_tokens);
+                        const reasoningOutputTokens = count(usage.thinking_tokens);
+                        const cachedInputTokens = count(
+                          usage.cache_read_tokens ?? usage.cached_tokens,
+                        );
                         const usageSnapshot: ThreadTokenUsageSnapshot = {
                           usedTokens,
-                          ...(count(usage.input_tokens) !== undefined
-                            ? { inputTokens: count(usage.input_tokens) }
-                            : {}),
-                          ...(count(usage.output_tokens) !== undefined
-                            ? { outputTokens: count(usage.output_tokens) }
-                            : {}),
-                          ...(count(usage.thinking_tokens) !== undefined
-                            ? { reasoningOutputTokens: count(usage.thinking_tokens) }
-                            : {}),
+                          maxTokens: 1_000_000,
+                          ...(inputTokens !== undefined ? { inputTokens } : {}),
+                          ...(outputTokens !== undefined ? { outputTokens } : {}),
+                          ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
+                          ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
                           compactsAutomatically: true,
                         };
                         yield* publishEvent({
@@ -534,7 +536,12 @@ export function makeAntigravityAdapter(
                             ...(toolInfo ? { data: toolInfo } : {}),
                           },
                         });
-                      } else if (step.state === "DONE") {
+                      } else if (
+                        step.state === "DONE" ||
+                        step.state === "ERROR" ||
+                        step.state === "CANCELLED" ||
+                        step.state === "FAILED"
+                      ) {
                         yield* publishEvent({
                           ...stamp,
                           provider: PROVIDER,
@@ -544,10 +551,30 @@ export function makeAntigravityAdapter(
                           type: "item.completed",
                           payload: {
                             itemType: toolItemType,
-                            status: "completed",
+                            status: step.state === "DONE" ? "completed" : "failed",
                             title: step.tool_name,
                             ...(toolDetail ? { detail: toolDetail } : {}),
                             ...(toolInfo ? { data: toolInfo } : {}),
+                          },
+                        });
+                      }
+                    } else if (step.step_type === "error_message") {
+                      const errorText =
+                        typeof step.error === "string"
+                          ? step.error
+                          : typeof step.content === "string"
+                            ? step.content
+                            : undefined;
+                      if (errorText) {
+                        yield* publishEvent({
+                          ...stamp,
+                          provider: PROVIDER,
+                          threadId,
+                          turnId,
+                          type: "content.delta",
+                          payload: {
+                            streamKind: "assistant_text",
+                            delta: `\n\n> ⚠️ **Antigravity Notice**: ${errorText}\n\n`,
                           },
                         });
                       }

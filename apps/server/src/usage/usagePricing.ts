@@ -56,13 +56,16 @@ export function parseRateTable(document: unknown): RateTable {
     const output = finiteNumber(entry.output_cost_per_token);
     if (input === null || output === null) continue;
 
-    table.set(normalizeModelName(name), {
+    const normalized = normalizeModelName(name);
+    // Anthropic bills cache reads at a discount and cache writes at a
+    // premium; Gemini bills cache reads at 25% of input rate. When a model
+    // omits them, cached input falls back to the provider default.
+    const defaultCacheRead = normalized.startsWith("gemini") ? input * 0.25 : input;
+
+    table.set(normalized, {
       inputCostPerToken: input,
       outputCostPerToken: output,
-      // Anthropic bills cache reads at a discount and cache writes at a
-      // premium. When a model omits them, cached input is priced as plain
-      // input rather than as free.
-      cacheReadCostPerToken: finiteNumber(entry.cache_read_input_token_cost) ?? input,
+      cacheReadCostPerToken: finiteNumber(entry.cache_read_input_token_cost) ?? defaultCacheRead,
       cacheCreationCostPerToken: finiteNumber(entry.cache_creation_input_token_cost) ?? input,
     });
   }
@@ -101,7 +104,17 @@ const UNPRICEABLE_MODELS = new Set([
 export function lookupRate(table: RateTable, model: string): ModelRate | null {
   const normalized = normalizeModelName(model);
   if (normalized.length === 0 || UNPRICEABLE_MODELS.has(normalized)) return null;
-  return table.get(normalized) ?? null;
+  const direct = table.get(normalized);
+  if (direct) return direct;
+
+  // Try stripping reasoning effort suffixes (-low, -medium, -high) or thinking suffix
+  const stripped = normalized.replace(/-(?:low|medium|high|thinking)$/, "");
+  if (stripped !== normalized) {
+    const fallback = table.get(stripped);
+    if (fallback) return fallback;
+  }
+
+  return null;
 }
 
 export interface PricedUsage {

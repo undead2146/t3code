@@ -17,14 +17,51 @@ const makeMockAgyScript = (lines: ReadonlyArray<string>) =>
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const dir = yield* fs.makeTempDirectory({ prefix: "agy-mock-" });
+    const isWin = process.platform === "win32";
+    const jsPath = path.join(dir, "fake-agy.cjs");
+    const jsContent = `
+const lines = ${JSON.stringify(lines)};
+for (const line of lines) {
+  console.log(line);
+}
+process.exit(0);
+`;
+    yield* fs.writeFileString(jsPath, jsContent);
+    if (isWin) {
+      const cmdPath = path.join(dir, "fake-agy.cmd");
+      yield* fs.writeFileString(cmdPath, `@node "${jsPath}" %*\r\n`);
+      return cmdPath;
+    }
     const scriptPath = path.join(dir, "fake-agy.sh");
-    const outputScript = [
-      "#!/bin/sh",
-      ...lines.map((line) => `printf '%s\\n' '${line}'`),
-      "exit 0",
-      "",
-    ].join("\n");
-    yield* fs.writeFileString(scriptPath, outputScript);
+    yield* fs.writeFileString(scriptPath, `#!/bin/sh\nnode "${jsPath}" "$@"\n`);
+    yield* fs.chmod(scriptPath, 0o755);
+    return scriptPath;
+  });
+
+const makeMockAgyArgsScript = (argsLog: string, lines: ReadonlyArray<string>) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectory({ prefix: "agy-mock-args-" });
+    const isWin = process.platform === "win32";
+    const jsPath = path.join(dir, "fake-agy-args.cjs");
+    const jsContent = `
+const fs = require('fs');
+fs.writeFileSync(${JSON.stringify(argsLog)}, process.argv.slice(2).join(' '));
+const lines = ${JSON.stringify(lines)};
+for (const line of lines) {
+  console.log(line);
+}
+process.exit(0);
+`;
+    yield* fs.writeFileString(jsPath, jsContent);
+    if (isWin) {
+      const cmdPath = path.join(dir, "fake-agy.cmd");
+      yield* fs.writeFileString(cmdPath, `@node "${jsPath}" %*\r\n`);
+      return cmdPath;
+    }
+    const scriptPath = path.join(dir, "fake-agy.sh");
+    yield* fs.writeFileString(scriptPath, `#!/bin/sh\nnode "${jsPath}" "$@"\n`);
     yield* fs.chmod(scriptPath, 0o755);
     return scriptPath;
   });
@@ -145,12 +182,10 @@ it.layer(NodeServices.layer)("makeAntigravityAdapter", (it) => {
       const path = yield* Path.Path;
       const dir = yield* fs.makeTempDirectory({ prefix: "agy-mock-args-" });
       const argsLog = path.join(dir, "args.log");
-      const scriptPath = path.join(dir, "fake-agy.sh");
-      yield* fs.writeFileString(
-        scriptPath,
-        `#!/bin/sh\nprintf "%s\\n" "$*" > "${argsLog}"\nprintf '{"event":"init","conversation_id":"conv-args"}\\n{"event":"result","result":{"conversation_id":"conv-args"}}\\n'\nexit 0\n`,
-      );
-      yield* fs.chmod(scriptPath, 0o755);
+      const scriptPath = yield* makeMockAgyArgsScript(argsLog, [
+        '{"event":"init","conversation_id":"conv-args"}',
+        '{"event":"result","result":{"conversation_id":"conv-args"}}',
+      ]);
 
       const adapter = yield* makeAntigravityAdapter(
         decodeAntigravitySettings({
@@ -170,6 +205,12 @@ it.layer(NodeServices.layer)("makeAntigravityAdapter", (it) => {
         },
       });
 
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 3).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+
       yield* adapter.sendTurn({
         threadId,
         input: "Hello with high effort",
@@ -180,9 +221,105 @@ it.layer(NodeServices.layer)("makeAntigravityAdapter", (it) => {
         },
       });
 
+      yield* Fiber.join(runtimeEventsFiber);
+
       const loggedArgs = yield* fs.readFileString(argsLog);
       expect(loggedArgs).toContain("--model gemini-3.7-flash");
       expect(loggedArgs).toContain("--effort high");
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("defaults effort to medium when not specified", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectory({ prefix: "agy-mock-default-effort-" });
+      const argsLog = path.join(dir, "args.log");
+      const scriptPath = yield* makeMockAgyArgsScript(argsLog, [
+        '{"event":"init","conversation_id":"conv-effort"}',
+        '{"event":"result","result":{"conversation_id":"conv-effort"}}',
+      ]);
+
+      const adapter = yield* makeAntigravityAdapter(
+        decodeAntigravitySettings({
+          enabled: true,
+          binaryPath: scriptPath,
+        }),
+      );
+
+      const threadId = ThreadId.make("thread-default-effort-test");
+      yield* adapter.startSession({
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 3).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* Effect.yieldNow;
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Hello with default effort",
+      });
+
+      yield* Fiber.join(runtimeEventsFiber);
+
+      const loggedArgs = yield* fs.readFileString(argsLog);
+      expect(loggedArgs).toContain("--effort medium");
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("completes tool item on ERROR state and translates error notices", () =>
+    Effect.gen(function* () {
+      const mockScript = yield* makeMockAgyScript([
+        '{"event":"init","conversation_id":"conv-err"}',
+        '{"event":"step_update","step_update":{"step_index":0,"step_type":"tool","tool_name":"run_command","state":"ACTIVE","tool_info":{"name":"run_command","parameters":{"CommandLine":"failing_cmd"}}}}',
+        '{"event":"step_update","step_update":{"step_index":0,"step_type":"tool","tool_name":"run_command","state":"ERROR","tool_info":{"name":"run_command"}}}',
+        '{"event":"step_update","step_update":{"step_index":1,"step_type":"error_message","state":"DONE","error":"Model temporarily unavailable"}}',
+        '{"event":"result","result":{"conversation_id":"conv-err","status":"SUCCESS","response":"Recovered"}}',
+      ]);
+
+      const adapter = yield* makeAntigravityAdapter(
+        decodeAntigravitySettings({
+          enabled: true,
+          binaryPath: mockScript,
+        }),
+      );
+
+      const threadId = ThreadId.make("thread-tool-err-test");
+      yield* adapter.startSession({ threadId, runtimeMode: "full-access" });
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 7).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* Effect.yieldNow;
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Do something",
+      });
+
+      const eventsChunk = yield* Fiber.join(runtimeEventsFiber);
+      const events = Array.from(eventsChunk);
+      const itemCompleted = events.find((e) => e.type === "item.completed");
+      expect(itemCompleted).toBeDefined();
+      if (itemCompleted && itemCompleted.type === "item.completed") {
+        expect(itemCompleted.payload.status).toBe("failed");
+      }
+
+      const noticeDelta = events.find(
+        (e) =>
+          e.type === "content.delta" && e.payload.delta.includes("Model temporarily unavailable"),
+      );
+      expect(noticeDelta).toBeDefined();
 
       yield* adapter.stopSession(threadId);
     }),

@@ -219,10 +219,41 @@ export const make = Effect.gen(function* () {
     const claudeDir = yield* resolveClaudeTranscriptDir(claudeHome);
     const codexLayout = yield* resolveCodexHomeLayout(settings.providers.codex);
 
-    return [
+    const antigravityDirs: string[] = [];
+    const providerLogsDir = path.join(config.stateDir, "logs", "provider");
+    const providerLogsExist = yield* fileSystem
+      .exists(providerLogsDir)
+      .pipe(Effect.catchCause(() => Effect.succeed(false)));
+    if (providerLogsExist) {
+      antigravityDirs.push(providerLogsDir);
+    }
+
+    const agyAppData =
+      process.env.ANTIGRAVITY_APP_DATA_DIR ??
+      path.join(NodeOS.homedir(), ".gemini", "antigravity-cli");
+    const brainDir = path.join(agyAppData, "brain");
+    const brainExists = yield* fileSystem
+      .exists(brainDir)
+      .pipe(Effect.catchCause(() => Effect.succeed(false)));
+    if (brainExists) {
+      antigravityDirs.push(brainDir);
+    }
+
+    const result: Array<{ provider: UsageProviderKind; dir: string }> = [
       { provider: "claude" as const, dir: claudeDir },
       { provider: "codex" as const, dir: path.join(codexLayout.sharedHomePath, "sessions") },
     ];
+    for (const dir of antigravityDirs) {
+      result.push({ provider: "antigravity" as const, dir });
+    }
+    if (antigravityDirs.length === 0) {
+      result.push({
+        provider: "antigravity" as const,
+        dir: providerLogsDir,
+      });
+    }
+
+    return result;
   });
 
   /**

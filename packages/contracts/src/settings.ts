@@ -499,7 +499,7 @@ export const AntigravitySettings = makeProviderSettingsSchema(
       }),
     ),
     effort: TrimmedString.pipe(
-      Schema.withDecodingDefault(Effect.succeed("high")),
+      Schema.withDecodingDefault(Effect.succeed("medium")),
       Schema.annotateKey({
         title: "Reasoning effort",
         description: "Reasoning effort for CLI sessions (low, medium, high).",

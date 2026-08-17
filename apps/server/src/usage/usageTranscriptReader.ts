@@ -18,8 +18,10 @@ import * as NodeReadline from "node:readline";
 import type { UsageProviderKind } from "@t3tools/contracts";
 
 import {
+  initialAntigravityScanState,
   initialCodexScanState,
   mightCarryUsage,
+  parseAntigravityLine,
   parseClaudeLine,
   parseCodexLine,
   type UsageRecord,
@@ -32,7 +34,7 @@ export interface TranscriptFile {
 }
 
 /**
- * Lists `.jsonl` transcripts under `root` last modified at or after `sinceMs`.
+ * Lists `.jsonl` and `.log` transcripts under `root` last modified at or after `sinceMs`.
  *
  * Errors on individual entries are swallowed: session files rotate and get
  * removed while the walk is in flight, and a partial listing is far better than
@@ -57,7 +59,7 @@ export async function listTranscriptFiles(
         await walk(child);
         continue;
       }
-      if (!entry.name.endsWith(".jsonl")) continue;
+      if (!entry.name.endsWith(".jsonl") && !entry.name.endsWith(".log")) continue;
       try {
         const stats = await NodeFSP.stat(child);
         if (stats.mtimeMs >= sinceMs) {
@@ -108,6 +110,7 @@ export async function readTranscriptRecords(
 ): Promise<readonly UsageRecord[] | null> {
   const records: UsageRecord[] = [];
   const codexState = initialCodexScanState();
+  const antigravityState = initialAntigravityScanState();
 
   try {
     const lines = NodeReadline.createInterface({
@@ -125,6 +128,13 @@ export async function readTranscriptRecords(
           continue;
         }
         const record = parseCodexLine(line, codexState);
+        if (record !== null) records.push(record);
+        continue;
+      }
+
+      if (provider === "antigravity") {
+        if (!mightCarryUsage(line, provider) && !line.includes('"init"')) continue;
+        const record = parseAntigravityLine(line, antigravityState);
         if (record !== null) records.push(record);
         continue;
       }

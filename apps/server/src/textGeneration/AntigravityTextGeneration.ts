@@ -73,7 +73,7 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
     const binary = settings.binaryPath || "agy";
     const args = ["-p", prompt, "--output-format", "stream-json"];
 
-    if (settings.dangerouslySkipPermissions) {
+    if (settings.dangerouslySkipPermissions !== false) {
       args.push("--dangerously-skip-permissions");
     }
 

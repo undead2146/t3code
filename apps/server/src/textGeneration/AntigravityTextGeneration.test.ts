@@ -24,17 +24,21 @@ it.layer(AntigravityTextGenTestLayer)("makeAntigravityTextGeneration", (it) => {
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
         const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-agy-textgen-" });
-        const agyPath = path.join(dir, "agy");
-
+        const isWin = process.platform === "win32";
+        const jsPath = path.join(dir, "agy.cjs");
         yield* fs.writeFileString(
-          agyPath,
-          [
-            "#!/bin/sh",
-            'printf \'{"branch": "feature-antigravity-integration"}\\n\'',
-            "exit 0",
-          ].join("\n"),
+          jsPath,
+          `console.log(JSON.stringify({ branch: "feature-antigravity-integration" }));\nprocess.exit(0);\n`,
         );
-        yield* fs.chmod(agyPath, 0o755);
+        let agyPath: string;
+        if (isWin) {
+          agyPath = path.join(dir, "agy.cmd");
+          yield* fs.writeFileString(agyPath, `@node "${jsPath}" %*\r\n`);
+        } else {
+          agyPath = path.join(dir, "agy");
+          yield* fs.writeFileString(agyPath, `#!/bin/sh\nnode "${jsPath}" "$@"\n`);
+          yield* fs.chmod(agyPath, 0o755);
+        }
 
         const settings = decodeAntigravitySettings({
           enabled: true,
@@ -62,17 +66,21 @@ it.layer(AntigravityTextGenTestLayer)("makeAntigravityTextGeneration", (it) => {
         const fs = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
         const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-agy-commit-" });
-        const agyPath = path.join(dir, "agy");
-
+        const isWin = process.platform === "win32";
+        const jsPath = path.join(dir, "agy.cjs");
         yield* fs.writeFileString(
-          agyPath,
-          [
-            "#!/bin/sh",
-            'printf \'{"subject": "feat: add antigravity provider", "body": "implement agy harness"}\\n\'',
-            "exit 0",
-          ].join("\n"),
+          jsPath,
+          `console.log(JSON.stringify({ subject: "feat: add antigravity provider", body: "implement agy harness" }));\nprocess.exit(0);\n`,
         );
-        yield* fs.chmod(agyPath, 0o755);
+        let agyPath: string;
+        if (isWin) {
+          agyPath = path.join(dir, "agy.cmd");
+          yield* fs.writeFileString(agyPath, `@node "${jsPath}" %*\r\n`);
+        } else {
+          agyPath = path.join(dir, "agy");
+          yield* fs.writeFileString(agyPath, `#!/bin/sh\nnode "${jsPath}" "$@"\n`);
+          yield* fs.chmod(agyPath, 0o755);
+        }
 
         const settings = decodeAntigravitySettings({
           enabled: true,

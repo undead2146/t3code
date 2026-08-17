@@ -803,6 +803,10 @@ export function runDevRunnerWithInput(input: DevRunnerCliInput) {
       }
     }
 
+    if (input.mode === "dev:desktop") {
+      env.T3CODE_DESKTOP_DEV = "1";
+    }
+
     const localBinPath = NodePath.resolve(process.cwd(), "node_modules", ".bin");
     const delimiter = process.platform === "win32" ? ";" : ":";
     const pathKey = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";

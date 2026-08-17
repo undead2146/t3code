@@ -106,12 +106,21 @@ it.layer(NodeServices.layer)("checkAntigravityProviderStatus", (it) => {
           const fs = yield* FileSystem.FileSystem;
           const path = yield* Path.Path;
           const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-agy-help-" });
-          const agyPath = path.join(dir, "agy");
+          const isWin = process.platform === "win32";
+          const jsPath = path.join(dir, "agy.cjs");
           yield* fs.writeFileString(
-            agyPath,
-            ["#!/bin/sh", `printf "%s\\n" "${secretStderr}" >&2`, "exit 2", ""].join("\n"),
+            jsPath,
+            `console.error(${JSON.stringify(secretStderr)});\nprocess.exit(2);\n`,
           );
-          yield* fs.chmod(agyPath, 0o755);
+          let agyPath: string;
+          if (isWin) {
+            agyPath = path.join(dir, "agy.cmd");
+            yield* fs.writeFileString(agyPath, `@node "${jsPath}" %*\r\n`);
+          } else {
+            agyPath = path.join(dir, "agy");
+            yield* fs.writeFileString(agyPath, `#!/bin/sh\nnode "${jsPath}" "$@"\n`);
+            yield* fs.chmod(agyPath, 0o755);
+          }
 
           return yield* checkAntigravityProviderStatus(
             decodeAntigravitySettings({ enabled: true, binaryPath: agyPath }),
@@ -136,12 +145,21 @@ it.layer(NodeServices.layer)("checkAntigravityProviderStatus", (it) => {
           const fs = yield* FileSystem.FileSystem;
           const path = yield* Path.Path;
           const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-agy-success-" });
-          const agyPath = path.join(dir, "agy");
+          const isWin = process.platform === "win32";
+          const jsPath = path.join(dir, "agy.cjs");
           yield* fs.writeFileString(
-            agyPath,
-            ["#!/bin/sh", 'printf "Usage of agy:\\n  --help\\n"', "exit 0", ""].join("\n"),
+            jsPath,
+            `console.log("Usage of agy:\\n  --help\\n");\nprocess.exit(0);\n`,
           );
-          yield* fs.chmod(agyPath, 0o755);
+          let agyPath: string;
+          if (isWin) {
+            agyPath = path.join(dir, "agy.cmd");
+            yield* fs.writeFileString(agyPath, `@node "${jsPath}" %*\r\n`);
+          } else {
+            agyPath = path.join(dir, "agy");
+            yield* fs.writeFileString(agyPath, `#!/bin/sh\nnode "${jsPath}" "$@"\n`);
+            yield* fs.chmod(agyPath, 0o755);
+          }
 
           return yield* checkAntigravityProviderStatus(
             decodeAntigravitySettings({
