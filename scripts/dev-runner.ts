@@ -393,6 +393,7 @@ export function createDevRunnerEnv({
 
     if (!isDesktopMode && host !== undefined) {
       output.T3CODE_HOST = host;
+      output.HOST = host;
     }
 
     if (!isDesktopMode) {
