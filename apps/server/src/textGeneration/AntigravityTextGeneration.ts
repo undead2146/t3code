@@ -71,7 +71,7 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
     readonly modelSelection: ModelSelection;
   }): Effect.fn.Return<S["Type"], TextGenerationError, S["DecodingServices"]> {
     const binary = settings.binaryPath || "agy";
-    const args = ["-p", prompt, "--output-format", "stream-json"];
+    const args = ["-p", prompt, "--output-format", "stream-json", "--print-timeout", "10m"];
 
     if (settings.dangerouslySkipPermissions !== false) {
       args.push("--dangerously-skip-permissions");

@@ -295,7 +295,7 @@ export function makeAntigravityAdapter(
           });
 
           const binary = settings.binaryPath || "agy";
-          const args = ["--output-format", "stream-json"];
+          const args = ["--output-format", "stream-json", "--print-timeout", "24h"];
 
           if (settings.dangerouslySkipPermissions !== false) {
             args.push("--dangerously-skip-permissions");
