@@ -45,10 +45,10 @@ it.layer(AntigravityTextGenTestLayer)("makeAntigravityTextGeneration", (it) => {
         const result = yield* textGen.generateBranchName({
           cwd: dir,
           message: "Implement Antigravity CLI",
-          modelSelection: createModelSelection({
-            instanceId: ProviderInstanceId.make("antigravity"),
-            model: "gemini-3.7-flash-high",
-          }),
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("antigravity"),
+            "gemini-3.7-flash-high",
+          ),
         });
 
         expect(result.branch).toBe("feature-antigravity-integration");
@@ -85,10 +85,10 @@ it.layer(AntigravityTextGenTestLayer)("makeAntigravityTextGeneration", (it) => {
           branch: "main",
           stagedSummary: "1 file changed",
           stagedPatch: "+ added antigravity",
-          modelSelection: createModelSelection({
-            instanceId: ProviderInstanceId.make("antigravity"),
-            model: "gemini-3.7-flash-high",
-          }),
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("antigravity"),
+            "gemini-3.7-flash-high",
+          ),
         });
 
         expect(result.subject).toBe("feat: add antigravity provider");

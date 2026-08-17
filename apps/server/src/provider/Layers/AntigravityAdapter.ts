@@ -213,7 +213,6 @@ export function makeAntigravityAdapter(
             providerInstanceId: boundInstanceId,
             runtimeMode: input.runtimeMode,
             model: isTargetInstance ? input.modelSelection?.model : undefined,
-            options: isTargetInstance ? input.modelSelection?.options : undefined,
             createdAt,
             updatedAt: createdAt,
           };
@@ -278,7 +277,7 @@ export function makeAntigravityAdapter(
           const turnStartedAt = yield* nowIso;
           const turnStartEventId = yield* nextEventId;
 
-          const turnRecord = {
+          const turnRecord: { id: TurnId; items: Array<unknown> } = {
             id: turnId,
             items: [{ prompt: input.input ?? "" }],
           };
@@ -554,9 +553,7 @@ export function makeAntigravityAdapter(
               threadId,
               Effect.gen(function* () {
                 if (ctx.activeTurnId !== turnId) return;
-                if (ctx.activeProcess === processHandle) {
-                  ctx.activeProcess = undefined;
-                }
+                ctx.activeProcess = undefined;
                 ctx.activeTurnId = undefined;
 
                 const completedStamp = yield* makeEventStamp();
@@ -584,8 +581,8 @@ export function makeAntigravityAdapter(
                     return yield* Effect.failCause(cause);
                   }
                   if (ctx.activeTurnId !== turnId) return;
-                  if (ctx.activeProcess === processHandle) {
-                    yield* processHandle.kill();
+                  if (ctx.activeProcess) {
+                    yield* ctx.activeProcess.kill();
                     ctx.activeProcess = undefined;
                   }
                   ctx.activeTurnId = undefined;
