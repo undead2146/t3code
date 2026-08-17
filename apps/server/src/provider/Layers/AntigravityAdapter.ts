@@ -591,6 +591,10 @@ export function makeAntigravityAdapter(
                     }
                     if (resultObj.status === "ERROR" && typeof resultObj.error === "string") {
                       lastResultError = resultObj.error;
+                      const formattedError =
+                        resultObj.error === "timeout waiting for response"
+                          ? "timeout waiting for response (synchronous tool execution exceeded time limit; run long commands/builds in background with WaitMsBeforeAsync or manage_task)"
+                          : resultObj.error;
                       yield* publishEvent({
                         ...stamp,
                         provider: PROVIDER,
@@ -599,7 +603,7 @@ export function makeAntigravityAdapter(
                         type: "content.delta",
                         payload: {
                           streamKind: "assistant_text",
-                          delta: `\n\n**Antigravity Error**: ${resultObj.error}\n`,
+                          delta: `\n\n**Antigravity Error**: ${formattedError}\n`,
                         },
                       });
                     } else if (
