@@ -13,6 +13,7 @@ import {
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { extractJsonObject } from "@t3tools/shared/schemaJson";
+import { resolveAntigravityBinary } from "../provider/Layers/AntigravityProvider.ts";
 
 import * as TextGeneration from "./TextGeneration.ts";
 import {
@@ -70,7 +71,7 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
     readonly outputSchemaJson: S;
     readonly modelSelection: ModelSelection;
   }): Effect.fn.Return<S["Type"], TextGenerationError, S["DecodingServices"]> {
-    const binary = settings.binaryPath || "agy";
+    const binary = resolveAntigravityBinary(settings.binaryPath, processEnv);
     const args = ["-p", prompt, "--output-format", "stream-json", "--print-timeout", "10m"];
 
     if (settings.dangerouslySkipPermissions !== false) {

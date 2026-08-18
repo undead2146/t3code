@@ -38,6 +38,7 @@ import {
 } from "../Errors.ts";
 import { type AntigravityAdapterShape } from "../Services/AntigravityAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
+import { resolveAntigravityBinary } from "./AntigravityProvider.ts";
 
 const PROVIDER = ProviderDriverKind.make("antigravity");
 const decodeJsonExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
@@ -294,7 +295,7 @@ export function makeAntigravityAdapter(
             payload: {},
           });
 
-          const binary = settings.binaryPath || "agy";
+          const binary = resolveAntigravityBinary(settings.binaryPath, processEnv);
           const args = ["--output-format", "stream-json", "--print-timeout", "24h"];
 
           if (settings.dangerouslySkipPermissions !== false) {

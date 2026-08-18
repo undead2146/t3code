@@ -123,7 +123,12 @@ function resolveSpawnExecutableWithNode(
     return candidates.find(isExecutable);
   }
 
-  for (const pathEntry of (readEnvPath(env) ?? "").split(pathDelimiterForPlatform(platform))) {
+  const pathEntries = [
+    ...(readEnvPath(env) ?? "").split(pathDelimiterForPlatform(platform)),
+    ...(platform === "win32" ? resolveKnownWindowsCliDirs(env) : []),
+  ];
+
+  for (const pathEntry of pathEntries) {
     const normalizedPathEntry = stripWrappingQuotes(pathEntry.trim());
     if (normalizedPathEntry.length === 0) continue;
     for (const candidate of candidates) {
@@ -606,6 +611,14 @@ const resolveCommandPathForPlatform = Effect.fn("shell.resolveCommandPathForPlat
     const pathEntry = stripWrappingQuotes(entry.trim());
     if (pathEntry.length > 0) {
       pathEntries.push(pathEntry);
+    }
+  }
+  if (platform === "win32") {
+    for (const entry of resolveKnownWindowsCliDirs(env)) {
+      const pathEntry = stripWrappingQuotes(entry.trim());
+      if (pathEntry.length > 0 && !pathEntries.includes(pathEntry)) {
+        pathEntries.push(pathEntry);
+      }
     }
   }
 
