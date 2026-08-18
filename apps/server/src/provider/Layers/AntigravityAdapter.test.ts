@@ -334,4 +334,65 @@ it.layer(NodeServices.layer)("makeAntigravityAdapter", (it) => {
       yield* adapter.stopSession(threadId);
     }),
   );
+
+  it.effect(
+    "retains main turn token usage when checkpoint sub-step occurs and updates totalProcessedTokens",
+    () =>
+      Effect.gen(function* () {
+        const mockScript = yield* makeMockAgyScript([
+          '{"event":"init","conversation_id":"conv-usage-test"}',
+          '{"event":"step_update","step_update":{"step_index":0,"step_type":"agent_response","text_delta":"Response text","state":"DONE","usage":{"input_tokens":14474,"output_tokens":89,"thinking_tokens":80,"total_tokens":14563}}}',
+          '{"event":"step_update","step_update":{"step_index":1,"step_type":"checkpoint","state":"DONE","usage":{"input_tokens":94,"output_tokens":3,"total_tokens":97}}}',
+          '{"event":"result","result":{"conversation_id":"conv-usage-test","usage":{"input_tokens":29334,"output_tokens":161,"total_tokens":29495}}}',
+        ]);
+
+        const adapter = yield* makeAntigravityAdapter(
+          decodeAntigravitySettings({
+            enabled: true,
+            binaryPath: mockScript,
+          }),
+        );
+
+        const threadId = ThreadId.make("thread-usage-test");
+        yield* adapter.startSession({
+          threadId,
+          runtimeMode: "full-access",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("antigravity"),
+            model: "claude-sonnet-4-6",
+          },
+        });
+
+        const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 7).pipe(
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+
+        yield* Effect.yieldNow;
+
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Test usage",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("antigravity"),
+            model: "claude-sonnet-4-6",
+          },
+        });
+
+        const eventsChunk = yield* Fiber.join(runtimeEventsFiber);
+        const usageEvents = Array.from(eventsChunk).filter(
+          (e) => e.type === "thread.token-usage.updated",
+        );
+
+        expect(usageEvents.length).toBeGreaterThanOrEqual(1);
+        const lastUsageEvent = usageEvents[usageEvents.length - 1];
+        if (lastUsageEvent && lastUsageEvent.type === "thread.token-usage.updated") {
+          expect(lastUsageEvent.payload.usage.usedTokens).toBe(14563);
+          expect(lastUsageEvent.payload.usage.maxTokens).toBe(200_000);
+          expect(lastUsageEvent.payload.usage.totalProcessedTokens).toBe(29495);
+        }
+
+        yield* adapter.stopSession(threadId);
+      }),
+  );
 });

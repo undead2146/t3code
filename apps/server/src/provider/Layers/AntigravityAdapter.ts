@@ -125,6 +125,7 @@ function parseAntigravityUsageSnapshot(
   rawUsage: unknown,
   contextWindow: number | undefined,
   existingUsage?: ThreadTokenUsageSnapshot,
+  isResultEvent = false,
 ): ThreadTokenUsageSnapshot | undefined {
   if (!rawUsage || typeof rawUsage !== "object") {
     return undefined;
@@ -139,28 +140,31 @@ function parseAntigravityUsageSnapshot(
   const cachedInputTokens = count(usage.cache_read_tokens ?? usage.cached_tokens);
   const totalTokens = count(usage.total_tokens);
 
-  const activeTokens = totalTokens ?? (inputTokens ?? 0) + (outputTokens ?? 0);
+  const activeTokens =
+    inputTokens !== undefined && outputTokens !== undefined
+      ? inputTokens + outputTokens
+      : (totalTokens ?? (inputTokens ?? 0) + (outputTokens ?? 0));
 
   if (activeTokens <= 0 && (!inputTokens || inputTokens <= 0)) {
     return undefined;
   }
 
   const maxTokens = contextWindow ?? existingUsage?.maxTokens ?? 1_000_000;
-  const usedTokens = Math.min(activeTokens, maxTokens);
-  const usedPercentage = maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : undefined;
-  const remainingTokens = Math.max(0, maxTokens - usedTokens);
-  const remainingPercentage =
-    usedPercentage !== undefined ? Math.max(0, 100 - usedPercentage) : undefined;
+  const usedTokens =
+    isResultEvent && existingUsage?.usedTokens
+      ? existingUsage.usedTokens
+      : Math.min(activeTokens, maxTokens);
+
+  const totalProcessedTokens =
+    isResultEvent && totalTokens !== undefined
+      ? Math.max(totalTokens, existingUsage?.totalProcessedTokens ?? 0)
+      : (existingUsage?.totalProcessedTokens ??
+        (totalTokens !== undefined && totalTokens > usedTokens ? totalTokens : undefined));
 
   return {
     usedTokens,
-    maxTokens,
-    ...(remainingTokens !== undefined ? { remainingTokens } : {}),
-    ...(usedPercentage !== undefined ? { usedPercentage } : {}),
-    ...(remainingPercentage !== undefined ? { remainingPercentage } : {}),
-    ...(totalTokens !== undefined && totalTokens > usedTokens
-      ? { totalProcessedTokens: totalTokens }
-      : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    ...(totalProcessedTokens !== undefined ? { totalProcessedTokens } : {}),
     ...(inputTokens !== undefined && inputTokens > 0 ? { inputTokens } : {}),
     ...(outputTokens !== undefined && outputTokens > 0 ? { outputTokens } : {}),
     ...(reasoningOutputTokens !== undefined && reasoningOutputTokens > 0
@@ -264,7 +268,9 @@ export function makeAntigravityAdapter(
 
           const sessionScope = yield* Scope.make();
           const createdAt = yield* nowIso;
-          const isTargetInstance = input.modelSelection?.instanceId === boundInstanceId;
+          const isTargetInstance =
+            input.modelSelection?.instanceId === boundInstanceId ||
+            !input.modelSelection?.instanceId;
           const session: ProviderSession = {
             threadId,
             status: "ready",
@@ -377,15 +383,8 @@ export function makeAntigravityAdapter(
             args.push("--dangerously-skip-permissions");
           }
 
-          const selectedModel =
-            input.modelSelection?.instanceId === boundInstanceId
-              ? input.modelSelection.model
-              : undefined;
-
-          const selectedEffort =
-            input.modelSelection?.instanceId === boundInstanceId
-              ? getModelSelectionStringOptionValue(input.modelSelection, "effort")
-              : undefined;
+          const selectedModel = input.modelSelection?.model;
+          const selectedEffort = getModelSelectionStringOptionValue(input.modelSelection, "effort");
           let effectiveEffort = selectedEffort || settings.effort;
 
           if (selectedModel) {
@@ -622,11 +621,16 @@ export function makeAntigravityAdapter(
                       }
                     }
 
-                    if (typeof step.usage === "object" && step.usage !== null) {
+                    if (
+                      step.step_type !== "checkpoint" &&
+                      typeof step.usage === "object" &&
+                      step.usage !== null
+                    ) {
                       const usageSnapshot = parseAntigravityUsageSnapshot(
                         step.usage,
                         ctx.lastKnownContextWindow,
                         ctx.lastKnownTokenUsage,
+                        false,
                       );
                       if (usageSnapshot) {
                         ctx.lastKnownTokenUsage = usageSnapshot;
@@ -691,6 +695,7 @@ export function makeAntigravityAdapter(
                         resultObj.usage,
                         ctx.lastKnownContextWindow,
                         ctx.lastKnownTokenUsage,
+                        true,
                       );
                       if (usageSnapshot) {
                         ctx.lastKnownTokenUsage = usageSnapshot;
