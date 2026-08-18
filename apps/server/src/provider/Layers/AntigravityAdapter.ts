@@ -607,8 +607,8 @@ export function makeAntigravityAdapter(
                           delta: `\n\n**Antigravity Error**: ${formattedError}\n`,
                         },
                       });
-                    } else if (
-                      resultObj.status === "SUCCESS" &&
+                    }
+                    if (
                       typeof resultObj.response === "string" &&
                       !hasEmittedText &&
                       resultObj.response.length > 0
@@ -632,11 +632,12 @@ export function makeAntigravityAdapter(
             );
 
             const exitCode = yield* processHandle.exitCode;
-            const isSuccess = exitCode === 0 && !lastResultError;
+            const isSuccess =
+              exitCode === 0 && (!lastResultError || hasEmittedText || turnRecord.items.length > 0);
             const errorDetail =
-              lastResultError ||
+              (exitCode !== 0 ? lastResultError : undefined) ||
               (stderrChunks.length > 0 ? stderrChunks.join("\n") : undefined) ||
-              `Antigravity CLI process exited with code ${exitCode}`;
+              (!isSuccess ? `Antigravity CLI process exited with code ${exitCode}` : undefined);
 
             yield* withThreadLock(
               threadId,
