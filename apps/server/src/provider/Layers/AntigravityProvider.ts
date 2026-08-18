@@ -134,7 +134,7 @@ export function resolveAntigravityContextWindow(
   return 1_000_000;
 }
 
-const VERSION_PROBE_TIMEOUT_MS = 4_000;
+const VERSION_PROBE_TIMEOUT_MS = 15_000;
 
 const ANTIGRAVITY_BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
   {
@@ -280,6 +280,7 @@ export function resolveAntigravityBinary(
   }
   const localAppData = env.LOCALAPPDATA?.trim();
   const userProfile = env.USERPROFILE?.trim();
+  const home = env.HOME?.trim();
   const candidates = [
     ...(localAppData
       ? [`${localAppData}\\agy\\bin\\agy.exe`, `${localAppData}\\Programs\\agy\\bin\\agy.exe`]
@@ -287,7 +288,16 @@ export function resolveAntigravityBinary(
     ...(userProfile
       ? [
           `${userProfile}\\.local\\bin\\agy`,
+          `${userProfile}\\.local\\bin\\agy.cmd`,
           `${userProfile}\\.gemini\\antigravity-cli\\bin\\agy.exe`,
+          `${userProfile}\\.gemini\\antigravity-cli\\bin\\agy.cmd`,
+        ]
+      : []),
+    ...(home
+      ? [
+          `${home}/.local/bin/agy`,
+          `${home}/.agy/bin/agy`,
+          `${home}/.gemini/antigravity-cli/bin/agy`,
         ]
       : []),
   ];
@@ -394,6 +404,8 @@ export const checkAntigravityProviderStatus = Effect.fn("checkAntigravityProvide
     }
 
     if (Option.isNone(probeResult.success)) {
+      const resolved = resolveAntigravityBinary(settings.binaryPath, environment);
+      const binaryExists = resolved !== "agy";
       return buildServerProvider({
         presentation: ANTIGRAVITY_PRESENTATION,
         enabled: settings.enabled,
@@ -402,9 +414,16 @@ export const checkAntigravityProviderStatus = Effect.fn("checkAntigravityProvide
         probe: {
           installed: true,
           version: null,
-          status: "error",
-          auth: { status: "unknown" },
-          message: "Antigravity CLI is installed but timed out while running `agy --help`.",
+          status: binaryExists ? "ready" : "error",
+          auth: account.email
+            ? {
+                status: "authenticated",
+                ...account,
+              }
+            : { status: "unknown" },
+          message: binaryExists
+            ? undefined
+            : "Antigravity CLI is installed but timed out while running `agy --help`.",
         },
       });
     }
