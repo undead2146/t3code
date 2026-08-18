@@ -2,6 +2,7 @@ import * as NodeFS from "node:fs";
 import {
   type AntigravitySettings,
   type ModelCapabilities,
+  type ModelSelection,
   type ServerProvider,
   type ServerProviderModel,
 } from "@t3tools/contracts";
