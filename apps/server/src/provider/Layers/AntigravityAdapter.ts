@@ -38,7 +38,10 @@ import {
 } from "../Errors.ts";
 import { type AntigravityAdapterShape } from "../Services/AntigravityAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
-import { resolveAntigravityBinary } from "./AntigravityProvider.ts";
+import {
+  resolveAntigravityBinary,
+  resolveAntigravityContextWindow,
+} from "./AntigravityProvider.ts";
 
 const PROVIDER = ProviderDriverKind.make("antigravity");
 const decodeJsonExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
@@ -64,6 +67,8 @@ interface AntigravitySessionContext {
   activeTurnId: TurnId | undefined;
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
   stopped: boolean;
+  lastKnownContextWindow: number | undefined;
+  lastKnownTokenUsage: ThreadTokenUsageSnapshot | undefined;
 }
 
 function toolNameToItemType(toolName: string): CanonicalItemType {
@@ -116,6 +121,56 @@ function toolParamsToDetail(parameters: unknown): string | undefined {
     : undefined;
 }
 
+function parseAntigravityUsageSnapshot(
+  rawUsage: unknown,
+  contextWindow: number | undefined,
+  existingUsage?: ThreadTokenUsageSnapshot,
+): ThreadTokenUsageSnapshot | undefined {
+  if (!rawUsage || typeof rawUsage !== "object") {
+    return undefined;
+  }
+  const usage = rawUsage as Record<string, unknown>;
+  const count = (v: unknown): number | undefined =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined;
+
+  const inputTokens = count(usage.input_tokens);
+  const outputTokens = count(usage.output_tokens);
+  const reasoningOutputTokens = count(usage.thinking_tokens);
+  const cachedInputTokens = count(usage.cache_read_tokens ?? usage.cached_tokens);
+  const totalTokens = count(usage.total_tokens);
+
+  const activeTokens = totalTokens ?? (inputTokens ?? 0) + (outputTokens ?? 0);
+
+  if (activeTokens <= 0 && (!inputTokens || inputTokens <= 0)) {
+    return undefined;
+  }
+
+  const maxTokens = contextWindow ?? existingUsage?.maxTokens ?? 1_000_000;
+  const usedTokens = Math.min(activeTokens, maxTokens);
+  const usedPercentage = maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : undefined;
+  const remainingTokens = Math.max(0, maxTokens - usedTokens);
+  const remainingPercentage =
+    usedPercentage !== undefined ? Math.max(0, 100 - usedPercentage) : undefined;
+
+  return {
+    usedTokens,
+    maxTokens,
+    ...(remainingTokens !== undefined ? { remainingTokens } : {}),
+    ...(usedPercentage !== undefined ? { usedPercentage } : {}),
+    ...(remainingPercentage !== undefined ? { remainingPercentage } : {}),
+    ...(totalTokens !== undefined && totalTokens > usedTokens
+      ? { totalProcessedTokens: totalTokens }
+      : {}),
+    ...(inputTokens !== undefined && inputTokens > 0 ? { inputTokens } : {}),
+    ...(outputTokens !== undefined && outputTokens > 0 ? { outputTokens } : {}),
+    ...(reasoningOutputTokens !== undefined && reasoningOutputTokens > 0
+      ? { reasoningOutputTokens }
+      : {}),
+    ...(cachedInputTokens !== undefined && cachedInputTokens > 0 ? { cachedInputTokens } : {}),
+    compactsAutomatically: true,
+  };
+}
+
 export function makeAntigravityAdapter(
   settings: AntigravitySettings,
   options?: AntigravityAdapterLiveOptions,
@@ -143,23 +198,27 @@ export function makeAntigravityAdapter(
         const existing: Option.Option<Semaphore.Semaphore> = Option.fromNullishOr(
           current.get(threadId),
         );
-        return Option.match(existing, {
-          onNone: () =>
-            Semaphore.make(1).pipe(
-              Effect.map((semaphore) => {
-                const next = new Map(current);
-                next.set(threadId, semaphore);
-                return [semaphore, next] as const;
-              }),
-            ),
-          onSome: (semaphore) => Effect.succeed([semaphore, current] as const),
-        });
+        if (Option.isSome(existing)) {
+          return Effect.succeed([existing.value, current] as const);
+        }
+        return Semaphore.make(1).pipe(
+          Effect.map((semaphore) => {
+            const next = new Map(current);
+            next.set(threadId, semaphore);
+            return [semaphore, next] as const;
+          }),
+        );
       });
 
-    const withThreadLock = <A, E, R>(threadId: string, effect: Effect.Effect<A, E, R>) =>
-      Effect.flatMap(getThreadSemaphore(threadId), (semaphore) => semaphore.withPermit(effect));
+    const withThreadLock = <A, E, R>(
+      threadId: ThreadId,
+      effect: Effect.Effect<A, E, R>,
+    ): Effect.Effect<A, E, R> =>
+      Effect.flatMap(getThreadSemaphore(threadId), (semaphore) =>
+        Semaphore.withPermit(semaphore)(effect),
+      );
 
-    const publishEvent = (event: ProviderRuntimeEvent) =>
+    const publishEvent = (event: ProviderRuntimeEvent): Effect.Effect<void, never, never> =>
       Queue.offer(runtimeEventQueue, event).pipe(Effect.asVoid);
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -183,16 +242,15 @@ export function makeAntigravityAdapter(
     const requireSession = (
       threadId: ThreadId,
     ): Effect.Effect<AntigravitySessionContext, ProviderAdapterError> =>
-      Effect.gen(function* () {
-        const ctx = sessions.get(threadId);
-        if (!ctx || ctx.stopped) {
-          return yield* new ProviderAdapterSessionNotFoundError({
-            provider: PROVIDER,
-            threadId,
-          });
-        }
-        return ctx;
-      });
+      Effect.sync(() => sessions.get(threadId)).pipe(
+        Effect.flatMap((ctx) =>
+          ctx && !ctx.stopped
+            ? Effect.succeed(ctx)
+            : Effect.fail(
+                new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }),
+              ),
+        ),
+      );
 
     const startSession: AntigravityAdapterShape["startSession"] = (input) =>
       withThreadLock(
@@ -206,7 +264,6 @@ export function makeAntigravityAdapter(
 
           const sessionScope = yield* Scope.make();
           const createdAt = yield* nowIso;
-
           const isTargetInstance = input.modelSelection?.instanceId === boundInstanceId;
           const session: ProviderSession = {
             threadId,
@@ -219,6 +276,7 @@ export function makeAntigravityAdapter(
             updatedAt: createdAt,
           };
 
+          const contextWindow = resolveAntigravityContextWindow(input.modelSelection);
           const ctx: AntigravitySessionContext = {
             threadId,
             session,
@@ -229,6 +287,8 @@ export function makeAntigravityAdapter(
             activeTurnId: undefined,
             turns: [],
             stopped: false,
+            lastKnownContextWindow: contextWindow,
+            lastKnownTokenUsage: undefined,
           };
 
           sessions.set(threadId, ctx);
@@ -256,6 +316,11 @@ export function makeAntigravityAdapter(
           if (ctx.activeProcess) {
             yield* ctx.activeProcess.kill();
             ctx.activeProcess = undefined;
+          }
+
+          const turnContextWindow = resolveAntigravityContextWindow(input.modelSelection);
+          if (turnContextWindow !== undefined) {
+            ctx.lastKnownContextWindow = turnContextWindow;
           }
 
           if (ctx.activeTurnId) {
@@ -478,40 +543,6 @@ export function makeAntigravityAdapter(
                           },
                         });
                       }
-
-                      if (
-                        step.state === "DONE" &&
-                        typeof step.usage === "object" &&
-                        step.usage !== null
-                      ) {
-                        const usage = step.usage as Record<string, unknown>;
-                        const count = (v: unknown): number | undefined =>
-                          typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
-                        const usedTokens = count(usage.total_tokens) ?? 0;
-                        const inputTokens = count(usage.input_tokens);
-                        const outputTokens = count(usage.output_tokens);
-                        const reasoningOutputTokens = count(usage.thinking_tokens);
-                        const cachedInputTokens = count(
-                          usage.cache_read_tokens ?? usage.cached_tokens,
-                        );
-                        const usageSnapshot: ThreadTokenUsageSnapshot = {
-                          usedTokens,
-                          maxTokens: 1_000_000,
-                          ...(inputTokens !== undefined ? { inputTokens } : {}),
-                          ...(outputTokens !== undefined ? { outputTokens } : {}),
-                          ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
-                          ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
-                          compactsAutomatically: true,
-                        };
-                        yield* publishEvent({
-                          ...stamp,
-                          provider: PROVIDER,
-                          threadId,
-                          turnId,
-                          type: "thread.token-usage.updated",
-                          payload: { usage: usageSnapshot },
-                        });
-                      }
                     } else if (step.step_type === "tool" && typeof step.tool_name === "string") {
                       const toolItemType = toolNameToItemType(step.tool_name);
                       const toolInfo =
@@ -580,6 +611,25 @@ export function makeAntigravityAdapter(
                         });
                       }
                     }
+
+                    if (typeof step.usage === "object" && step.usage !== null) {
+                      const usageSnapshot = parseAntigravityUsageSnapshot(
+                        step.usage,
+                        ctx.lastKnownContextWindow,
+                        ctx.lastKnownTokenUsage,
+                      );
+                      if (usageSnapshot) {
+                        ctx.lastKnownTokenUsage = usageSnapshot;
+                        yield* publishEvent({
+                          ...stamp,
+                          provider: PROVIDER,
+                          threadId,
+                          turnId,
+                          type: "thread.token-usage.updated",
+                          payload: { usage: usageSnapshot },
+                        });
+                      }
+                    }
                   } else if (
                     data.event === "result" &&
                     typeof data.result === "object" &&
@@ -625,6 +675,24 @@ export function makeAntigravityAdapter(
                           delta: resultObj.response,
                         },
                       });
+                    }
+                    if (typeof resultObj.usage === "object" && resultObj.usage !== null) {
+                      const usageSnapshot = parseAntigravityUsageSnapshot(
+                        resultObj.usage,
+                        ctx.lastKnownContextWindow,
+                        ctx.lastKnownTokenUsage,
+                      );
+                      if (usageSnapshot) {
+                        ctx.lastKnownTokenUsage = usageSnapshot;
+                        yield* publishEvent({
+                          ...stamp,
+                          provider: PROVIDER,
+                          threadId,
+                          turnId,
+                          type: "thread.token-usage.updated",
+                          payload: { usage: usageSnapshot },
+                        });
+                      }
                     }
                   }
                 }

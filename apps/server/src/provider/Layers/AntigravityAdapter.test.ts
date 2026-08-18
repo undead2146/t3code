@@ -146,6 +146,16 @@ it.layer(NodeServices.layer)("makeAntigravityAdapter", (it) => {
       expect(types).toContain("thread.token-usage.updated");
       expect(types).toContain("turn.completed");
 
+      const usageEvent = Array.from(eventsChunk).find(
+        (e) => e.type === "thread.token-usage.updated",
+      );
+      expect(usageEvent).toBeDefined();
+      if (usageEvent && usageEvent.type === "thread.token-usage.updated") {
+        expect(usageEvent.payload.usage.usedTokens).toBe(100);
+        expect(usageEvent.payload.usage.inputTokens).toBe(40);
+        expect(usageEvent.payload.usage.outputTokens).toBe(60);
+      }
+
       yield* adapter.stopSession(threadId);
     }),
   );

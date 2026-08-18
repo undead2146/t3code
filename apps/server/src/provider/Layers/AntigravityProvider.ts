@@ -13,7 +13,7 @@ import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import { HttpClient } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import { createModelCapabilities } from "@t3tools/shared/model";
+import { createModelCapabilities, getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
 import {
@@ -47,9 +47,91 @@ const ANTIGRAVITY_EFFORT_DESCRIPTOR = buildSelectOptionDescriptor({
   ],
 });
 
-const ANTIGRAVITY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
-  optionDescriptors: [ANTIGRAVITY_EFFORT_DESCRIPTOR],
+const ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_GEMINI = buildSelectOptionDescriptor({
+  id: "contextWindow",
+  label: "Context Window",
+  options: [
+    { value: "1m", label: "1M", isDefault: true },
+    { value: "2m", label: "2M" },
+  ],
 });
+
+const ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_CLAUDE = buildSelectOptionDescriptor({
+  id: "contextWindow",
+  label: "Context Window",
+  options: [
+    { value: "200k", label: "200k", isDefault: true },
+    { value: "1m", label: "1M" },
+  ],
+});
+
+const ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_STANDARD = buildSelectOptionDescriptor({
+  id: "contextWindow",
+  label: "Context Window",
+  options: [
+    { value: "128k", label: "128k", isDefault: true },
+    { value: "200k", label: "200k" },
+  ],
+});
+
+export function getAntigravityModelCapabilities(slug: string): ModelCapabilities {
+  const lower = slug.toLowerCase();
+  if (lower.includes("claude")) {
+    return createModelCapabilities({
+      optionDescriptors: [
+        ANTIGRAVITY_EFFORT_DESCRIPTOR,
+        ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_CLAUDE,
+      ],
+    });
+  }
+  if (lower.includes("gpt")) {
+    return createModelCapabilities({
+      optionDescriptors: [
+        ANTIGRAVITY_EFFORT_DESCRIPTOR,
+        ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_STANDARD,
+      ],
+    });
+  }
+  return createModelCapabilities({
+    optionDescriptors: [
+      ANTIGRAVITY_EFFORT_DESCRIPTOR,
+      ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_GEMINI,
+    ],
+  });
+}
+
+const ANTIGRAVITY_CAPABILITIES: ModelCapabilities = getAntigravityModelCapabilities("gemini");
+
+export function resolveAntigravityContextWindow(
+  modelSelection: ModelSelection | { model?: string; options?: unknown } | undefined,
+): number {
+  const model = modelSelection?.model?.toLowerCase() ?? "";
+  let rawOption: string | undefined;
+  if (Array.isArray(modelSelection?.options)) {
+    rawOption = getModelSelectionStringOptionValue(
+      modelSelection as ModelSelection,
+      "contextWindow",
+    );
+  } else if (
+    modelSelection?.options &&
+    typeof modelSelection.options === "object" &&
+    "contextWindow" in modelSelection.options &&
+    typeof (modelSelection.options as Record<string, unknown>).contextWindow === "string"
+  ) {
+    rawOption = (modelSelection.options as Record<string, unknown>).contextWindow as string;
+  }
+
+  if (rawOption === "2m") return 2_000_000;
+  if (rawOption === "1m") return 1_000_000;
+  if (rawOption === "200k") return 200_000;
+  if (rawOption === "128k") return 128_000;
+
+  if (model.includes("gemini-3.1-pro")) return 2_000_000;
+  if (model.includes("gemini")) return 1_000_000;
+  if (model.includes("claude")) return 200_000;
+  if (model.includes("gpt")) return 128_000;
+  return 1_000_000;
+}
 
 const VERSION_PROBE_TIMEOUT_MS = 4_000;
 
@@ -58,43 +140,43 @@ const ANTIGRAVITY_BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
     slug: "gemini-3.7-flash",
     name: "Gemini 3.7 Flash",
     isCustom: false,
-    capabilities: ANTIGRAVITY_CAPABILITIES,
+    capabilities: getAntigravityModelCapabilities("gemini-3.7-flash"),
   },
   {
     slug: "gemini-3.6-flash",
     name: "Gemini 3.6 Flash",
     isCustom: false,
-    capabilities: ANTIGRAVITY_CAPABILITIES,
+    capabilities: getAntigravityModelCapabilities("gemini-3.6-flash"),
   },
   {
     slug: "gemini-3.5-flash",
     name: "Gemini 3.5 Flash",
     isCustom: false,
-    capabilities: ANTIGRAVITY_CAPABILITIES,
+    capabilities: getAntigravityModelCapabilities("gemini-3.5-flash"),
   },
   {
     slug: "gemini-3.1-pro",
     name: "Gemini 3.1 Pro",
     isCustom: false,
-    capabilities: ANTIGRAVITY_CAPABILITIES,
+    capabilities: getAntigravityModelCapabilities("gemini-3.1-pro"),
   },
   {
     slug: "claude-sonnet-4-6",
     name: "Claude Sonnet 4.6 (Thinking)",
     isCustom: false,
-    capabilities: ANTIGRAVITY_CAPABILITIES,
+    capabilities: getAntigravityModelCapabilities("claude-sonnet-4-6"),
   },
   {
     slug: "claude-opus-4-6-thinking",
     name: "Claude Opus 4.6 (Thinking)",
     isCustom: false,
-    capabilities: ANTIGRAVITY_CAPABILITIES,
+    capabilities: getAntigravityModelCapabilities("claude-opus-4-6-thinking"),
   },
   {
     slug: "gpt-oss-120b-medium",
     name: "GPT-OSS 120B (Medium)",
     isCustom: false,
-    capabilities: ANTIGRAVITY_CAPABILITIES,
+    capabilities: getAntigravityModelCapabilities("gpt-oss-120b-medium"),
   },
 ];
 
@@ -116,7 +198,7 @@ export function parseAntigravityModels(output: string): ReadonlyArray<ServerProv
           slug,
           name,
           isCustom: false,
-          capabilities: ANTIGRAVITY_CAPABILITIES,
+          capabilities: getAntigravityModelCapabilities(slug),
         });
       }
     }
