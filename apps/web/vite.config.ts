@@ -92,7 +92,7 @@ function resolveDevProxyTarget(
   // T3CODE_PORT is set by scripts/dev-runner.ts for every non-desktop mode.
   const port = Number(backendPort?.trim());
   if (Number.isInteger(port) && port > 0) {
-    return `http://localhost:${port}/`;
+    return `http://127.0.0.1:${port}/`;
   }
 
   // dev:desktop still points the renderer straight at the backend, so fall
