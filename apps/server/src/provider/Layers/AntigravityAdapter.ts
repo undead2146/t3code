@@ -335,6 +335,16 @@ export function makeAntigravityAdapter(
                 reason: "Superseded by new turn",
               },
             });
+            yield* publishEvent({
+              ...abortedStamp,
+              provider: PROVIDER,
+              threadId,
+              turnId: ctx.activeTurnId,
+              type: "turn.completed",
+              payload: {
+                state: "interrupted",
+              },
+            });
             ctx.activeTurnId = undefined;
           }
 
@@ -777,7 +787,32 @@ export function makeAntigravityAdapter(
         threadId,
         Effect.gen(function* () {
           const ctx = sessions.get(threadId);
-          if (!ctx) return;
+          if (!ctx) {
+            if (turnId) {
+              const stamp = yield* makeEventStamp();
+              yield* publishEvent({
+                ...stamp,
+                provider: PROVIDER,
+                threadId,
+                turnId,
+                type: "turn.aborted",
+                payload: {
+                  reason: "Turn interrupted by user",
+                },
+              });
+              yield* publishEvent({
+                ...stamp,
+                provider: PROVIDER,
+                threadId,
+                turnId,
+                type: "turn.completed",
+                payload: {
+                  state: "interrupted",
+                },
+              });
+            }
+            return;
+          }
 
           if (turnId !== undefined && ctx.activeTurnId !== turnId) {
             return;
@@ -852,7 +887,19 @@ export function makeAntigravityAdapter(
         threadId,
         Effect.gen(function* () {
           const ctx = sessions.get(threadId);
-          if (!ctx) return;
+          if (!ctx) {
+            const stamp = yield* makeEventStamp();
+            yield* publishEvent({
+              ...stamp,
+              provider: PROVIDER,
+              threadId,
+              type: "session.exited",
+              payload: {
+                exitKind: "graceful",
+              },
+            });
+            return;
+          }
           yield* stopSessionInternal(ctx);
         }),
       );
