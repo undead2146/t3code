@@ -48,87 +48,18 @@ const ANTIGRAVITY_EFFORT_DESCRIPTOR = buildSelectOptionDescriptor({
   ],
 });
 
-const ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_GEMINI = buildSelectOptionDescriptor({
-  id: "contextWindow",
-  label: "Context Window",
-  options: [
-    { value: "1m", label: "1M", isDefault: true },
-    { value: "2m", label: "2M" },
-  ],
-});
-
-const ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_CLAUDE = buildSelectOptionDescriptor({
-  id: "contextWindow",
-  label: "Context Window",
-  options: [
-    { value: "200k", label: "200k", isDefault: true },
-    { value: "1m", label: "1M" },
-  ],
-});
-
-const ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_STANDARD = buildSelectOptionDescriptor({
-  id: "contextWindow",
-  label: "Context Window",
-  options: [
-    { value: "128k", label: "128k", isDefault: true },
-    { value: "200k", label: "200k" },
-  ],
-});
-
-export function getAntigravityModelCapabilities(slug: string): ModelCapabilities {
-  const lower = slug.toLowerCase();
-  if (lower.includes("claude")) {
-    return createModelCapabilities({
-      optionDescriptors: [
-        ANTIGRAVITY_EFFORT_DESCRIPTOR,
-        ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_CLAUDE,
-      ],
-    });
-  }
-  if (lower.includes("gpt")) {
-    return createModelCapabilities({
-      optionDescriptors: [
-        ANTIGRAVITY_EFFORT_DESCRIPTOR,
-        ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_STANDARD,
-      ],
-    });
-  }
+export function getAntigravityModelCapabilities(_slug?: string): ModelCapabilities {
   return createModelCapabilities({
-    optionDescriptors: [
-      ANTIGRAVITY_EFFORT_DESCRIPTOR,
-      ANTIGRAVITY_CONTEXT_WINDOW_DESCRIPTOR_GEMINI,
-    ],
+    optionDescriptors: [ANTIGRAVITY_EFFORT_DESCRIPTOR],
   });
 }
 
-const ANTIGRAVITY_CAPABILITIES: ModelCapabilities = getAntigravityModelCapabilities("gemini");
+const ANTIGRAVITY_CAPABILITIES: ModelCapabilities = getAntigravityModelCapabilities();
 
 export function resolveAntigravityContextWindow(
   modelSelection: ModelSelection | { model?: string; options?: unknown } | undefined,
 ): number {
   const model = modelSelection?.model?.toLowerCase() ?? "";
-  let rawOption: string | undefined;
-  if (Array.isArray(modelSelection?.options)) {
-    rawOption = getModelSelectionStringOptionValue(
-      modelSelection as ModelSelection,
-      "contextWindow",
-    );
-  } else if (
-    modelSelection?.options &&
-    typeof modelSelection.options === "object" &&
-    "contextWindow" in modelSelection.options &&
-    typeof (modelSelection.options as Record<string, unknown>).contextWindow === "string"
-  ) {
-    rawOption = (modelSelection.options as Record<string, unknown>).contextWindow as string;
-  }
-
-  if (rawOption === "2m") return 2_000_000;
-  if (rawOption === "1m") return 1_000_000;
-  if (rawOption === "200k") return 200_000;
-  if (rawOption === "128k") return 128_000;
-
-  if (model.includes("gemini-3.1-pro")) return 2_000_000;
-  if (model.includes("gemini")) return 1_000_000;
   if (model.includes("claude")) return 200_000;
   if (model.includes("gpt")) return 128_000;
   return 1_000_000;

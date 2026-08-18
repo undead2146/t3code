@@ -395,4 +395,68 @@ it.layer(NodeServices.layer)("makeAntigravityAdapter", (it) => {
         yield* adapter.stopSession(threadId);
       }),
   );
+
+  it.effect(
+    "includes cached prompt tokens in active context window and prevents result totals from inflating usage",
+    () =>
+      Effect.gen(function* () {
+        const mockScript = yield* makeMockAgyScript([
+          '{"event":"init","conversation_id":"conv-cache-test"}',
+          '{"event":"step_update","step_update":{"step_index":0,"step_type":"agent_response","text_delta":"Cached response","state":"DONE","usage":{"input_tokens":4215,"cache_read_tokens":211285,"output_tokens":142,"thinking_tokens":51,"total_tokens":4357}}}',
+          '{"event":"result","result":{"conversation_id":"conv-cache-test","usage":{"input_tokens":2650687,"output_tokens":148356,"total_tokens":2799043}}}',
+        ]);
+
+        const adapter = yield* makeAntigravityAdapter(
+          decodeAntigravitySettings({
+            enabled: true,
+            binaryPath: mockScript,
+          }),
+        );
+
+        const threadId = ThreadId.make("thread-cache-test");
+        yield* adapter.startSession({
+          threadId,
+          runtimeMode: "full-access",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("antigravity"),
+            model: "gemini-3.7-flash",
+          },
+        });
+
+        const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 6).pipe(
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+
+        yield* Effect.yieldNow;
+
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Test cache usage",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("antigravity"),
+            model: "gemini-3.7-flash",
+          },
+        });
+
+        const eventsChunk = yield* Fiber.join(runtimeEventsFiber);
+        const usageEvents = Array.from(eventsChunk).filter(
+          (e) => e.type === "thread.token-usage.updated",
+        );
+
+        expect(usageEvents.length).toBeGreaterThanOrEqual(1);
+        const lastUsageEvent = usageEvents[usageEvents.length - 1];
+        if (lastUsageEvent && lastUsageEvent.type === "thread.token-usage.updated") {
+          // 4215 uncached + 211285 cached + 142 output = 215642 tokens used in 1M window (~21.6%)
+          expect(lastUsageEvent.payload.usage.usedTokens).toBe(215642);
+          expect(lastUsageEvent.payload.usage.cachedInputTokens).toBe(211285);
+          expect(lastUsageEvent.payload.usage.inputTokens).toBe(4215);
+          expect(lastUsageEvent.payload.usage.outputTokens).toBe(142);
+          expect(lastUsageEvent.payload.usage.maxTokens).toBe(1_000_000);
+          expect(lastUsageEvent.payload.usage.totalProcessedTokens).toBe(2799043);
+        }
+
+        yield* adapter.stopSession(threadId);
+      }),
+  );
 });

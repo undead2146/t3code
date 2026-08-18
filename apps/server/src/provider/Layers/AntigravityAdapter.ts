@@ -134,43 +134,79 @@ function parseAntigravityUsageSnapshot(
   const count = (v: unknown): number | undefined =>
     typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined;
 
-  const inputTokens = count(usage.input_tokens);
+  const rawInputTokens = count(usage.input_tokens);
   const outputTokens = count(usage.output_tokens);
   const reasoningOutputTokens = count(usage.thinking_tokens);
   const cachedInputTokens = count(usage.cache_read_tokens ?? usage.cached_tokens);
   const totalTokens = count(usage.total_tokens);
 
-  const activeTokens =
-    inputTokens !== undefined && outputTokens !== undefined
-      ? inputTokens + outputTokens
-      : (totalTokens ?? (inputTokens ?? 0) + (outputTokens ?? 0));
+  const maxTokens = contextWindow ?? existingUsage?.maxTokens ?? 1_000_000;
 
-  if (activeTokens <= 0 && (!inputTokens || inputTokens <= 0)) {
+  if (isResultEvent) {
+    // result.usage from agy represents cumulative lifetime totals across all turns of the session.
+    // We update totalProcessedTokens, but MUST NOT overwrite the active context window usage.
+    const totalProcessed =
+      totalTokens ??
+      (rawInputTokens !== undefined && outputTokens !== undefined
+        ? rawInputTokens + outputTokens
+        : undefined);
+    const totalProcessedTokens =
+      totalProcessed !== undefined
+        ? Math.max(totalProcessed, existingUsage?.totalProcessedTokens ?? 0)
+        : existingUsage?.totalProcessedTokens;
+
+    if (existingUsage) {
+      return {
+        ...existingUsage,
+        ...(maxTokens !== undefined ? { maxTokens } : {}),
+        ...(totalProcessedTokens !== undefined ? { totalProcessedTokens } : {}),
+      };
+    }
+
+    const inputTokens = rawInputTokens ?? 0;
+    const cachedTokens = cachedInputTokens ?? 0;
+    const activeTokens = inputTokens + cachedTokens + (outputTokens ?? 0);
+    if (activeTokens <= 0) {
+      return undefined;
+    }
+    const usedTokens = Math.min(activeTokens, maxTokens);
+    return {
+      usedTokens,
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
+      ...(totalProcessedTokens !== undefined ? { totalProcessedTokens } : {}),
+      ...(inputTokens > 0 ? { inputTokens } : {}),
+      ...(outputTokens !== undefined && outputTokens > 0 ? { outputTokens } : {}),
+      ...(reasoningOutputTokens !== undefined && reasoningOutputTokens > 0
+        ? { reasoningOutputTokens }
+        : {}),
+      ...(cachedTokens > 0 ? { cachedInputTokens: cachedTokens } : {}),
+      compactsAutomatically: true,
+    };
+  }
+
+  // For step_update.usage (the active LLM call state in the conversation):
+  // The context window size is the full prompt in the model (uncached + cached input tokens + generated output tokens).
+  const inputTokens = rawInputTokens ?? 0;
+  const cachedTokens = cachedInputTokens ?? 0;
+  const activeTokens = inputTokens + cachedTokens + (outputTokens ?? 0);
+
+  if (activeTokens <= 0) {
     return undefined;
   }
 
-  const maxTokens = contextWindow ?? existingUsage?.maxTokens ?? 1_000_000;
-  const usedTokens =
-    isResultEvent && existingUsage?.usedTokens
-      ? existingUsage.usedTokens
-      : Math.min(activeTokens, maxTokens);
-
-  const totalProcessedTokens =
-    isResultEvent && totalTokens !== undefined
-      ? Math.max(totalTokens, existingUsage?.totalProcessedTokens ?? 0)
-      : (existingUsage?.totalProcessedTokens ??
-        (totalTokens !== undefined && totalTokens > usedTokens ? totalTokens : undefined));
+  const usedTokens = Math.min(activeTokens, maxTokens);
+  const totalProcessedTokens = existingUsage?.totalProcessedTokens;
 
   return {
     usedTokens,
     ...(maxTokens !== undefined ? { maxTokens } : {}),
     ...(totalProcessedTokens !== undefined ? { totalProcessedTokens } : {}),
-    ...(inputTokens !== undefined && inputTokens > 0 ? { inputTokens } : {}),
+    ...(inputTokens > 0 ? { inputTokens } : {}),
     ...(outputTokens !== undefined && outputTokens > 0 ? { outputTokens } : {}),
     ...(reasoningOutputTokens !== undefined && reasoningOutputTokens > 0
       ? { reasoningOutputTokens }
       : {}),
-    ...(cachedInputTokens !== undefined && cachedInputTokens > 0 ? { cachedInputTokens } : {}),
+    ...(cachedTokens > 0 ? { cachedInputTokens: cachedTokens } : {}),
     compactsAutomatically: true,
   };
 }

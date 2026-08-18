@@ -16,7 +16,7 @@ import {
 const decodeAntigravitySettings = Schema.decodeSync(AntigravitySettings);
 
 describe("parseAntigravityModels", () => {
-  it("normalizes and deduplicates model list with effort suffixes and context window descriptors", () => {
+  it("normalizes and deduplicates model list with effort suffixes and option descriptors", () => {
     const rawOutput = [
       "gemini-3.7-flash-high     Gemini 3.7 Flash (High)",
       "gemini-3.7-flash-medium   Gemini 3.7 Flash (Medium)",
@@ -51,30 +51,14 @@ describe("parseAntigravityModels", () => {
       if (effortOption?.type === "select") {
         expect(effortOption.options.map((o) => o.id)).toEqual(["low", "medium", "high"]);
       }
-
-      const contextOption = model.capabilities?.optionDescriptors?.find(
-        (d) => d.id === "contextWindow",
-      );
-      expect(contextOption).toBeDefined();
-      expect(contextOption?.type).toBe("select");
     }
   });
 
-  it("resolves context window from selection or defaults", () => {
+  it("resolves context window from model defaults", () => {
     expect(resolveAntigravityContextWindow({ model: "gemini-3.7-flash" })).toBe(1_000_000);
-    expect(
-      resolveAntigravityContextWindow({
-        model: "gemini-3.7-flash",
-        options: { contextWindow: "2m" },
-      }),
-    ).toBe(2_000_000);
+    expect(resolveAntigravityContextWindow({ model: "gemini-3.1-pro" })).toBe(1_000_000);
     expect(resolveAntigravityContextWindow({ model: "claude-sonnet-4-6" })).toBe(200_000);
-    expect(
-      resolveAntigravityContextWindow({
-        model: "claude-sonnet-4-6",
-        options: { contextWindow: "1m" },
-      }),
-    ).toBe(1_000_000);
+    expect(resolveAntigravityContextWindow({ model: "gpt-oss-120b-medium" })).toBe(128_000);
   });
 });
 
