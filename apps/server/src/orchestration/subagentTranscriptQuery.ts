@@ -12,7 +12,7 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
-function findTranscriptPath(conversationId: string): string | null {
+export function findTranscriptPath(conversationId: string): string | null {
   const home = NodeOS.homedir();
   const candidates = [
     NodePath.join(
@@ -228,3 +228,70 @@ export const readSubagentTranscript = Effect.fn("orchestration.readSubagentTrans
     transcriptPath,
   };
 });
+
+export function computeSubagentUsage(
+  conversationId: string,
+  customPath?: string,
+):
+  | {
+      readonly totalTokens: number;
+      readonly inputTokens?: number;
+      readonly outputTokens?: number;
+      readonly toolUses?: number;
+    }
+  | undefined {
+  try {
+    const transcriptPath = customPath || findTranscriptPath(conversationId);
+    if (!transcriptPath || !NodeFS.existsSync(transcriptPath)) {
+      return undefined;
+    }
+    const rawContent = NodeFS.readFileSync(transcriptPath, "utf8");
+    const lines = rawContent
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    let toolUses = 0;
+    let inputChars = 0;
+    let outputChars = 0;
+
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line) as {
+          type?: string;
+          content?: string;
+          thinking?: string;
+          tool_calls?: Array<unknown>;
+        };
+        if (obj.type === "USER_INPUT") {
+          inputChars += (obj.content || "").length;
+        } else if (obj.type === "PLANNER_RESPONSE") {
+          if (Array.isArray(obj.tool_calls)) {
+            toolUses += obj.tool_calls.length;
+            outputChars += JSON.stringify(obj.tool_calls).length;
+          }
+          if (obj.content) {
+            outputChars += obj.content.length;
+          }
+          if (obj.thinking) {
+            outputChars += obj.thinking.length;
+          }
+        } else if (obj.type === "GENERIC" || obj.type === "SYSTEM_MESSAGE") {
+          inputChars += (obj.content || "").length;
+        }
+      } catch {}
+    }
+
+    const inputTokens = Math.round(inputChars / 3.8);
+    const outputTokens = Math.round(outputChars / 3.8);
+    const totalTokens = inputTokens + outputTokens;
+
+    return {
+      totalTokens: Math.max(1, totalTokens),
+      inputTokens,
+      outputTokens,
+      toolUses,
+    };
+  } catch {
+    return undefined;
+  }
+}

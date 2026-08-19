@@ -44,6 +44,7 @@ import {
   resolveAntigravityBinary,
   resolveAntigravityContextWindow,
 } from "./AntigravityProvider.ts";
+import { computeSubagentUsage } from "../../orchestration/subagentTranscriptQuery.ts";
 
 const PROVIDER = ProviderDriverKind.make("antigravity");
 const decodeJsonExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
@@ -1145,6 +1146,8 @@ export function makeAntigravityAdapter(
                               });
                             }
 
+                            const usage = computeSubagentUsage(cid, sub.transcript);
+
                             if (status === "completed" || status === "failed") {
                               yield* publishEvent({
                                 ...stamp,
@@ -1157,6 +1160,7 @@ export function makeAntigravityAdapter(
                                   status,
                                   taskType: "subagent",
                                   agentKind: "agent",
+                                  ...(usage ? { typedUsage: usage } : {}),
                                 },
                               });
                             } else if (sub.stateDetail) {
@@ -1175,6 +1179,7 @@ export function makeAntigravityAdapter(
                                   status: "running",
                                   taskType: "subagent",
                                   agentKind: "agent",
+                                  ...(usage ? { typedUsage: usage } : {}),
                                 },
                               });
                             }

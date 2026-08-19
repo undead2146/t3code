@@ -533,7 +533,10 @@ export function foldSubagentActivities(
         }
         const error = asString(payload.error);
         if (error) agent.error = bounded(error);
-        agent.usage = mergeUsageMax(agent.usage, asUsage(payload.typedUsage));
+        agent.usage = mergeUsageMax(
+          agent.usage,
+          asUsage(payload.typedUsage) ?? asUsage(payload.usage),
+        );
         agent.updatedAt = at;
         break;
       }
@@ -555,6 +558,10 @@ export function foldSubagentActivities(
         if (status) applyStatus(agent, status, at);
         const error = asString(payload.error);
         if (error) agent.error = bounded(error);
+        agent.usage = mergeUsageMax(
+          agent.usage,
+          asUsage(payload.typedUsage) ?? asUsage(payload.usage),
+        );
         // Provider end time beats ingestion time for the transition that
         // actually settled the run (applyStatus fills completedAt with the
         // activity timestamp first, so check the transition, not null).
@@ -591,7 +598,10 @@ export function foldSubagentActivities(
               agent.result = agent.result ?? bounded(summary);
             }
           }
-          agent.usage = mergeUsageMax(agent.usage, asUsage(payload.typedUsage));
+          agent.usage = mergeUsageMax(
+            agent.usage,
+            asUsage(payload.typedUsage) ?? asUsage(payload.usage),
+          );
           break;
         }
         const status = TASK_COMPLETED_STATUS.get(asString(payload.status) ?? "") ?? "completed";
@@ -603,7 +613,10 @@ export function foldSubagentActivities(
             agent.result = bounded(summary);
           }
         }
-        agent.usage = mergeUsageMax(agent.usage, asUsage(payload.typedUsage));
+        agent.usage = mergeUsageMax(
+          agent.usage,
+          asUsage(payload.typedUsage) ?? asUsage(payload.usage),
+        );
         agent.updatedAt = at;
         break;
       }
