@@ -1687,6 +1687,8 @@ export const OrchestrationGetSubagentTranscriptResult = Schema.Struct({
   conversationId: TrimmedNonEmptyString,
   items: Schema.Array(SubagentTranscriptItem),
   totalSteps: Schema.Number,
+  totalTokens: Schema.optional(Schema.Number),
+  toolUses: Schema.optional(Schema.Number),
   transcriptPath: Schema.String,
 });
 export type OrchestrationGetSubagentTranscriptResult =

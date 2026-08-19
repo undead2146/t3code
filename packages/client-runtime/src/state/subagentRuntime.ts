@@ -498,6 +498,10 @@ export function foldSubagentActivities(
         }
         const detail = asString(payload.detail);
         if (detail && agent.title === agent.id) agent.title = detail;
+        agent.usage = mergeUsageMax(
+          agent.usage,
+          asUsage(payload.typedUsage) ?? asUsage(payload.usage),
+        );
         agent.updatedAt = at;
         break;
       }

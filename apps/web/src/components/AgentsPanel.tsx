@@ -292,9 +292,28 @@ function AgentRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [isKilling, setIsKilling] = useState(false);
-  const killSubagent = useAtomCommand(orchestrationEnvironment.killSubagent, {
-    reportFailure: false,
-  });
+  const conversationId = agent.runHandles?.runId || agent.id;
+  const transcriptQuery = useAtomValue(
+    environmentId && conversationId && !agent.usage
+      ? orchestrationEnvironment.subagentTranscript({
+          environmentId,
+          input: { conversationId, limit: 1 },
+        })
+      : orchestrationEnvironment.subagentTranscript({
+          environmentId: "" as EnvironmentId,
+          input: { conversationId: "" },
+        }),
+  );
+
+  const effectiveUsage =
+    agent.usage ??
+    (transcriptQuery._tag === "Success" && transcriptQuery.value.totalTokens !== undefined
+      ? {
+          totalTokens: transcriptQuery.value.totalTokens,
+          toolUses: transcriptQuery.value.toolUses,
+        }
+      : null);
+
   const visuals = STATUS_VISUALS[agent.status];
   const activity = agentActivityText(agent);
   const modelLabel = formatSubagentModelLabel(agent.model, agent.effort);
@@ -304,12 +323,14 @@ function AgentRow({
       : agent.role;
   const metadata = [
     modelLabel,
-    agent.usage ? `${formatSubagentTokenCount(agent.usage.totalTokens)} tok` : "— tok",
-    agent.usage?.toolUses !== undefined ? `${agent.usage.toolUses} tools` : null,
+    effectiveUsage ? `${formatSubagentTokenCount(effectiveUsage.totalTokens)} tok` : "— tok",
+    effectiveUsage?.toolUses !== undefined ? `${effectiveUsage.toolUses} tools` : null,
     agent.activationCount > 1 ? `run ${agent.activationCount}` : null,
   ].filter((value): value is string => value !== null);
 
-  const conversationId = agent.runHandles?.runId || agent.id;
+  const killSubagent = useAtomCommand(orchestrationEnvironment.killSubagent, {
+    reportFailure: false,
+  });
   const isLive =
     agent.status === "running" || agent.status === "pending" || agent.status === "waiting";
 

@@ -220,11 +220,14 @@ export const readSubagentTranscript = Effect.fn("orchestration.readSubagentTrans
   const totalSteps = allItems.length;
   const limit = input.limit && input.limit > 0 ? input.limit : undefined;
   const items = limit !== undefined && allItems.length > limit ? allItems.slice(-limit) : allItems;
+  const usage = computeSubagentUsage(conversationId, transcriptPath);
 
   return {
     conversationId,
     items,
     totalSteps,
+    ...(usage?.totalTokens !== undefined ? { totalTokens: usage.totalTokens } : {}),
+    ...(usage?.toolUses !== undefined ? { toolUses: usage.toolUses } : {}),
     transcriptPath,
   };
 });
