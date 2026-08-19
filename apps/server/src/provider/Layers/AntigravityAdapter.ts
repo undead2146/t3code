@@ -8,6 +8,7 @@ import {
   type ProviderSession,
   type ThreadTokenUsageSnapshot,
   RuntimeItemId,
+  RuntimeTaskId,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -57,6 +58,17 @@ interface ActiveProcessHandle {
   readonly kill: () => Effect.Effect<void, never, never>;
 }
 
+interface TrackedSubagent {
+  readonly taskId: RuntimeTaskId;
+  readonly role?: string;
+  readonly typeName?: string;
+  readonly prompt?: string;
+  readonly model?: string;
+  status: "running" | "completed" | "failed" | "cancelled";
+  conversationId?: string;
+  readonly stepIndex: number;
+}
+
 interface AntigravitySessionContext {
   readonly threadId: ThreadId;
   session: ProviderSession;
@@ -69,6 +81,37 @@ interface AntigravitySessionContext {
   stopped: boolean;
   lastKnownContextWindow: number | undefined;
   lastKnownTokenUsage: ThreadTokenUsageSnapshot | undefined;
+  readonly subagents: Map<string, TrackedSubagent>;
+}
+
+interface RawSubagentInput {
+  readonly Role?: string;
+  readonly role?: string;
+  readonly TypeName?: string;
+  readonly typeName?: string;
+  readonly Prompt?: string;
+  readonly prompt?: string;
+  readonly Model?: string;
+  readonly model?: string;
+  readonly Workspace?: string;
+  readonly workspace?: string;
+}
+
+function parseSubagentsParam(parameters: unknown): ReadonlyArray<RawSubagentInput> {
+  if (!parameters || typeof parameters !== "object") return [];
+  const p = parameters as Record<string, unknown>;
+  let raw = p.Subagents ?? p.subagents;
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch {}
+  }
+  if (Array.isArray(raw)) {
+    return raw.filter(
+      (item): item is RawSubagentInput => typeof item === "object" && item !== null,
+    );
+  }
+  return [];
 }
 
 function toolNameToItemType(toolName: string): CanonicalItemType {
@@ -107,6 +150,14 @@ function toolNameToItemType(toolName: string): CanonicalItemType {
 function toolParamsToDetail(parameters: unknown): string | undefined {
   if (!parameters || typeof parameters !== "object") return undefined;
   const p = parameters as Record<string, unknown>;
+  if (p.Subagents !== undefined || p.subagents !== undefined) {
+    const subagents = parseSubagentsParam(parameters);
+    if (subagents.length > 0) {
+      return subagents
+        .map((s) => s.Role || s.role || s.TypeName || s.typeName || "Subagent")
+        .join(", ");
+    }
+  }
   const candidate =
     p.CommandLine ??
     p.TargetFile ??
@@ -115,7 +166,12 @@ function toolParamsToDetail(parameters: unknown): string | undefined {
     p.Query ??
     p.query ??
     p.Url ??
-    p.Prompt;
+    p.Prompt ??
+    p.prompt ??
+    p.Recipient ??
+    p.recipient ??
+    p.Action ??
+    p.action;
   return typeof candidate === "string" && candidate.trim().length > 0
     ? candidate.trim()
     : undefined;
@@ -170,6 +226,72 @@ function parseAntigravityUsageSnapshot(
       return undefined;
     }
     const usedTokens = Math.min(activeTokens, maxTokens);
+    const rawCategories =
+      usage.categories ??
+      usage.category_breakdown ??
+      usage.token_usage_by_category ??
+      (typeof usage.by_category === "object" ? usage.by_category : undefined);
+    const categoriesObj =
+      typeof rawCategories === "object" && rawCategories !== null
+        ? (rawCategories as Record<string, unknown>)
+        : usage;
+
+    const userMessages = count(
+      categoriesObj.user_messages ??
+        categoriesObj.user_messages_tokens ??
+        categoriesObj.userMessages,
+    );
+    const agentResponses = count(
+      categoriesObj.agent_responses ??
+        categoriesObj.agent_responses_tokens ??
+        categoriesObj.agentResponses,
+    );
+    const toolCalls = count(
+      categoriesObj.tool_calls ?? categoriesObj.tool_calls_tokens ?? categoriesObj.toolCalls,
+    );
+    const systemPrompt = count(
+      categoriesObj.system_prompt ??
+        categoriesObj.system_prompt_tokens ??
+        categoriesObj.systemPrompt,
+    );
+    const systemTools = count(
+      categoriesObj.system_tools ?? categoriesObj.system_tools_tokens ?? categoriesObj.systemTools,
+    );
+    const skills = count(
+      categoriesObj.skills ?? categoriesObj.skills_tokens ?? categoriesObj.skills,
+    );
+    const subagents = count(
+      categoriesObj.subagents ?? categoriesObj.subagents_tokens ?? categoriesObj.subagents,
+    );
+    const checkpointBuffer = count(
+      categoriesObj.checkpoint_buffer ??
+        categoriesObj.checkpoint_buffer_tokens ??
+        categoriesObj.checkpointBuffer,
+    );
+
+    const hasAnyCategory =
+      userMessages !== undefined ||
+      agentResponses !== undefined ||
+      toolCalls !== undefined ||
+      systemPrompt !== undefined ||
+      systemTools !== undefined ||
+      skills !== undefined ||
+      subagents !== undefined ||
+      checkpointBuffer !== undefined;
+
+    const categories = hasAnyCategory
+      ? {
+          ...(userMessages !== undefined ? { userMessages } : {}),
+          ...(agentResponses !== undefined ? { agentResponses } : {}),
+          ...(toolCalls !== undefined ? { toolCalls } : {}),
+          ...(systemPrompt !== undefined ? { systemPrompt } : {}),
+          ...(systemTools !== undefined ? { systemTools } : {}),
+          ...(skills !== undefined ? { skills } : {}),
+          ...(subagents !== undefined ? { subagents } : {}),
+          ...(checkpointBuffer !== undefined ? { checkpointBuffer } : {}),
+        }
+      : existingUsage?.categories;
+
     return {
       usedTokens,
       ...(maxTokens !== undefined ? { maxTokens } : {}),
@@ -181,6 +303,7 @@ function parseAntigravityUsageSnapshot(
         : {}),
       ...(cachedTokens > 0 ? { cachedInputTokens: cachedTokens } : {}),
       compactsAutomatically: true,
+      ...(categories ? { categories } : {}),
     };
   }
 
@@ -197,6 +320,66 @@ function parseAntigravityUsageSnapshot(
   const usedTokens = Math.min(activeTokens, maxTokens);
   const totalProcessedTokens = existingUsage?.totalProcessedTokens;
 
+  const rawCategories =
+    usage.categories ??
+    usage.category_breakdown ??
+    usage.token_usage_by_category ??
+    (typeof usage.by_category === "object" ? usage.by_category : undefined);
+  const categoriesObj =
+    typeof rawCategories === "object" && rawCategories !== null
+      ? (rawCategories as Record<string, unknown>)
+      : usage;
+
+  const userMessages = count(
+    categoriesObj.user_messages ?? categoriesObj.user_messages_tokens ?? categoriesObj.userMessages,
+  );
+  const agentResponses = count(
+    categoriesObj.agent_responses ??
+      categoriesObj.agent_responses_tokens ??
+      categoriesObj.agentResponses,
+  );
+  const toolCalls = count(
+    categoriesObj.tool_calls ?? categoriesObj.tool_calls_tokens ?? categoriesObj.toolCalls,
+  );
+  const systemPrompt = count(
+    categoriesObj.system_prompt ?? categoriesObj.system_prompt_tokens ?? categoriesObj.systemPrompt,
+  );
+  const systemTools = count(
+    categoriesObj.system_tools ?? categoriesObj.system_tools_tokens ?? categoriesObj.systemTools,
+  );
+  const skills = count(categoriesObj.skills ?? categoriesObj.skills_tokens ?? categoriesObj.skills);
+  const subagents = count(
+    categoriesObj.subagents ?? categoriesObj.subagents_tokens ?? categoriesObj.subagents,
+  );
+  const checkpointBuffer = count(
+    categoriesObj.checkpoint_buffer ??
+      categoriesObj.checkpoint_buffer_tokens ??
+      categoriesObj.checkpointBuffer,
+  );
+
+  const hasAnyCategory =
+    userMessages !== undefined ||
+    agentResponses !== undefined ||
+    toolCalls !== undefined ||
+    systemPrompt !== undefined ||
+    systemTools !== undefined ||
+    skills !== undefined ||
+    subagents !== undefined ||
+    checkpointBuffer !== undefined;
+
+  const categories = hasAnyCategory
+    ? {
+        ...(userMessages !== undefined ? { userMessages } : {}),
+        ...(agentResponses !== undefined ? { agentResponses } : {}),
+        ...(toolCalls !== undefined ? { toolCalls } : {}),
+        ...(systemPrompt !== undefined ? { systemPrompt } : {}),
+        ...(systemTools !== undefined ? { systemTools } : {}),
+        ...(skills !== undefined ? { skills } : {}),
+        ...(subagents !== undefined ? { subagents } : {}),
+        ...(checkpointBuffer !== undefined ? { checkpointBuffer } : {}),
+      }
+    : existingUsage?.categories;
+
   return {
     usedTokens,
     ...(maxTokens !== undefined ? { maxTokens } : {}),
@@ -208,6 +391,7 @@ function parseAntigravityUsageSnapshot(
       : {}),
     ...(cachedTokens > 0 ? { cachedInputTokens: cachedTokens } : {}),
     compactsAutomatically: true,
+    ...(categories ? { categories } : {}),
   };
 }
 
@@ -331,6 +515,7 @@ export function makeAntigravityAdapter(
             stopped: false,
             lastKnownContextWindow: contextWindow,
             lastKnownTokenUsage: undefined,
+            subagents: new Map(),
           };
 
           sessions.set(threadId, ctx);
@@ -613,6 +798,127 @@ export function makeAntigravityAdapter(
                             ...(toolInfo ? { data: toolInfo } : {}),
                           },
                         });
+
+                        if (step.tool_name === "invoke_subagent") {
+                          const subagentList = parseSubagentsParam(toolInfo?.parameters);
+                          for (let idx = 0; idx < subagentList.length; idx++) {
+                            const item = subagentList[idx]!;
+                            const taskId = RuntimeTaskId.make(
+                              `subagent-${threadId}-s${step.step_index}-i${idx}`,
+                            );
+                            const role =
+                              item.Role ||
+                              item.role ||
+                              item.TypeName ||
+                              item.typeName ||
+                              "Subagent";
+                            const prompt = item.Prompt || item.prompt;
+                            const rawModel = item.Model || item.model;
+                            const model =
+                              rawModel && rawModel !== "inherit"
+                                ? rawModel
+                                : ctx.session.model || undefined;
+                            const tracked: TrackedSubagent = {
+                              taskId,
+                              role,
+                              typeName: item.TypeName || item.typeName,
+                              prompt,
+                              model,
+                              status: "running",
+                              stepIndex: Number(step.step_index) || 0,
+                            };
+                            ctx.subagents.set(String(taskId), tracked);
+                            ctx.subagents.set(`s${step.step_index}-i${idx}`, tracked);
+
+                            yield* publishEvent({
+                              ...stamp,
+                              provider: PROVIDER,
+                              threadId,
+                              turnId,
+                              type: "task.started",
+                              payload: {
+                                taskId,
+                                title: role,
+                                ...(prompt ? { description: prompt.slice(0, 300) } : {}),
+                                ...(role ? { role } : {}),
+                                ...(model ? { model } : {}),
+                                taskType: "subagent",
+                                timelineBypass: false,
+                              },
+                            });
+                          }
+                        } else if (step.tool_name === "send_message") {
+                          const p = (toolInfo?.parameters ?? {}) as Record<string, unknown>;
+                          const recipient = (p.Recipient || p.recipient) as string | undefined;
+                          const message = (p.Message || p.message) as string | undefined;
+                          if (recipient) {
+                            const tracked = ctx.subagents.get(recipient);
+                            if (tracked && tracked.status === "running") {
+                              yield* publishEvent({
+                                ...stamp,
+                                provider: PROVIDER,
+                                threadId,
+                                turnId,
+                                type: "task.progress",
+                                payload: {
+                                  taskId: tracked.taskId,
+                                  description: tracked.prompt || tracked.role || "Subagent",
+                                  summary: message
+                                    ? `Sent message: ${message.slice(0, 100)}`
+                                    : "Sent message to subagent",
+                                  lastToolName: "send_message",
+                                  status: "running",
+                                  ...(tracked.role ? { role: tracked.role } : {}),
+                                  ...(tracked.model ? { model: tracked.model } : {}),
+                                },
+                              });
+                            }
+                          }
+                        } else if (step.tool_name === "manage_subagents") {
+                          const p = (toolInfo?.parameters ?? {}) as Record<string, unknown>;
+                          const action = (p.Action || p.action) as string | undefined;
+                          const convIds = (p.ConversationIds ||
+                            p.conversation_ids ||
+                            p.conversationIds) as unknown;
+                          if (action === "kill_all") {
+                            for (const tracked of ctx.subagents.values()) {
+                              if (tracked.status === "running") {
+                                tracked.status = "cancelled";
+                                yield* publishEvent({
+                                  ...stamp,
+                                  provider: PROVIDER,
+                                  threadId,
+                                  turnId,
+                                  type: "task.completed",
+                                  payload: {
+                                    taskId: tracked.taskId,
+                                    status: "cancelled",
+                                  },
+                                });
+                              }
+                            }
+                          } else if (action === "kill" && Array.isArray(convIds)) {
+                            for (const cid of convIds) {
+                              if (typeof cid === "string") {
+                                const tracked = ctx.subagents.get(cid);
+                                if (tracked && tracked.status === "running") {
+                                  tracked.status = "cancelled";
+                                  yield* publishEvent({
+                                    ...stamp,
+                                    provider: PROVIDER,
+                                    threadId,
+                                    turnId,
+                                    type: "task.completed",
+                                    payload: {
+                                      taskId: tracked.taskId,
+                                      status: "cancelled",
+                                    },
+                                  });
+                                }
+                              }
+                            }
+                          }
+                        }
                       } else if (
                         step.state === "DONE" ||
                         step.state === "ERROR" ||
@@ -634,6 +940,30 @@ export function makeAntigravityAdapter(
                             ...(toolInfo ? { data: toolInfo } : {}),
                           },
                         });
+
+                        if (step.tool_name === "invoke_subagent") {
+                          const isFailed = step.state !== "DONE";
+                          if (isFailed) {
+                            const stepIdx = Number(step.step_index) || 0;
+                            for (const tracked of ctx.subagents.values()) {
+                              if (tracked.stepIndex === stepIdx && tracked.status === "running") {
+                                tracked.status = "failed";
+                                yield* publishEvent({
+                                  ...stamp,
+                                  provider: PROVIDER,
+                                  threadId,
+                                  turnId,
+                                  type: "task.completed",
+                                  payload: {
+                                    taskId: tracked.taskId,
+                                    status: "failed",
+                                    error: `Subagent launch failed (${step.state})`,
+                                  },
+                                });
+                              }
+                            }
+                          }
+                        }
                       }
                     } else if (step.step_type === "error_message") {
                       const errorText =

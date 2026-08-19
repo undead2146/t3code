@@ -307,6 +307,18 @@ const ThreadMetadataUpdatedPayload = Schema.Struct({
 });
 export type ThreadMetadataUpdatedPayload = typeof ThreadMetadataUpdatedPayload.Type;
 
+export const ThreadTokenUsageCategories = Schema.Struct({
+  userMessages: Schema.optional(NonNegativeInt),
+  agentResponses: Schema.optional(NonNegativeInt),
+  toolCalls: Schema.optional(NonNegativeInt),
+  systemPrompt: Schema.optional(NonNegativeInt),
+  systemTools: Schema.optional(NonNegativeInt),
+  skills: Schema.optional(NonNegativeInt),
+  subagents: Schema.optional(NonNegativeInt),
+  checkpointBuffer: Schema.optional(NonNegativeInt),
+});
+export type ThreadTokenUsageCategories = typeof ThreadTokenUsageCategories.Type;
+
 export const ThreadTokenUsageSnapshot = Schema.Struct({
   usedTokens: NonNegativeInt,
   totalProcessedTokens: Schema.optional(NonNegativeInt),
@@ -323,6 +335,7 @@ export const ThreadTokenUsageSnapshot = Schema.Struct({
   toolUses: Schema.optional(NonNegativeInt),
   durationMs: Schema.optional(NonNegativeInt),
   compactsAutomatically: Schema.optional(Schema.Boolean),
+  categories: Schema.optional(ThreadTokenUsageCategories),
 });
 export type ThreadTokenUsageSnapshot = typeof ThreadTokenUsageSnapshot.Type;
 

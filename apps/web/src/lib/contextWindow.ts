@@ -18,11 +18,23 @@ type NullableContextWindowUsage = {
     : ThreadTokenUsageSnapshot[Key];
 };
 
+export type ContextWindowCategories = {
+  readonly userMessages?: number | null;
+  readonly agentResponses?: number | null;
+  readonly toolCalls?: number | null;
+  readonly systemPrompt?: number | null;
+  readonly systemTools?: number | null;
+  readonly skills?: number | null;
+  readonly subagents?: number | null;
+  readonly checkpointBuffer?: number | null;
+};
+
 export type ContextWindowSnapshot = NullableContextWindowUsage & {
   readonly remainingTokens: number | null;
   readonly usedPercentage: number | null;
   readonly remainingPercentage: number | null;
   readonly updatedAt: string;
+  readonly categories?: ContextWindowCategories | null;
 };
 
 /** Map a provider driver kind to a user-facing display name. */
@@ -69,6 +81,20 @@ export function deriveLatestContextWindowSnapshot(
       maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
     const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
 
+    const categoriesPayload = asRecord(payload?.categories);
+    const categories: ContextWindowCategories | null = categoriesPayload
+      ? {
+          userMessages: asFiniteNumber(categoriesPayload.userMessages),
+          agentResponses: asFiniteNumber(categoriesPayload.agentResponses),
+          toolCalls: asFiniteNumber(categoriesPayload.toolCalls),
+          systemPrompt: asFiniteNumber(categoriesPayload.systemPrompt),
+          systemTools: asFiniteNumber(categoriesPayload.systemTools),
+          skills: asFiniteNumber(categoriesPayload.skills),
+          subagents: asFiniteNumber(categoriesPayload.subagents),
+          checkpointBuffer: asFiniteNumber(categoriesPayload.checkpointBuffer),
+        }
+      : null;
+
     return {
       usedTokens,
       totalProcessedTokens: asFiniteNumber(payload?.totalProcessedTokens),
@@ -89,6 +115,7 @@ export function deriveLatestContextWindowSnapshot(
       durationMs: asFiniteNumber(payload?.durationMs),
       compactsAutomatically: asBoolean(payload?.compactsAutomatically) ?? false,
       updatedAt: activity.createdAt,
+      categories,
     };
   }
 

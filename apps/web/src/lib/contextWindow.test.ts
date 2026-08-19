@@ -81,4 +81,34 @@ describe("contextWindow", () => {
     expect(snapshot?.usedTokens).toBe(81_659);
     expect(snapshot?.totalProcessedTokens).toBe(748_126);
   });
+
+  it("extracts categorical token usage when available", () => {
+    const snapshot = deriveLatestContextWindowSnapshot([
+      makeActivity("activity-1", "context-window.updated", {
+        usedTokens: 174_500,
+        maxTokens: 1_000_000,
+        categories: {
+          userMessages: 319,
+          agentResponses: 115_900,
+          toolCalls: 32_600,
+          systemPrompt: 10_600,
+          systemTools: 13_100,
+          skills: 1_300,
+          subagents: 653,
+          checkpointBuffer: 34_300,
+        },
+      }),
+    ]);
+
+    expect(snapshot?.categories).toEqual({
+      userMessages: 319,
+      agentResponses: 115_900,
+      toolCalls: 32_600,
+      systemPrompt: 10_600,
+      systemTools: 13_100,
+      skills: 1_300,
+      subagents: 653,
+      checkpointBuffer: 34_300,
+    });
+  });
 });

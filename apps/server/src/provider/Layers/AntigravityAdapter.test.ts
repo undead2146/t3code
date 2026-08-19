@@ -459,4 +459,148 @@ it.layer(NodeServices.layer)("makeAntigravityAdapter", (it) => {
         yield* adapter.stopSession(threadId);
       }),
   );
+
+  it.effect("parses categorical token usage when provided by agy telemetry", () =>
+    Effect.gen(function* () {
+      const mockScript = yield* makeMockAgyScript([
+        '{"event":"init","conversation_id":"conv-cat-test"}',
+        '{"event":"step_update","step_update":{"step_index":0,"step_type":"agent_response","text_delta":"Response with categories","state":"DONE","usage":{"input_tokens":4215,"cache_read_tokens":211285,"output_tokens":142,"categories":{"user_messages":319,"agent_responses":115900,"tool_calls":32600,"system_prompt":10600,"system_tools":13100,"skills":1300,"subagents":653,"checkpoint_buffer":34300}}}}',
+        '{"event":"result","result":{"conversation_id":"conv-cat-test","status":"SUCCESS","response":"Done"}}',
+      ]);
+
+      const adapter = yield* makeAntigravityAdapter(
+        decodeAntigravitySettings({
+          enabled: true,
+          binaryPath: mockScript,
+        }),
+      );
+
+      const threadId = ThreadId.make("thread-cat-test");
+      yield* adapter.startSession({
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 6).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* Effect.yieldNow;
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Test categorical usage",
+      });
+
+      const eventsChunk = yield* Fiber.join(runtimeEventsFiber);
+      const usageEvents = Array.from(eventsChunk).filter(
+        (e) => e.type === "thread.token-usage.updated",
+      );
+
+      expect(usageEvents.length).toBeGreaterThanOrEqual(1);
+      const lastUsageEvent = usageEvents[0];
+      if (lastUsageEvent && lastUsageEvent.type === "thread.token-usage.updated") {
+        expect(lastUsageEvent.payload.usage.categories).toEqual({
+          userMessages: 319,
+          agentResponses: 115900,
+          toolCalls: 32600,
+          systemPrompt: 10600,
+          systemTools: 13100,
+          skills: 1300,
+          subagents: 653,
+          checkpointBuffer: 34300,
+        });
+      }
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect(
+    "translates invoke_subagent, send_message, and manage_subagents to task lifecycle events",
+    () =>
+      Effect.gen(function* () {
+        const mockScript = yield* makeMockAgyScript([
+          '{"event":"init","conversation_id":"conv-subagent-test"}',
+          '{"event":"step_update","step_update":{"step_index":0,"step_type":"tool","tool_name":"invoke_subagent","state":"ACTIVE","tool_info":{"name":"invoke_subagent","parameters":{"Subagents":[{"Role":"Codebase Researcher","TypeName":"research","Prompt":"Search for components","Model":"inherit"},{"Role":"Unit Tester","TypeName":"tester","Prompt":"Run test suite","Model":"gemini-3.7-flash"}]}}}}',
+          '{"event":"step_update","step_update":{"step_index":0,"step_type":"tool","tool_name":"invoke_subagent","state":"DONE","tool_info":{"name":"invoke_subagent"}}}',
+          '{"event":"step_update","step_update":{"step_index":1,"step_type":"tool","tool_name":"send_message","state":"ACTIVE","tool_info":{"name":"send_message","parameters":{"Recipient":"subagent-thread-subagent-test-s0-i0","Message":"Please check the auth files"}}}}',
+          '{"event":"step_update","step_update":{"step_index":1,"step_type":"tool","tool_name":"send_message","state":"DONE","tool_info":{"name":"send_message"}}}',
+          '{"event":"step_update","step_update":{"step_index":2,"step_type":"tool","tool_name":"manage_subagents","state":"ACTIVE","tool_info":{"name":"manage_subagents","parameters":{"Action":"kill","ConversationIds":["subagent-thread-subagent-test-s0-i1"]}}}}',
+          '{"event":"step_update","step_update":{"step_index":2,"step_type":"tool","tool_name":"manage_subagents","state":"DONE","tool_info":{"name":"manage_subagents"}}}',
+          '{"event":"result","result":{"conversation_id":"conv-subagent-test","status":"SUCCESS","response":"Subagents orchestrated successfully"}}',
+        ]);
+
+        const adapter = yield* makeAntigravityAdapter(
+          decodeAntigravitySettings({
+            enabled: true,
+            binaryPath: mockScript,
+          }),
+        );
+
+        const threadId = ThreadId.make("thread-subagent-test");
+        yield* adapter.startSession({
+          threadId,
+          runtimeMode: "full-access",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("antigravity"),
+            model: "gemini-3.7-flash",
+          },
+        });
+
+        const runtimeEventsFiber = yield* adapter.streamEvents.pipe(
+          Stream.takeUntil((e) => e.type === "turn.completed"),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+
+        yield* Effect.yieldNow;
+
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Launch subagents",
+        });
+
+        const eventsChunk = yield* Fiber.join(runtimeEventsFiber);
+        const events = Array.from(eventsChunk);
+
+        const taskStartedEvents = events.filter((e) => e.type === "task.started");
+        expect(taskStartedEvents.length).toBe(2);
+
+        const firstTask = taskStartedEvents[0];
+        if (firstTask && firstTask.type === "task.started") {
+          expect(firstTask.payload.title).toBe("Codebase Researcher");
+          expect(firstTask.payload.role).toBe("Codebase Researcher");
+          expect(firstTask.payload.taskType).toBe("subagent");
+          expect(firstTask.payload.model).toBe("gemini-3.7-flash");
+        }
+
+        const secondTask = taskStartedEvents[1];
+        if (secondTask && secondTask.type === "task.started") {
+          expect(secondTask.payload.title).toBe("Unit Tester");
+          expect(secondTask.payload.role).toBe("Unit Tester");
+          expect(secondTask.payload.taskType).toBe("subagent");
+          expect(secondTask.payload.model).toBe("gemini-3.7-flash");
+        }
+
+        const taskProgressEvents = events.filter((e) => e.type === "task.progress");
+        expect(taskProgressEvents.length).toBe(1);
+        const progressEvent = taskProgressEvents[0];
+        if (progressEvent && progressEvent.type === "task.progress") {
+          expect(progressEvent.payload.summary).toContain(
+            "Sent message: Please check the auth files",
+          );
+        }
+
+        const taskCompletedEvents = events.filter((e) => e.type === "task.completed");
+        expect(taskCompletedEvents.length).toBe(1);
+        const completedEvent = taskCompletedEvents[0];
+        if (completedEvent && completedEvent.type === "task.completed") {
+          expect(completedEvent.payload.status).toBe("cancelled");
+        }
+
+        yield* adapter.stopSession(threadId);
+      }),
+  );
 });

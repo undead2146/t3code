@@ -83,7 +83,7 @@ export function ContextWindowMeter(props: {
         side="top"
         align="end"
         viewportClassName="p-0"
-        className="w-64 max-w-none text-left whitespace-normal"
+        className="w-72 max-w-none text-left whitespace-normal"
       >
         <div className="flex flex-col gap-2 p-[var(--floating-content-inset)]">
           <div className="flex items-center justify-between gap-3">
@@ -118,8 +118,192 @@ export function ContextWindowMeter(props: {
               />
             </div>
           ) : null}
+          {usage.categories ? (
+            <div className="flex flex-col gap-1 border-t border-border/40 pt-2 text-[11px]">
+              <div className="font-medium text-muted-foreground text-[10px] uppercase tracking-wider mb-0.5">
+                Token usage by category
+              </div>
+              <div className="flex flex-col gap-1">
+                {usage.categories.userMessages != null && usage.categories.userMessages > 0 ? (
+                  <div className="flex items-center justify-between text-secondary-label">
+                    <span className="flex items-center gap-1.5">
+                      <span className="size-1.5 rounded-full bg-sky-500 inline-block" />
+                      User messages
+                    </span>
+                    <span className="tabular-nums font-mono">
+                      {formatContextWindowTokens(usage.categories.userMessages)}
+                      {usage.maxTokens
+                        ? ` (${((usage.categories.userMessages / usage.maxTokens) * 100).toFixed(1)}%)`
+                        : ""}
+                    </span>
+                  </div>
+                ) : null}
+                {usage.categories.agentResponses != null && usage.categories.agentResponses > 0 ? (
+                  <div className="flex items-center justify-between text-secondary-label">
+                    <span className="flex items-center gap-1.5">
+                      <span className="size-1.5 rounded-full bg-emerald-500 inline-block" />
+                      Agent responses
+                    </span>
+                    <span className="tabular-nums font-mono">
+                      {formatContextWindowTokens(usage.categories.agentResponses)}
+                      {usage.maxTokens
+                        ? ` (${((usage.categories.agentResponses / usage.maxTokens) * 100).toFixed(1)}%)`
+                        : ""}
+                    </span>
+                  </div>
+                ) : null}
+                {usage.categories.toolCalls != null && usage.categories.toolCalls > 0 ? (
+                  <div className="flex items-center justify-between text-secondary-label">
+                    <span className="flex items-center gap-1.5">
+                      <span className="size-1.5 rounded-full bg-purple-500 inline-block" />
+                      Tool calls
+                    </span>
+                    <span className="tabular-nums font-mono">
+                      {formatContextWindowTokens(usage.categories.toolCalls)}
+                      {usage.maxTokens
+                        ? ` (${((usage.categories.toolCalls / usage.maxTokens) * 100).toFixed(1)}%)`
+                        : ""}
+                    </span>
+                  </div>
+                ) : null}
+                {usage.categories.systemPrompt != null && usage.categories.systemPrompt > 0 ? (
+                  <div className="flex items-center justify-between text-secondary-label">
+                    <span className="flex items-center gap-1.5">
+                      <span className="size-1.5 rounded-full bg-amber-500 inline-block" />
+                      System prompt
+                    </span>
+                    <span className="tabular-nums font-mono">
+                      {formatContextWindowTokens(usage.categories.systemPrompt)}
+                      {usage.maxTokens
+                        ? ` (${((usage.categories.systemPrompt / usage.maxTokens) * 100).toFixed(1)}%)`
+                        : ""}
+                    </span>
+                  </div>
+                ) : null}
+                {usage.categories.systemTools != null && usage.categories.systemTools > 0 ? (
+                  <div className="flex items-center justify-between text-secondary-label">
+                    <span className="flex items-center gap-1.5">
+                      <span className="size-1.5 rounded-full bg-cyan-500 inline-block" />
+                      System tools
+                    </span>
+                    <span className="tabular-nums font-mono">
+                      {formatContextWindowTokens(usage.categories.systemTools)}
+                      {usage.maxTokens
+                        ? ` (${((usage.categories.systemTools / usage.maxTokens) * 100).toFixed(1)}%)`
+                        : ""}
+                    </span>
+                  </div>
+                ) : null}
+                {usage.categories.skills != null && usage.categories.skills > 0 ? (
+                  <div className="flex items-center justify-between text-secondary-label">
+                    <span className="flex items-center gap-1.5">
+                      <span className="size-1.5 rounded-full bg-indigo-500 inline-block" />
+                      Skills
+                    </span>
+                    <span className="tabular-nums font-mono">
+                      {formatContextWindowTokens(usage.categories.skills)}
+                      {usage.maxTokens
+                        ? ` (${((usage.categories.skills / usage.maxTokens) * 100).toFixed(1)}%)`
+                        : ""}
+                    </span>
+                  </div>
+                ) : null}
+                {usage.categories.subagents != null && usage.categories.subagents > 0 ? (
+                  <div className="flex items-center justify-between text-secondary-label">
+                    <span className="flex items-center gap-1.5">
+                      <span className="size-1.5 rounded-full bg-pink-500 inline-block" />
+                      Subagents
+                    </span>
+                    <span className="tabular-nums font-mono">
+                      {formatContextWindowTokens(usage.categories.subagents)}
+                      {usage.maxTokens
+                        ? ` (${((usage.categories.subagents / usage.maxTokens) * 100).toFixed(1)}%)`
+                        : ""}
+                    </span>
+                  </div>
+                ) : null}
+                {usage.categories.checkpointBuffer != null &&
+                usage.categories.checkpointBuffer > 0 ? (
+                  <div className="flex items-center justify-between text-secondary-label">
+                    <span className="flex items-center gap-1.5">
+                      <span className="size-1.5 rounded-full bg-zinc-500 inline-block" />
+                      Checkpoint buffer
+                    </span>
+                    <span className="tabular-nums font-mono">
+                      {formatContextWindowTokens(usage.categories.checkpointBuffer)}
+                    </span>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          ) : (usage.inputTokens != null && usage.inputTokens > 0) ||
+            (usage.cachedInputTokens != null && usage.cachedInputTokens > 0) ||
+            (usage.outputTokens != null && usage.outputTokens > 0) ||
+            (usage.reasoningOutputTokens != null && usage.reasoningOutputTokens > 0) ? (
+            <div className="flex flex-col gap-1 border-t border-border/40 pt-2 text-[11px]">
+              <div className="font-medium text-muted-foreground text-[10px] uppercase tracking-wider mb-0.5">
+                Token breakdown
+              </div>
+              {usage.cachedInputTokens != null && usage.cachedInputTokens > 0 ? (
+                <div className="flex items-center justify-between text-secondary-label">
+                  <span className="flex items-center gap-1.5">
+                    <span className="size-1.5 rounded-full bg-amber-500 inline-block" />
+                    Cached prompt
+                  </span>
+                  <span className="tabular-nums font-mono">
+                    {formatContextWindowTokens(usage.cachedInputTokens)}
+                    {usage.maxTokens
+                      ? ` (${((usage.cachedInputTokens / usage.maxTokens) * 100).toFixed(1)}%)`
+                      : ""}
+                  </span>
+                </div>
+              ) : null}
+              {usage.inputTokens != null && usage.inputTokens > 0 ? (
+                <div className="flex items-center justify-between text-secondary-label">
+                  <span className="flex items-center gap-1.5">
+                    <span className="size-1.5 rounded-full bg-sky-500 inline-block" />
+                    New input
+                  </span>
+                  <span className="tabular-nums font-mono">
+                    {formatContextWindowTokens(usage.inputTokens)}
+                    {usage.maxTokens
+                      ? ` (${((usage.inputTokens / usage.maxTokens) * 100).toFixed(1)}%)`
+                      : ""}
+                  </span>
+                </div>
+              ) : null}
+              {usage.outputTokens != null && usage.outputTokens > 0 ? (
+                <div className="flex items-center justify-between text-secondary-label">
+                  <span className="flex items-center gap-1.5">
+                    <span className="size-1.5 rounded-full bg-emerald-500 inline-block" />
+                    Agent output
+                  </span>
+                  <span className="tabular-nums font-mono">
+                    {formatContextWindowTokens(usage.outputTokens)}
+                    {usage.maxTokens
+                      ? ` (${((usage.outputTokens / usage.maxTokens) * 100).toFixed(1)}%)`
+                      : ""}
+                  </span>
+                </div>
+              ) : null}
+              {usage.reasoningOutputTokens != null && usage.reasoningOutputTokens > 0 ? (
+                <div className="flex items-center justify-between text-secondary-label">
+                  <span className="flex items-center gap-1.5">
+                    <span className="size-1.5 rounded-full bg-purple-500 inline-block" />
+                    Thinking tokens
+                  </span>
+                  <span className="tabular-nums font-mono">
+                    {formatContextWindowTokens(usage.reasoningOutputTokens)}
+                    {usage.maxTokens
+                      ? ` (${((usage.reasoningOutputTokens / usage.maxTokens) * 100).toFixed(1)}%)`
+                      : ""}
+                  </span>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           {showTotalProcessed ? (
-            <div className="flex items-center justify-between gap-3 text-[11px] leading-4">
+            <div className="flex items-center justify-between gap-3 text-[11px] leading-4 border-t border-border/30 pt-1.5">
               <span className="text-secondary-label">Total processed</span>
               <span className="font-medium tabular-nums text-secondary-label">
                 {formatContextWindowTokens(totalProcessedTokens)}
