@@ -45,6 +45,23 @@ import {
   resolveAntigravityContextWindow,
 } from "./AntigravityProvider.ts";
 import { computeSubagentUsage } from "../../orchestration/subagentTranscriptQuery.ts";
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeCP from "node:child_process";
+
+export const KILLED_SUBAGENT_IDS = new Set<string>();
+
+export function registerKilledSubagent(conversationId: string): void {
+  if (!conversationId || typeof conversationId !== "string" || conversationId.length < 5) return;
+  KILLED_SUBAGENT_IDS.add(conversationId);
+  try {
+    if (process.platform === "win32") {
+      const psCmd = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*${conversationId}*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+      NodeCP.exec(`powershell -NoProfile -Command "${psCmd}"`, () => {});
+    } else {
+      NodeCP.exec(`pkill -9 -f "${conversationId}"`, () => {});
+    }
+  } catch {}
+}
 
 const PROVIDER = ProviderDriverKind.make("antigravity");
 const decodeJsonExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
@@ -1099,6 +1116,11 @@ export function makeAntigravityAdapter(
                           for (const sub of listedSubagents) {
                             const cid = sub.conversationId;
                             if (!cid) continue;
+                            if (KILLED_SUBAGENT_IDS.has(cid)) {
+                              const tracked = ctx.subagents.get(cid);
+                              if (tracked) tracked.status = "cancelled";
+                              continue;
+                            }
                             const taskId = RuntimeTaskId.make(cid);
                             const role = sub.role || sub.type || "Subagent";
                             const rawStatus = sub.state;
@@ -1111,7 +1133,12 @@ export function makeAntigravityAdapter(
                                     ? "idle"
                                     : "running";
 
-                            if (!ctx.subagents.has(cid)) {
+                            const existingTracked = ctx.subagents.get(cid);
+                            if (existingTracked?.status === "cancelled") {
+                              continue;
+                            }
+
+                            if (!existingTracked) {
                               const tracked: TrackedSubagent = {
                                 taskId,
                                 role,

@@ -120,6 +120,12 @@ function AgentElapsed({ agent }: { agent: RuntimeSubagent }) {
  * failed rows because they explain a red row at a glance.
  */
 function agentActivityText(agent: RuntimeSubagent): string | null {
+  if (agent.status === "cancelled") {
+    return "Terminated by user";
+  }
+  if (agent.status === "interrupted") {
+    return "Stopped";
+  }
   const live =
     agent.status === "running" || agent.status === "pending" || agent.status === "waiting";
   if (live) {

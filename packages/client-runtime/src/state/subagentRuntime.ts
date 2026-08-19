@@ -425,7 +425,10 @@ function applyStatus(agent: MutableAgent, status: RuntimeSubagentStatus, at: str
 const TASK_COMPLETED_STATUS: ReadonlyMap<string, RuntimeSubagentStatus> = new Map([
   ["completed", "completed"],
   ["failed", "failed"],
+  ["cancelled", "cancelled"],
+  ["canceled", "cancelled"],
   ["stopped", "interrupted"],
+  ["interrupted", "interrupted"],
 ]);
 
 const KNOWN_STATUSES: ReadonlySet<string> = new Set([

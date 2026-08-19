@@ -93,6 +93,7 @@ import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
 import { readWorkflowScript } from "./orchestration/workflowScriptQuery.ts";
 import { readSubagentTranscript } from "./orchestration/subagentTranscriptQuery.ts";
+import { registerKilledSubagent } from "./provider/Layers/AntigravityAdapter.ts";
 import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
 import * as VcsStatusBroadcaster from "./vcs/VcsStatusBroadcaster.ts";
 import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
@@ -1157,6 +1158,7 @@ const makeWsRpcLayer = (
               activityId: serverEventId,
             }).pipe(
               Effect.flatMap(({ commandId, activityId }) => {
+                registerKilledSubagent(input.conversationId);
                 const now = new Date().toISOString();
                 return orchestrationEngine.dispatch({
                   type: "thread.activity.append",
