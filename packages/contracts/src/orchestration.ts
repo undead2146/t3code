@@ -27,6 +27,7 @@ export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
   getWorkflowScript: "orchestration.getWorkflowScript",
   getSubagentTranscript: "orchestration.getSubagentTranscript",
+  killSubagent: "orchestration.killSubagent",
   getTurnDiff: "orchestration.getTurnDiff",
   getFullThreadDiff: "orchestration.getFullThreadDiff",
   searchThreads: "orchestration.searchThreads",
@@ -1710,6 +1711,27 @@ export class OrchestrationGetSubagentTranscriptError extends Schema.TaggedErrorC
   }
 }
 
+export const OrchestrationKillSubagentInput = Schema.Struct({
+  threadId: ThreadId,
+  conversationId: TrimmedNonEmptyString,
+});
+export type OrchestrationKillSubagentInput = typeof OrchestrationKillSubagentInput.Type;
+
+export const OrchestrationKillSubagentResult = Schema.Struct({
+  conversationId: TrimmedNonEmptyString,
+  status: Schema.Literal("cancelled"),
+});
+export type OrchestrationKillSubagentResult = typeof OrchestrationKillSubagentResult.Type;
+
+export class OrchestrationKillSubagentError extends Schema.TaggedErrorClass<OrchestrationKillSubagentError>()(
+  "OrchestrationKillSubagentError",
+  {
+    reason: Schema.Literals(["invalid-id", "failed"]),
+    conversationId: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
 export const OrchestrationRpcSchemas = {
   dispatchCommand: {
     input: ClientOrchestrationCommand,
@@ -1722,6 +1744,10 @@ export const OrchestrationRpcSchemas = {
   getSubagentTranscript: {
     input: OrchestrationGetSubagentTranscriptInput,
     output: OrchestrationGetSubagentTranscriptResult,
+  },
+  killSubagent: {
+    input: OrchestrationKillSubagentInput,
+    output: OrchestrationKillSubagentResult,
   },
   getTurnDiff: {
     input: OrchestrationGetTurnDiffInput,

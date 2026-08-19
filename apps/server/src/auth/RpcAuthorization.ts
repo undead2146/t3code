@@ -24,6 +24,7 @@ export const RPC_REQUIRED_SCOPES = {
   [ORCHESTRATION_WS_METHODS.dispatchCommand]: AuthOrchestrationOperateScope,
   [ORCHESTRATION_WS_METHODS.getWorkflowScript]: AuthOrchestrationReadScope,
   [ORCHESTRATION_WS_METHODS.getSubagentTranscript]: AuthOrchestrationReadScope,
+  [ORCHESTRATION_WS_METHODS.killSubagent]: AuthOrchestrationOperateScope,
   [ORCHESTRATION_WS_METHODS.getTurnDiff]: AuthOrchestrationReadScope,
   [ORCHESTRATION_WS_METHODS.getFullThreadDiff]: AuthOrchestrationReadScope,
   [ORCHESTRATION_WS_METHODS.searchThreads]: AuthOrchestrationReadScope,

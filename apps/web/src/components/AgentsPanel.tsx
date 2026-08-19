@@ -11,7 +11,7 @@
  *   it settles; older collapsed runs can still be opened at run granularity.
  * - Static status dots, DOM-write elapsed timers, plain token counters.
  */
-import { useAtomValue } from "@effect/atom-react";
+import { useAtomCommand, useAtomValue } from "@effect/atom-react";
 import type {
   AgentPanelModel,
   AgentPanelWorkflowGroup,
@@ -22,7 +22,7 @@ import {
   formatSubagentTokenCount,
 } from "@t3tools/client-runtime/state/subagentRuntime";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import { Bot, Braces, Check, ChevronDown, ChevronRight, Terminal, X } from "lucide-react";
+import { Bot, Braces, Check, ChevronDown, ChevronRight, Square, Terminal, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { cn } from "~/lib/utils";
@@ -273,7 +273,7 @@ function SubagentTranscriptView({
   );
 }
 
-/** Expandable agent status line with detailed activity trace. */
+/** Expandable agent status line with detailed activity trace and remote kill capability. */
 function AgentRow({
   agent,
   environmentId = null,
@@ -284,6 +284,10 @@ function AgentRow({
   threadId?: ThreadId | null;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [isKilling, setIsKilling] = useState(false);
+  const killSubagent = useAtomCommand(orchestrationEnvironment.killSubagent, {
+    reportFailure: false,
+  });
   const visuals = STATUS_VISUALS[agent.status];
   const activity = agentActivityText(agent);
   const modelLabel = formatSubagentModelLabel(agent.model, agent.effort);
@@ -299,6 +303,29 @@ function AgentRow({
   ].filter((value): value is string => value !== null);
 
   const conversationId = agent.runHandles?.runId || agent.id;
+  const isLive =
+    agent.status === "running" || agent.status === "pending" || agent.status === "waiting";
+
+  const handleKill = async (e?: React.MouseEvent) => {
+    if (e) {
+      e.stopPropagation();
+    }
+    if (!environmentId || !threadId || !conversationId || isKilling) {
+      return;
+    }
+    setIsKilling(true);
+    try {
+      await killSubagent({
+        environmentId,
+        input: {
+          threadId,
+          conversationId,
+        },
+      });
+    } finally {
+      setIsKilling(false);
+    }
+  };
 
   return (
     <div className="flex flex-col rounded-md border border-transparent transition-colors hover:border-border/40 hover:bg-accent/20">
@@ -320,8 +347,21 @@ function AgentRow({
           ) : null}
         </span>
         <span className="col-start-3 row-start-1 min-w-14 text-right font-mono text-[.7rem] text-muted-foreground/80">
-          <span className="inline-flex items-center gap-1">
+          <span className="inline-flex items-center gap-1.5">
             <AgentElapsed agent={agent} />
+            {isLive && environmentId && threadId ? (
+              <button
+                type="button"
+                onClick={handleKill}
+                disabled={isKilling}
+                aria-label="Kill subagent"
+                title="Kill subagent remotely"
+                className="inline-flex items-center gap-0.5 rounded border border-destructive/40 bg-destructive/10 px-1 py-0.5 text-[.6rem] font-medium text-destructive hover:bg-destructive/20 disabled:opacity-50"
+              >
+                <Square aria-hidden className="size-2 fill-current" />
+                <span>{isKilling ? "…" : "Kill"}</span>
+              </button>
+            ) : null}
             {agent.status === "completed" ? (
               <Check aria-hidden className="size-3 text-success" />
             ) : null}
@@ -350,9 +390,24 @@ function AgentRow({
 
       {expanded ? (
         <div className="flex flex-col gap-2 border-t border-border/40 bg-muted/20 px-2.5 py-2 text-xs">
-          <div className="flex items-center gap-1.5 font-mono text-[.68rem] text-muted-foreground">
-            <span className="font-semibold text-foreground/80">ID:</span>
-            <span className="select-all truncate">{conversationId}</span>
+          <div className="flex items-center justify-between font-mono text-[.68rem] text-muted-foreground">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="font-semibold text-foreground/80">ID:</span>
+              <span className="select-all truncate">{conversationId}</span>
+            </div>
+            {isLive && environmentId && threadId ? (
+              <Button
+                type="button"
+                size="xs"
+                variant="destructive"
+                onClick={handleKill}
+                disabled={isKilling}
+                className="h-5 px-2 text-[.65rem] gap-1 shrink-0"
+              >
+                <Square aria-hidden className="size-2.5 fill-current" />
+                {isKilling ? "Stopping…" : "Kill Subagent"}
+              </Button>
+            ) : null}
           </div>
 
           {environmentId && conversationId ? (

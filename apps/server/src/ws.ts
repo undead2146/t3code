@@ -1149,6 +1149,43 @@ const makeWsRpcLayer = (
             readSubagentTranscript(input),
             { "rpc.aggregate": "orchestration" },
           ),
+        [ORCHESTRATION_WS_METHODS.killSubagent]: (input) =>
+          observeRpcEffect(
+            ORCHESTRATION_WS_METHODS.killSubagent,
+            Effect.all({
+              commandId: serverCommandId("subagent-kill"),
+              activityId: serverEventId,
+            }).pipe(
+              Effect.flatMap(({ commandId, activityId }) => {
+                const now = new Date().toISOString();
+                return orchestrationEngine.dispatch({
+                  type: "thread.activity.append",
+                  commandId,
+                  threadId: input.threadId,
+                  activity: {
+                    id: activityId,
+                    tone: "tool",
+                    kind: "task.completed",
+                    summary: "Subagent terminated remotely",
+                    payload: {
+                      taskId: input.conversationId,
+                      status: "cancelled",
+                      taskType: "subagent",
+                      agentKind: "agent",
+                    },
+                    turnId: null,
+                    createdAt: now,
+                  },
+                  createdAt: now,
+                });
+              }),
+              Effect.map(() => ({
+                conversationId: input.conversationId,
+                status: "cancelled" as const,
+              })),
+            ),
+            { "rpc.aggregate": "orchestration" },
+          ),
         [ORCHESTRATION_WS_METHODS.getTurnDiff]: (input) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.getTurnDiff,
