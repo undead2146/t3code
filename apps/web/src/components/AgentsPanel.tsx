@@ -22,7 +22,7 @@ import {
   formatSubagentTokenCount,
 } from "@t3tools/client-runtime/state/subagentRuntime";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
-import { Bot, Braces, Check, ChevronDown, ChevronRight, X } from "lucide-react";
+import { Bot, Braces, Check, ChevronDown, ChevronRight, Terminal, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { cn } from "~/lib/utils";
@@ -137,8 +137,152 @@ function agentActivityText(agent: RuntimeSubagent): string | null {
   );
 }
 
+/**
+ * Live transcript view that queries the actual transcript log from disk
+ * via getSubagentTranscript RPC and displays all tool executions, commands,
+ * outputs, and agent thoughts.
+ */
+function SubagentTranscriptView({
+  environmentId,
+  conversationId,
+}: {
+  environmentId: EnvironmentId;
+  conversationId: string;
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const [openOutputs, setOpenOutputs] = useState<Record<number, boolean>>({});
+
+  const result = useAtomValue(
+    orchestrationEnvironment.subagentTranscript({
+      environmentId,
+      input: { conversationId, limit: showAll ? undefined : 20 },
+    }),
+  );
+
+  const toggleOutput = (idx: number) => {
+    setOpenOutputs((prev) => ({ ...prev, [idx]: !prev[idx] }));
+  };
+
+  if (result._tag === "Initial" || result._tag === "Loading") {
+    return (
+      <div className="flex items-center gap-1.5 py-1 text-xs text-muted-foreground">
+        <span className="animate-spin">◷</span> Loading execution transcript…
+      </div>
+    );
+  }
+
+  if (result._tag === "Failure") {
+    return (
+      <p className="text-[.68rem] text-muted-foreground/80">
+        Live log available once subagent logs to disk.
+      </p>
+    );
+  }
+
+  const transcript = result.value;
+  const items = transcript.items;
+
+  if (items.length === 0) {
+    return (
+      <p className="text-[.68rem] text-muted-foreground/80">No execution steps recorded yet.</p>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-1.5 pt-1">
+      <div className="flex items-center justify-between font-mono text-[.68rem] text-muted-foreground">
+        <span className="font-semibold text-foreground/90">
+          Execution Steps ({items.length} of {transcript.totalSteps}):
+        </span>
+        {transcript.totalSteps > 20 && !showAll ? (
+          <button
+            type="button"
+            onClick={() => setShowAll(true)}
+            className="text-info-foreground hover:underline"
+          >
+            Show all {transcript.totalSteps} steps
+          </button>
+        ) : showAll && transcript.totalSteps > 20 ? (
+          <button
+            type="button"
+            onClick={() => setShowAll(false)}
+            className="text-muted-foreground hover:underline"
+          >
+            Show recent 20
+          </button>
+        ) : null}
+      </div>
+
+      <div className="flex max-h-96 flex-col gap-1 overflow-y-auto rounded border border-border/50 bg-background/80 p-1.5 font-mono text-[.68rem]">
+        {items.map((item, idx) => {
+          const isTool = item.type === "TOOL_CALL";
+          const hasOutput = Boolean(item.output);
+          const isOutputOpen = Boolean(openOutputs[idx]);
+
+          return (
+            <div
+              key={idx}
+              className="flex flex-col gap-0.5 rounded border border-border/30 bg-muted/30 px-1.5 py-1"
+            >
+              <div className="flex items-baseline gap-1.5 text-foreground/90">
+                <span className="shrink-0 text-muted-foreground font-mono">#{item.stepIndex}</span>
+                {isTool ? (
+                  <span className="shrink-0 rounded bg-info/20 px-1 font-semibold text-info-foreground">
+                    {item.toolName}
+                  </span>
+                ) : item.type === "USER_INPUT" ? (
+                  <span className="shrink-0 rounded bg-primary/20 px-1 font-semibold text-primary">
+                    prompt
+                  </span>
+                ) : (
+                  <span className="shrink-0 rounded bg-muted px-1 font-semibold text-muted-foreground">
+                    thought
+                  </span>
+                )}
+                <span className="min-w-0 flex-1 truncate font-sans text-xs">{item.summary}</span>
+                {hasOutput ? (
+                  <button
+                    type="button"
+                    onClick={() => toggleOutput(idx)}
+                    className="ml-auto shrink-0 text-[.65rem] text-info-foreground hover:underline"
+                  >
+                    {isOutputOpen ? "Hide output" : "View output"}
+                  </button>
+                ) : null}
+              </div>
+
+              {item.detail && item.detail !== item.summary ? (
+                <pre className="max-h-24 overflow-x-auto whitespace-pre-wrap rounded bg-background/70 p-1 text-[.65rem] text-muted-foreground">
+                  {item.detail}
+                </pre>
+              ) : null}
+
+              {hasOutput && isOutputOpen ? (
+                <div className="mt-1 flex flex-col gap-0.5 border-t border-border/40 pt-1">
+                  <span className="text-[.6rem] font-semibold text-muted-foreground">Output:</span>
+                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap rounded bg-black/50 p-1.5 text-[.65rem] text-foreground/90 font-mono">
+                    {item.output}
+                  </pre>
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /** Expandable agent status line with detailed activity trace. */
-function AgentRow({ agent }: { agent: RuntimeSubagent }) {
+function AgentRow({
+  agent,
+  environmentId = null,
+  threadId = null,
+}: {
+  agent: RuntimeSubagent;
+  environmentId?: EnvironmentId | null;
+  threadId?: ThreadId | null;
+}) {
   const [expanded, setExpanded] = useState(false);
   const visuals = STATUS_VISUALS[agent.status];
   const activity = agentActivityText(agent);
@@ -153,6 +297,8 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
     agent.usage?.toolUses !== undefined ? `${agent.usage.toolUses} tools` : null,
     agent.activationCount > 1 ? `run ${agent.activationCount}` : null,
   ].filter((value): value is string => value !== null);
+
+  const conversationId = agent.runHandles?.runId || agent.id;
 
   return (
     <div className="flex flex-col rounded-md border border-transparent transition-colors hover:border-border/40 hover:bg-accent/20">
@@ -203,25 +349,15 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
       </button>
 
       {expanded ? (
-        <div className="flex flex-col gap-1.5 border-t border-border/40 bg-muted/20 px-2.5 py-2 text-xs">
-          {agent.runHandles?.runId ? (
-            <div className="flex items-center gap-1.5 font-mono text-[.68rem] text-muted-foreground">
-              <span className="font-semibold text-foreground/80">ID:</span>
-              <span className="select-all truncate">{agent.runHandles.runId}</span>
-            </div>
-          ) : (
-            <div className="flex items-center gap-1.5 font-mono text-[.68rem] text-muted-foreground">
-              <span className="font-semibold text-foreground/80">ID:</span>
-              <span className="select-all truncate">{agent.id}</span>
-            </div>
-          )}
-          {agent.runHandles?.scriptPath ? (
-            <div className="flex items-center gap-1.5 font-mono text-[.68rem] text-muted-foreground">
-              <span className="font-semibold text-foreground/80">Log:</span>
-              <span className="select-all truncate">{agent.runHandles.scriptPath}</span>
-            </div>
-          ) : null}
-          {agent.recentActivity.length > 0 ? (
+        <div className="flex flex-col gap-2 border-t border-border/40 bg-muted/20 px-2.5 py-2 text-xs">
+          <div className="flex items-center gap-1.5 font-mono text-[.68rem] text-muted-foreground">
+            <span className="font-semibold text-foreground/80">ID:</span>
+            <span className="select-all truncate">{conversationId}</span>
+          </div>
+
+          {environmentId && conversationId ? (
+            <SubagentTranscriptView environmentId={environmentId} conversationId={conversationId} />
+          ) : agent.recentActivity.length > 0 ? (
             <div className="flex flex-col gap-1 pt-1">
               <span className="font-mono text-[.68rem] font-semibold text-muted-foreground">
                 Activity log:
@@ -236,6 +372,7 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
               </div>
             </div>
           ) : null}
+
           {agent.result ? (
             <div className="flex flex-col gap-0.5 pt-1">
               <span className="font-semibold text-success-foreground">Result:</span>
@@ -384,19 +521,21 @@ function WorkflowScriptView({
  */
 function PhaseSection({
   phase,
+  environmentId = null,
+  threadId = null,
   defaultOpen = false,
 }: {
   phase: AgentPanelWorkflowGroup["phases"][number];
+  environmentId?: EnvironmentId | null;
+  threadId?: ThreadId | null;
   defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(defaultOpen || phase.state === "running");
-  const previousState = useRef(phase.state);
+  const [open, setOpen] = useState(defaultOpen);
 
   useEffect(() => {
-    if (previousState.current !== "running" && phase.state === "running") {
+    if (phase.state === "running") {
       setOpen(true);
     }
-    previousState.current = phase.state;
   }, [phase.state]);
 
   return (
@@ -436,7 +575,16 @@ function PhaseSection({
           </span>
         ) : null}
       </button>
-      {open ? phase.members.map((member) => <AgentRow key={member.id} agent={member} />) : null}
+      {open
+        ? phase.members.map((member) => (
+            <AgentRow
+              key={member.id}
+              agent={member}
+              environmentId={environmentId}
+              threadId={threadId}
+            />
+          ))
+        : null}
     </div>
   );
 }
@@ -506,13 +654,24 @@ function ExpandedWorkflowSection({
         />
       ) : null}
       {group.phases.map((phase) => (
-        <PhaseSection key={phase.index} phase={phase} defaultOpen={!workflowIsLive(group)} />
+        <PhaseSection
+          key={phase.index}
+          phase={phase}
+          environmentId={environmentId}
+          threadId={threadId}
+          defaultOpen={!workflowIsLive(group)}
+        />
       ))}
       {group.unphasedMembers.map((member) => (
-        <AgentRow key={member.id} agent={member} />
+        <AgentRow
+          key={member.id}
+          agent={member}
+          environmentId={environmentId}
+          threadId={threadId}
+        />
       ))}
       {group.phases.length === 0 && group.unphasedMembers.length === 0 ? (
-        <AgentRow agent={group.workflow} />
+        <AgentRow agent={group.workflow} environmentId={environmentId} threadId={threadId} />
       ) : null}
     </section>
   );
@@ -628,7 +787,12 @@ export function AgentsPanel({
                 Direct spawns
               </div>
               {model.directAgents.map((agent) => (
-                <AgentRow key={agent.id} agent={agent} />
+                <AgentRow
+                  key={agent.id}
+                  agent={agent}
+                  environmentId={environmentId}
+                  threadId={threadId}
+                />
               ))}
             </section>
           ) : null}

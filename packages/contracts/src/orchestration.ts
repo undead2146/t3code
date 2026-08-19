@@ -26,6 +26,7 @@ import { ProviderInstanceId } from "./providerInstance.ts";
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
   getWorkflowScript: "orchestration.getWorkflowScript",
+  getSubagentTranscript: "orchestration.getSubagentTranscript",
   getTurnDiff: "orchestration.getTurnDiff",
   getFullThreadDiff: "orchestration.getFullThreadDiff",
   searchThreads: "orchestration.searchThreads",
@@ -1663,6 +1664,52 @@ export class OrchestrationGetWorkflowScriptError extends Schema.TaggedErrorClass
   }
 }
 
+export const SubagentTranscriptItem = Schema.Struct({
+  stepIndex: Schema.Number,
+  type: Schema.String,
+  toolName: Schema.NullOr(Schema.String),
+  summary: Schema.String,
+  detail: Schema.NullOr(Schema.String),
+  output: Schema.NullOr(Schema.String),
+  timestamp: Schema.NullOr(Schema.String),
+});
+export type SubagentTranscriptItem = typeof SubagentTranscriptItem.Type;
+
+export const OrchestrationGetSubagentTranscriptInput = Schema.Struct({
+  conversationId: TrimmedNonEmptyString,
+  limit: Schema.optional(Schema.Number),
+});
+export type OrchestrationGetSubagentTranscriptInput =
+  typeof OrchestrationGetSubagentTranscriptInput.Type;
+
+export const OrchestrationGetSubagentTranscriptResult = Schema.Struct({
+  conversationId: TrimmedNonEmptyString,
+  items: Schema.Array(SubagentTranscriptItem),
+  totalSteps: Schema.Number,
+  transcriptPath: Schema.String,
+});
+export type OrchestrationGetSubagentTranscriptResult =
+  typeof OrchestrationGetSubagentTranscriptResult.Type;
+
+const SUBAGENT_TRANSCRIPT_ERROR_MESSAGES = {
+  "invalid-id": "Invalid subagent conversation id.",
+  "not-found": "Subagent transcript log not found.",
+  "read-failed": "Failed to read subagent transcript.",
+} as const;
+
+export class OrchestrationGetSubagentTranscriptError extends Schema.TaggedErrorClass<OrchestrationGetSubagentTranscriptError>()(
+  "OrchestrationGetSubagentTranscriptError",
+  {
+    reason: Schema.Literals(["invalid-id", "not-found", "read-failed"]),
+    conversationId: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return SUBAGENT_TRANSCRIPT_ERROR_MESSAGES[this.reason];
+  }
+}
+
 export const OrchestrationRpcSchemas = {
   dispatchCommand: {
     input: ClientOrchestrationCommand,
@@ -1671,6 +1718,10 @@ export const OrchestrationRpcSchemas = {
   getWorkflowScript: {
     input: OrchestrationGetWorkflowScriptInput,
     output: OrchestrationGetWorkflowScriptResult,
+  },
+  getSubagentTranscript: {
+    input: OrchestrationGetSubagentTranscriptInput,
+    output: OrchestrationGetSubagentTranscriptResult,
   },
   getTurnDiff: {
     input: OrchestrationGetTurnDiffInput,
