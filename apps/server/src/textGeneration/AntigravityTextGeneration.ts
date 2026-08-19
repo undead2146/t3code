@@ -11,9 +11,13 @@ import {
   TextGenerationError,
 } from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
+import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { extractJsonObject } from "@t3tools/shared/schemaJson";
-import { resolveAntigravityBinary } from "../provider/Layers/AntigravityProvider.ts";
+import {
+  isAntigravityEffortSupported,
+  resolveAntigravityBinary,
+} from "../provider/Layers/AntigravityProvider.ts";
 
 import * as TextGeneration from "./TextGeneration.ts";
 import {
@@ -72,18 +76,29 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
     readonly modelSelection: ModelSelection;
   }): Effect.fn.Return<S["Type"], TextGenerationError, S["DecodingServices"]> {
     const binary = resolveAntigravityBinary(settings.binaryPath, processEnv);
-    const args = ["-p", prompt, "--output-format", "stream-json", "--print-timeout", "10m"];
+    const args = [
+      "-p",
+      prompt,
+      "--output-format",
+      "stream-json",
+      "--print-timeout",
+      "10m",
+      "--disable-slash-commands",
+    ];
 
     if (settings.dangerouslySkipPermissions !== false) {
       args.push("--dangerously-skip-permissions");
     }
 
-    if (settings.effort) {
-      args.push("--effort", settings.effort);
-    }
+    const modelSlug = modelSelection.model || "gemini-3.7-flash";
+    args.push("--model", modelSlug);
 
-    if (modelSelection.model) {
-      args.push("--model", modelSelection.model);
+    const effortSupported = isAntigravityEffortSupported(modelSlug);
+    const selectedEffort = getModelSelectionStringOptionValue(modelSelection, "effort");
+    const effectiveEffort = selectedEffort || settings.effort || "medium";
+
+    if (effortSupported && effectiveEffort) {
+      args.push("--effort", effectiveEffort);
     }
 
     const spawnCommand = yield* resolveSpawnCommand(binary, args, {

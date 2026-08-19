@@ -145,8 +145,8 @@ export const PREFERRED_DEFAULT_CODEX_MODELS: ReadonlyArray<string> = [
   "gpt-5.6-sol",
   "gpt-5.6-terra",
 ];
-export const DEFAULT_TEXT_GENERATION_MODEL = "gpt-5.6-luna";
-export const DEFAULT_TEXT_GENERATION_REASONING_EFFORT = "low";
+export const DEFAULT_TEXT_GENERATION_MODEL = "gemini-3.7-flash";
+export const DEFAULT_TEXT_GENERATION_REASONING_EFFORT = "medium";
 
 export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, string>> = {
   [CODEX_DRIVER_KIND]: DEFAULT_MODEL,
@@ -161,7 +161,7 @@ export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, strin
 export const DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER: Partial<
   Record<ProviderDriverKind, string>
 > = {
-  [CODEX_DRIVER_KIND]: DEFAULT_TEXT_GENERATION_MODEL,
+  [CODEX_DRIVER_KIND]: "gpt-5.6-luna",
   [CLAUDE_DRIVER_KIND]: "claude-haiku-4-5",
   [CURSOR_DRIVER_KIND]: "composer-2",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",

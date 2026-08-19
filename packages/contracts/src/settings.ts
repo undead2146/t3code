@@ -691,11 +691,11 @@ export const ServerSettings = Schema.Struct({
   textGenerationModelSelection: ModelSelection.pipe(
     Schema.withDecodingDefault(
       Effect.succeed({
-        instanceId: ProviderInstanceId.make("codex"),
+        instanceId: ProviderInstanceId.make("antigravity"),
         model: DEFAULT_TEXT_GENERATION_MODEL,
         options: [
           {
-            id: "reasoningEffort",
+            id: "effort",
             value: DEFAULT_TEXT_GENERATION_REASONING_EFFORT,
           },
         ],
