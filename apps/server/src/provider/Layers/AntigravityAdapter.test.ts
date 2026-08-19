@@ -285,6 +285,61 @@ it.layer(NodeServices.layer)("makeAntigravityAdapter", (it) => {
     }),
   );
 
+  it.effect(
+    "omits effort argument for models that do not support effort like claude-opus-4-6-thinking",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fs.makeTempDirectory({ prefix: "agy-mock-claude-effort-" });
+        const argsLog = path.join(dir, "args.log");
+        const scriptPath = yield* makeMockAgyArgsScript(argsLog, [
+          '{"event":"init","conversation_id":"conv-claude-effort"}',
+          '{"event":"result","result":{"conversation_id":"conv-claude-effort"}}',
+        ]);
+
+        const adapter = yield* makeAntigravityAdapter(
+          decodeAntigravitySettings({
+            enabled: true,
+            binaryPath: scriptPath,
+          }),
+        );
+
+        const threadId = ThreadId.make("thread-claude-effort-test");
+        yield* adapter.startSession({
+          threadId,
+          runtimeMode: "full-access",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("antigravity"),
+            model: "claude-opus-4-6-thinking",
+          },
+        });
+
+        const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 3).pipe(
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* Effect.yieldNow;
+
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Hello with claude model",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("antigravity"),
+            model: "claude-opus-4-6-thinking",
+          },
+        });
+
+        yield* Fiber.join(runtimeEventsFiber);
+
+        const loggedArgs = yield* fs.readFileString(argsLog);
+        expect(loggedArgs).toContain("--model claude-opus-4-6-thinking");
+        expect(loggedArgs).not.toContain("--effort");
+
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
   it.effect("completes tool item on ERROR state and translates error notices", () =>
     Effect.gen(function* () {
       const mockScript = yield* makeMockAgyScript([

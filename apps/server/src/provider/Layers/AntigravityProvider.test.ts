@@ -46,10 +46,14 @@ describe("parseAntigravityModels", () => {
 
     for (const model of models) {
       const effortOption = model.capabilities?.optionDescriptors?.find((d) => d.id === "effort");
-      expect(effortOption).toBeDefined();
-      expect(effortOption?.type).toBe("select");
-      if (effortOption?.type === "select") {
-        expect(effortOption.options.map((o) => o.id)).toEqual(["low", "medium", "high"]);
+      if (model.slug.startsWith("gemini")) {
+        expect(effortOption).toBeDefined();
+        expect(effortOption?.type).toBe("select");
+        if (effortOption?.type === "select") {
+          expect(effortOption.options.map((o) => o.id)).toEqual(["low", "medium", "high"]);
+        }
+      } else {
+        expect(effortOption).toBeUndefined();
       }
     }
   });

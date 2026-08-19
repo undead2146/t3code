@@ -40,6 +40,7 @@ import {
 import { type AntigravityAdapterShape } from "../Services/AntigravityAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import {
+  isAntigravityEffortSupported,
   resolveAntigravityBinary,
   resolveAntigravityContextWindow,
 } from "./AntigravityProvider.ts";
@@ -605,22 +606,26 @@ export function makeAntigravityAdapter(
           }
 
           const selectedModel = input.modelSelection?.model;
-          const selectedEffort = getModelSelectionStringOptionValue(input.modelSelection, "effort");
-          let effectiveEffort = selectedEffort || settings.effort;
+          const effortSupported = isAntigravityEffortSupported(selectedModel);
+          const selectedEffort = effortSupported
+            ? getModelSelectionStringOptionValue(input.modelSelection, "effort")
+            : undefined;
+          let effectiveEffort = selectedEffort || (effortSupported ? settings.effort : undefined);
 
           if (selectedModel) {
             args.push("--model", selectedModel);
           }
 
-          // If effort is not specified and model doesn't embed it in the slug, default to "medium"
+          // If effort is not specified, effort is supported, and model doesn't embed it in the slug, default to "medium"
           if (
+            effortSupported &&
             !effectiveEffort &&
             (!selectedModel || !selectedModel.match(/-(low|medium|high)$/i))
           ) {
             effectiveEffort = "medium";
           }
 
-          if (effectiveEffort) {
+          if (effortSupported && effectiveEffort) {
             args.push("--effort", effectiveEffort);
           }
 

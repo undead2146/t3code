@@ -48,7 +48,21 @@ const ANTIGRAVITY_EFFORT_DESCRIPTOR = buildSelectOptionDescriptor({
   ],
 });
 
-export function getAntigravityModelCapabilities(_slug?: string): ModelCapabilities {
+export function isAntigravityEffortSupported(modelSlug?: string): boolean {
+  if (!modelSlug) return true;
+  const slug = modelSlug.toLowerCase();
+  if (slug.includes("claude") || slug.includes("gpt") || slug.includes("-thinking")) {
+    return false;
+  }
+  return slug.startsWith("gemini") || !slug.match(/-(low|medium|high)$/i);
+}
+
+export function getAntigravityModelCapabilities(slug?: string): ModelCapabilities {
+  if (slug && !isAntigravityEffortSupported(slug)) {
+    return createModelCapabilities({
+      optionDescriptors: [],
+    });
+  }
   return createModelCapabilities({
     optionDescriptors: [ANTIGRAVITY_EFFORT_DESCRIPTOR],
   });
