@@ -11,7 +11,8 @@
  *   it settles; older collapsed runs can still be opened at run granularity.
  * - Static status dots, DOM-write elapsed timers, plain token counters.
  */
-import { useAtomCommand, useAtomValue } from "@effect/atom-react";
+import { useAtomValue } from "@effect/atom-react";
+import { useAtomCommand } from "~/state/use-atom-command";
 import type {
   AgentPanelModel,
   AgentPanelWorkflowGroup,
