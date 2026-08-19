@@ -121,6 +121,32 @@ function parseSubagentsParam(parameters: unknown): ReadonlyArray<RawSubagentInpu
   return [];
 }
 
+interface SubagentListEntry {
+  readonly role?: string;
+  readonly type?: string;
+  readonly conversationId?: string;
+  readonly transcript?: string;
+  readonly state?: string;
+  readonly stateDetail?: string;
+}
+
+function parseSubagentListFromOutput(data: unknown): ReadonlyArray<SubagentListEntry> {
+  if (typeof data !== "string") return [];
+  const start = data.indexOf("[");
+  const end = data.lastIndexOf("]");
+  if (start !== -1 && end > start) {
+    try {
+      const parsed = JSON.parse(data.slice(start, end + 1));
+      if (Array.isArray(parsed)) {
+        return parsed.filter(
+          (item): item is SubagentListEntry => typeof item === "object" && item !== null,
+        );
+      }
+    } catch {}
+  }
+  return [];
+}
+
 function toolNameToItemType(toolName: string): CanonicalItemType {
   switch (toolName) {
     case "run_command":
@@ -1057,6 +1083,96 @@ export function makeAntigravityAdapter(
                                   },
                                 });
                               }
+                            }
+                          }
+                        } else if (step.tool_name === "manage_subagents") {
+                          const output =
+                            typeof step.content === "string"
+                              ? step.content
+                              : typeof toolInfo?.output === "string"
+                                ? toolInfo.output
+                                : typeof step.output === "string"
+                                  ? step.output
+                                  : "";
+                          const listedSubagents = parseSubagentListFromOutput(output);
+                          for (const sub of listedSubagents) {
+                            const cid = sub.conversationId;
+                            if (!cid) continue;
+                            const taskId = RuntimeTaskId.make(cid);
+                            const role = sub.role || sub.type || "Subagent";
+                            const rawStatus = sub.state;
+                            const status =
+                              rawStatus === "completed"
+                                ? "completed"
+                                : rawStatus === "errored" || rawStatus === "failed"
+                                  ? "failed"
+                                  : rawStatus === "idle"
+                                    ? "idle"
+                                    : "running";
+
+                            if (!ctx.subagents.has(cid)) {
+                              const tracked: TrackedSubagent = {
+                                taskId,
+                                role,
+                                typeName: sub.type,
+                                status:
+                                  status === "completed" || status === "failed"
+                                    ? status
+                                    : "running",
+                                stepIndex: Number(step.step_index) || 0,
+                              };
+                              ctx.subagents.set(cid, tracked);
+                              ctx.subagents.set(String(taskId), tracked);
+
+                              yield* publishEvent({
+                                ...stamp,
+                                provider: PROVIDER,
+                                threadId,
+                                turnId,
+                                type: "task.started",
+                                payload: {
+                                  taskId,
+                                  title: role,
+                                  role,
+                                  taskType: "subagent",
+                                  agentKind: "agent",
+                                  timelineBypass: false,
+                                },
+                              });
+                            }
+
+                            if (status === "completed" || status === "failed") {
+                              yield* publishEvent({
+                                ...stamp,
+                                provider: PROVIDER,
+                                threadId,
+                                turnId,
+                                type: "task.completed",
+                                payload: {
+                                  taskId,
+                                  status,
+                                  taskType: "subagent",
+                                  agentKind: "agent",
+                                },
+                              });
+                            } else if (sub.stateDetail) {
+                              yield* publishEvent({
+                                ...stamp,
+                                provider: PROVIDER,
+                                threadId,
+                                turnId,
+                                type: "task.progress",
+                                payload: {
+                                  taskId,
+                                  title: role,
+                                  role,
+                                  summary: sub.stateDetail,
+                                  lastToolName: sub.stateDetail.split(":")[0]?.trim() || "subagent",
+                                  status: "running",
+                                  taskType: "subagent",
+                                  agentKind: "agent",
+                                },
+                              });
                             }
                           }
                         }
