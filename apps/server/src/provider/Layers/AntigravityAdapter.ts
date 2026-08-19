@@ -101,7 +101,7 @@ interface RawSubagentInput {
 function parseSubagentsParam(parameters: unknown): ReadonlyArray<RawSubagentInput> {
   if (!parameters || typeof parameters !== "object") return [];
   const p = parameters as Record<string, unknown>;
-  let raw = p.Subagents ?? p.subagents;
+  let raw = p.Subagents ?? p.subagents ?? p.Subagent ?? p.subagent ?? p.agents ?? p.Agents;
   if (typeof raw === "string") {
     try {
       raw = JSON.parse(raw);
@@ -111,6 +111,12 @@ function parseSubagentsParam(parameters: unknown): ReadonlyArray<RawSubagentInpu
     return raw.filter(
       (item): item is RawSubagentInput => typeof item === "object" && item !== null,
     );
+  }
+  if (typeof raw === "object" && raw !== null) {
+    return [raw as RawSubagentInput];
+  }
+  if (p.Prompt || p.prompt || p.Role || p.role || p.TypeName || p.typeName) {
+    return [p as RawSubagentInput];
   }
   return [];
 }
@@ -805,53 +811,65 @@ export function makeAntigravityAdapter(
                         });
 
                         if (step.tool_name === "invoke_subagent") {
-                          const subagentList = parseSubagentsParam(toolInfo?.parameters);
-                          for (let idx = 0; idx < subagentList.length; idx++) {
-                            const item = subagentList[idx]!;
-                            const taskId = RuntimeTaskId.make(
-                              `subagent-${threadId}-s${step.step_index}-i${idx}`,
-                            );
-                            const role =
-                              item.Role ||
-                              item.role ||
-                              item.TypeName ||
-                              item.typeName ||
-                              "Subagent";
-                            const prompt = item.Prompt || item.prompt;
-                            const rawModel = item.Model || item.model;
-                            const model =
-                              rawModel && rawModel !== "inherit"
-                                ? rawModel
-                                : ctx.session.model || undefined;
-                            const tracked: TrackedSubagent = {
-                              taskId,
-                              role,
-                              typeName: item.TypeName || item.typeName,
-                              prompt,
-                              model,
+                          const stepIdx = Number(step.step_index) || 0;
+                          const stepKey = `s${stepIdx}`;
+                          if (!ctx.subagents.has(stepKey)) {
+                            ctx.subagents.set(stepKey, {
+                              taskId: RuntimeTaskId.make(`subagent-${threadId}-${stepKey}`),
+                              role: "Subagent",
                               status: "running",
-                              stepIndex: Number(step.step_index) || 0,
-                            };
-                            ctx.subagents.set(String(taskId), tracked);
-                            ctx.subagents.set(`s${step.step_index}-i${idx}`, tracked);
-
-                            yield* publishEvent({
-                              ...stamp,
-                              provider: PROVIDER,
-                              threadId,
-                              turnId,
-                              type: "task.started",
-                              payload: {
-                                taskId,
-                                title: role,
-                                ...(prompt ? { description: prompt.slice(0, 300) } : {}),
-                                ...(role ? { role } : {}),
-                                ...(model ? { model } : {}),
-                                taskType: "subagent",
-                                agentKind: "agent",
-                                timelineBypass: false,
-                              },
+                              stepIndex: stepIdx,
                             });
+                            const parsedList = parseSubagentsParam(toolInfo?.parameters);
+                            const subagentList =
+                              parsedList.length > 0 ? parsedList : [{ Role: "Subagent" }];
+                            for (let idx = 0; idx < subagentList.length; idx++) {
+                              const item = subagentList[idx]!;
+                              const taskId = RuntimeTaskId.make(
+                                `subagent-${threadId}-s${stepIdx}-i${idx}`,
+                              );
+                              const role =
+                                item.Role ||
+                                item.role ||
+                                item.TypeName ||
+                                item.typeName ||
+                                "Subagent";
+                              const prompt = item.Prompt || item.prompt;
+                              const rawModel = item.Model || item.model;
+                              const model =
+                                rawModel && rawModel !== "inherit"
+                                  ? rawModel
+                                  : ctx.session.model || undefined;
+                              const tracked: TrackedSubagent = {
+                                taskId,
+                                role,
+                                typeName: item.TypeName || item.typeName,
+                                prompt,
+                                model,
+                                status: "running",
+                                stepIndex: stepIdx,
+                              };
+                              ctx.subagents.set(String(taskId), tracked);
+                              ctx.subagents.set(`s${stepIdx}-i${idx}`, tracked);
+
+                              yield* publishEvent({
+                                ...stamp,
+                                provider: PROVIDER,
+                                threadId,
+                                turnId,
+                                type: "task.started",
+                                payload: {
+                                  taskId,
+                                  title: role,
+                                  ...(prompt ? { description: prompt.slice(0, 300) } : {}),
+                                  ...(role ? { role } : {}),
+                                  ...(model ? { model } : {}),
+                                  taskType: "subagent",
+                                  agentKind: "agent",
+                                  timelineBypass: false,
+                                },
+                              });
+                            }
                           }
                         } else if (step.tool_name === "send_message") {
                           const p = (toolInfo?.parameters ?? {}) as Record<string, unknown>;
@@ -954,9 +972,69 @@ export function makeAntigravityAdapter(
                         });
 
                         if (step.tool_name === "invoke_subagent") {
+                          const stepIdx = Number(step.step_index) || 0;
+                          const stepKey = `s${stepIdx}`;
+                          if (!ctx.subagents.has(stepKey)) {
+                            ctx.subagents.set(stepKey, {
+                              taskId: RuntimeTaskId.make(`subagent-${threadId}-${stepKey}`),
+                              role: "Subagent",
+                              status: "running",
+                              stepIndex: stepIdx,
+                            });
+                            const parsedList = parseSubagentsParam(toolInfo?.parameters);
+                            const subagentList =
+                              parsedList.length > 0 ? parsedList : [{ Role: "Subagent" }];
+                            for (let idx = 0; idx < subagentList.length; idx++) {
+                              const item = subagentList[idx]!;
+                              const taskId = RuntimeTaskId.make(
+                                `subagent-${threadId}-s${stepIdx}-i${idx}`,
+                              );
+                              const role =
+                                item.Role ||
+                                item.role ||
+                                item.TypeName ||
+                                item.typeName ||
+                                "Subagent";
+                              const prompt = item.Prompt || item.prompt;
+                              const rawModel = item.Model || item.model;
+                              const model =
+                                rawModel && rawModel !== "inherit"
+                                  ? rawModel
+                                  : ctx.session.model || undefined;
+                              const tracked: TrackedSubagent = {
+                                taskId,
+                                role,
+                                typeName: item.TypeName || item.typeName,
+                                prompt,
+                                model,
+                                status: "running",
+                                stepIndex: stepIdx,
+                              };
+                              ctx.subagents.set(String(taskId), tracked);
+                              ctx.subagents.set(`s${stepIdx}-i${idx}`, tracked);
+
+                              yield* publishEvent({
+                                ...stamp,
+                                provider: PROVIDER,
+                                threadId,
+                                turnId,
+                                type: "task.started",
+                                payload: {
+                                  taskId,
+                                  title: role,
+                                  ...(prompt ? { description: prompt.slice(0, 300) } : {}),
+                                  ...(role ? { role } : {}),
+                                  ...(model ? { model } : {}),
+                                  taskType: "subagent",
+                                  agentKind: "agent",
+                                  timelineBypass: false,
+                                },
+                              });
+                            }
+                          }
+
                           const isFailed = step.state !== "DONE";
                           if (isFailed) {
-                            const stepIdx = Number(step.step_index) || 0;
                             for (const tracked of ctx.subagents.values()) {
                               if (tracked.stepIndex === stepIdx && tracked.status === "running") {
                                 tracked.status = "failed";
