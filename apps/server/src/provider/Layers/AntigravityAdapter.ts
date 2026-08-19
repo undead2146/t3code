@@ -848,6 +848,7 @@ export function makeAntigravityAdapter(
                                 ...(role ? { role } : {}),
                                 ...(model ? { model } : {}),
                                 taskType: "subagent",
+                                agentKind: "agent",
                                 timelineBypass: false,
                               },
                             });
@@ -873,6 +874,8 @@ export function makeAntigravityAdapter(
                                     : "Sent message to subagent",
                                   lastToolName: "send_message",
                                   status: "running",
+                                  taskType: "subagent",
+                                  agentKind: "agent",
                                   ...(tracked.role ? { role: tracked.role } : {}),
                                   ...(tracked.model ? { model: tracked.model } : {}),
                                 },
@@ -898,6 +901,8 @@ export function makeAntigravityAdapter(
                                   payload: {
                                     taskId: tracked.taskId,
                                     status: "cancelled",
+                                    taskType: "subagent",
+                                    agentKind: "agent",
                                   },
                                 });
                               }
@@ -917,6 +922,8 @@ export function makeAntigravityAdapter(
                                     payload: {
                                       taskId: tracked.taskId,
                                       status: "cancelled",
+                                      taskType: "subagent",
+                                      agentKind: "agent",
                                     },
                                   });
                                 }
@@ -962,6 +969,8 @@ export function makeAntigravityAdapter(
                                   payload: {
                                     taskId: tracked.taskId,
                                     status: "failed",
+                                    taskType: "subagent",
+                                    agentKind: "agent",
                                     error: `Subagent launch failed (${step.state})`,
                                   },
                                 });
