@@ -90,6 +90,10 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
       args.push("--dangerously-skip-permissions");
     }
 
+    if (cwd) {
+      args.push("--add-dir", cwd);
+    }
+
     const modelSlug = modelSelection.model || "gemini-3.7-flash";
     args.push("--model", modelSlug);
 

@@ -611,6 +611,10 @@ export function makeAntigravityAdapter(
             args.push("--dangerously-skip-permissions");
           }
 
+          if (ctx.cwd) {
+            args.push("--add-dir", ctx.cwd);
+          }
+
           const selectedModel = input.modelSelection?.model;
           const effortSupported = isAntigravityEffortSupported(selectedModel);
           const selectedEffort = effortSupported
