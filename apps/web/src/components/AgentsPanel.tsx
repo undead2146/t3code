@@ -137,8 +137,9 @@ function agentActivityText(agent: RuntimeSubagent): string | null {
   );
 }
 
-/** Flat, non-interactive agent status line. No unfold. */
+/** Expandable agent status line with detailed activity trace. */
 function AgentRow({ agent }: { agent: RuntimeSubagent }) {
+  const [expanded, setExpanded] = useState(false);
   const visuals = STATUS_VISUALS[agent.status];
   const activity = agentActivityText(agent);
   const modelLabel = formatSubagentModelLabel(agent.model, agent.effort);
@@ -154,38 +155,105 @@ function AgentRow({ agent }: { agent: RuntimeSubagent }) {
   ].filter((value): value is string => value !== null);
 
   return (
-    <div className="grid h-[3.875rem] grid-cols-[0.375rem_minmax(0,1fr)_auto] grid-rows-[1.25rem_1.125rem_1rem] items-center gap-x-2 rounded-md px-1.5 py-1">
-      <span className="col-start-1 row-start-1 flex items-center">
-        <StatusDot status={agent.status} />
-      </span>
-      <span className="col-start-2 row-start-1 flex min-w-0 items-baseline gap-2">
-        <span className="min-w-0 truncate text-sm font-medium">{agent.title}</span>
-        {role ? (
-          <span className="max-w-28 shrink-0 truncate rounded-sm border border-border/60 px-1 font-mono text-[.65rem] text-muted-foreground">
-            {role}
-          </span>
-        ) : null}
-      </span>
-      <span className="col-start-3 row-start-1 min-w-14 text-right font-mono text-[.7rem] text-muted-foreground/80">
-        <span className="inline-flex items-center gap-1">
-          <AgentElapsed agent={agent} />
-          {agent.status === "completed" ? (
-            <Check aria-hidden className="size-3 text-success" />
+    <div className="flex flex-col rounded-md border border-transparent transition-colors hover:border-border/40 hover:bg-accent/20">
+      <button
+        type="button"
+        onClick={() => setExpanded((prev) => !prev)}
+        className="grid w-full grid-cols-[0.375rem_minmax(0,1fr)_auto] grid-rows-[1.25rem_1.125rem_1rem] items-center gap-x-2 px-1.5 py-1 text-left"
+        aria-expanded={expanded}
+      >
+        <span className="col-start-1 row-start-1 flex items-center">
+          <StatusDot status={agent.status} />
+        </span>
+        <span className="col-start-2 row-start-1 flex min-w-0 items-baseline gap-2">
+          <span className="min-w-0 truncate text-sm font-medium">{agent.title}</span>
+          {role ? (
+            <span className="max-w-28 shrink-0 truncate rounded-sm border border-border/60 px-1 font-mono text-[.65rem] text-muted-foreground">
+              {role}
+            </span>
           ) : null}
         </span>
-      </span>
-      <span
-        className={cn(
-          "col-start-2 col-end-4 row-start-2 block truncate text-xs",
-          agent.status === "failed" ? "text-destructive-foreground" : "text-muted-foreground",
-        )}
-      >
-        {activity ?? visuals.label}
-      </span>
-      <span className="col-start-2 col-end-4 row-start-3 truncate font-mono text-[.7rem] tabular-nums text-muted-foreground/70">
-        {metadata.join(" · ")}
-      </span>
-      <span className="sr-only">{visuals.label}</span>
+        <span className="col-start-3 row-start-1 min-w-14 text-right font-mono text-[.7rem] text-muted-foreground/80">
+          <span className="inline-flex items-center gap-1">
+            <AgentElapsed agent={agent} />
+            {agent.status === "completed" ? (
+              <Check aria-hidden className="size-3 text-success" />
+            ) : null}
+            <ChevronDown
+              aria-hidden
+              className={cn(
+                "size-3 text-muted-foreground/60 transition-transform",
+                expanded && "rotate-180",
+              )}
+            />
+          </span>
+        </span>
+        <span
+          className={cn(
+            "col-start-2 col-end-4 row-start-2 block truncate text-xs",
+            agent.status === "failed" ? "text-destructive-foreground" : "text-muted-foreground",
+          )}
+        >
+          {activity ?? visuals.label}
+        </span>
+        <span className="col-start-2 col-end-4 row-start-3 truncate font-mono text-[.7rem] tabular-nums text-muted-foreground/70">
+          {metadata.join(" · ")}
+        </span>
+        <span className="sr-only">{visuals.label}</span>
+      </button>
+
+      {expanded ? (
+        <div className="flex flex-col gap-1.5 border-t border-border/40 bg-muted/20 px-2.5 py-2 text-xs">
+          {agent.runHandles?.runId ? (
+            <div className="flex items-center gap-1.5 font-mono text-[.68rem] text-muted-foreground">
+              <span className="font-semibold text-foreground/80">ID:</span>
+              <span className="select-all truncate">{agent.runHandles.runId}</span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-1.5 font-mono text-[.68rem] text-muted-foreground">
+              <span className="font-semibold text-foreground/80">ID:</span>
+              <span className="select-all truncate">{agent.id}</span>
+            </div>
+          )}
+          {agent.runHandles?.scriptPath ? (
+            <div className="flex items-center gap-1.5 font-mono text-[.68rem] text-muted-foreground">
+              <span className="font-semibold text-foreground/80">Log:</span>
+              <span className="select-all truncate">{agent.runHandles.scriptPath}</span>
+            </div>
+          ) : null}
+          {agent.recentActivity.length > 0 ? (
+            <div className="flex flex-col gap-1 pt-1">
+              <span className="font-mono text-[.68rem] font-semibold text-muted-foreground">
+                Activity log:
+              </span>
+              <div className="flex flex-col gap-1 rounded bg-background/50 p-1.5 font-mono text-[.68rem]">
+                {agent.recentActivity.map((entry, idx) => (
+                  <div key={idx} className="flex items-start gap-1.5 text-foreground/90">
+                    <span className="text-muted-foreground">›</span>
+                    <span className="break-all">{entry.summary}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {agent.result ? (
+            <div className="flex flex-col gap-0.5 pt-1">
+              <span className="font-semibold text-success-foreground">Result:</span>
+              <p className="whitespace-pre-wrap break-words rounded bg-background/50 p-1.5 font-sans text-xs text-foreground/90">
+                {agent.result}
+              </p>
+            </div>
+          ) : null}
+          {agent.error ? (
+            <div className="flex flex-col gap-0.5 pt-1">
+              <span className="font-semibold text-destructive-foreground">Error:</span>
+              <p className="whitespace-pre-wrap break-words rounded bg-destructive/10 p-1.5 font-mono text-xs text-destructive-foreground">
+                {agent.error}
+              </p>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

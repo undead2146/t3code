@@ -1137,6 +1137,10 @@ export function makeAntigravityAdapter(
                                   taskType: "subagent",
                                   agentKind: "agent",
                                   timelineBypass: false,
+                                  runHandles: {
+                                    runId: cid,
+                                    ...(sub.transcript ? { scriptPath: sub.transcript } : {}),
+                                  },
                                 },
                               });
                             }
