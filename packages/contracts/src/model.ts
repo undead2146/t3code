@@ -202,6 +202,10 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
     "haiku-4.5": "claude-haiku-4-5",
     "claude-haiku-4.5": "claude-haiku-4-5",
     "claude-haiku-4-5-20251001": "claude-haiku-4-5",
+    "stealth/ox-alpha": "stealth/ox-alpha",
+    "ox-alpha": "stealth/ox-alpha",
+    "stealth-ox-alpha": "stealth/ox-alpha",
+    ox: "stealth/ox-alpha",
   },
   [CURSOR_DRIVER_KIND]: {
     composer: "composer-2",

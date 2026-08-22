@@ -48,6 +48,20 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
       }),
     );
 
+    it.effect("sets custom ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY when configured", () =>
+      Effect.gen(function* () {
+        const env = yield* makeClaudeEnvironment({
+          homePath: "",
+          apiBaseUrl: "https://openrouter.ai/api/v1",
+          apiKey: "sk-or-test-key",
+        });
+
+        expect(env.ANTHROPIC_BASE_URL).toBe("https://openrouter.ai/api/v1");
+        expect(env.ANTHROPIC_API_KEY).toBe("sk-or-test-key");
+        expect(env.ANTHROPIC_AUTH_TOKEN).toBe("sk-or-test-key");
+      }),
+    );
+
     it.effect("keeps continuation compatible across instances with the same Claude HOME", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;

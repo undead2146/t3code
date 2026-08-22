@@ -15,23 +15,31 @@ export const resolveClaudeHomePath = Effect.fn("resolveClaudeHomePath")(function
 });
 
 export const makeClaudeEnvironment = Effect.fn("makeClaudeEnvironment")(function* (
-  config: Pick<ClaudeSettings, "homePath">,
+  config: Pick<ClaudeSettings, "homePath"> & Partial<Pick<ClaudeSettings, "apiBaseUrl" | "apiKey">>,
   baseEnv?: NodeJS.ProcessEnv,
 ): Effect.fn.Return<NodeJS.ProcessEnv, never, Path.Path> {
   const resolvedBaseEnv = baseEnv ?? process.env;
-  const homePath = config.homePath.trim();
-  if (homePath.length === 0) return resolvedBaseEnv;
-  const resolvedHomePath = yield* resolveClaudeHomePath(config);
-  return {
-    ...resolvedBaseEnv,
-    // Isolate this instance's config via CLAUDE_CONFIG_DIR rather than HOME.
-    // Overriding HOME also relocates the macOS login keychain lookup
-    // ($HOME/Library/Keychains), so the spawned CLI can't find its stored
-    // OAuth credentials and reports "Not logged in". CLAUDE_CONFIG_DIR points
-    // Claude Code at its config dir directly while leaving HOME (and the
-    // keychain) intact.
-    CLAUDE_CONFIG_DIR: resolvedHomePath,
-  };
+  const homePath = config.homePath?.trim() ?? "";
+  const apiBaseUrl = config.apiBaseUrl?.trim() ?? "";
+  const apiKey = config.apiKey?.trim() ?? "";
+
+  if (homePath.length === 0 && apiBaseUrl.length === 0 && apiKey.length === 0) {
+    return resolvedBaseEnv;
+  }
+
+  let nextEnv: NodeJS.ProcessEnv = { ...resolvedBaseEnv };
+  if (homePath.length > 0) {
+    const resolvedHomePath = yield* resolveClaudeHomePath(config);
+    nextEnv.CLAUDE_CONFIG_DIR = resolvedHomePath;
+  }
+  if (apiBaseUrl.length > 0) {
+    nextEnv.ANTHROPIC_BASE_URL = apiBaseUrl;
+  }
+  if (apiKey.length > 0) {
+    nextEnv.ANTHROPIC_API_KEY = apiKey;
+    nextEnv.ANTHROPIC_AUTH_TOKEN = apiKey;
+  }
+  return nextEnv;
 });
 
 export const makeClaudeContinuationGroupKey = Effect.fn("makeClaudeContinuationGroupKey")(
@@ -43,10 +51,12 @@ export const makeClaudeContinuationGroupKey = Effect.fn("makeClaudeContinuationG
 
 export const makeClaudeCapabilitiesCacheKey = Effect.fn("makeClaudeCapabilitiesCacheKey")(
   function* (
-    config: Pick<ClaudeSettings, "binaryPath" | "homePath">,
+    config: Pick<ClaudeSettings, "binaryPath" | "homePath"> &
+      Partial<Pick<ClaudeSettings, "apiBaseUrl">>,
     cwd?: string,
   ): Effect.fn.Return<string, never, Path.Path> {
     const resolvedHomePath = yield* resolveClaudeHomePath(config);
-    return `${config.binaryPath}\0${resolvedHomePath}\0${cwd ?? ""}`;
+    const endpointFragment = config.apiBaseUrl?.trim() ? `\0${config.apiBaseUrl.trim()}` : "";
+    return `${config.binaryPath}\0${resolvedHomePath}${endpointFragment}\0${cwd ?? ""}`;
   },
 );

@@ -56,7 +56,12 @@ const MINIMUM_CLAUDE_FABLE_5_VERSION = "2.1.169";
 const MINIMUM_CLAUDE_OPUS_4_8_VERSION = "2.1.154";
 const MINIMUM_CLAUDE_OPUS_4_7_VERSION = "2.1.111";
 
-const CURRENT_CLAUDE_MODELS = new Set(["claude-fable-5", "claude-opus-5", "claude-sonnet-5"]);
+const CURRENT_CLAUDE_MODELS = new Set([
+  "claude-fable-5",
+  "claude-opus-5",
+  "claude-sonnet-5",
+  "stealth/ox-alpha",
+]);
 
 export function isLegacyClaudeModel(model: string): boolean {
   return !CURRENT_CLAUDE_MODELS.has(model);
@@ -321,6 +326,25 @@ const CLAUDE_MODEL_CATALOG: ReadonlyArray<ServerProviderModel> = [
         buildBooleanOptionDescriptor({
           id: "thinking",
           label: "Thinking",
+        }),
+      ],
+    }),
+  },
+  {
+    slug: "stealth/ox-alpha",
+    name: "Stealth OX Alpha (OpenRouter)",
+    isCustom: false,
+    capabilities: createModelCapabilities({
+      optionDescriptors: [
+        buildSelectOptionDescriptor({
+          id: "effort",
+          label: "Reasoning",
+          options: [
+            { value: "low", label: "Low" },
+            { value: "medium", label: "Medium" },
+            { value: "high", label: "High", isDefault: true },
+            { value: "max", label: "Max" },
+          ],
         }),
       ],
     }),
@@ -931,6 +955,8 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
   const dedupedSlashCommands = dedupeSlashCommands(slashCommands);
 
   if (!capabilities) {
+    const hasCustomEndpoint =
+      Boolean(claudeSettings.apiBaseUrl?.trim()) || Boolean(resolvedEnvironment.ANTHROPIC_BASE_URL);
     return buildServerProvider({
       presentation: CLAUDE_PRESENTATION,
       enabled: claudeSettings.enabled,
@@ -941,9 +967,14 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
       probe: {
         installed: true,
         version: parsedVersion,
-        status: "warning",
-        auth: { status: "unknown" },
-        message: "Could not verify Claude authentication status from initialization result.",
+        status: hasCustomEndpoint ? "ready" : "warning",
+        auth: {
+          status: hasCustomEndpoint ? "authenticated" : "unknown",
+          label: hasCustomEndpoint ? "OpenRouter / Custom Endpoint" : undefined,
+        },
+        message: hasCustomEndpoint
+          ? undefined
+          : "Could not verify Claude authentication status from initialization result.",
       },
     });
   }

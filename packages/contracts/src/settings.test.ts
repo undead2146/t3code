@@ -365,4 +365,18 @@ describe("ServerSettingsPatch string normalization", () => {
     expect(encoded.providers?.codex?.binaryPath).toBe("/opt/homebrew/bin/codex");
     expect(encoded.providers?.codex?.launchArgs).toBe("--strict-config");
   });
+
+  it("decodes Claude provider settings with custom apiBaseUrl and apiKey", () => {
+    const patch = decodeServerSettingsPatch({
+      providers: {
+        claudeAgent: {
+          apiBaseUrl: "  https://openrouter.ai/api/v1  ",
+          apiKey: "  sk-or-test-key  ",
+        },
+      },
+    });
+
+    expect(patch.providers?.claudeAgent?.apiBaseUrl).toBe("https://openrouter.ai/api/v1");
+    expect(patch.providers?.claudeAgent?.apiKey).toBe("sk-or-test-key");
+  });
 });
