@@ -218,7 +218,12 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
     "opus-4.5-thinking": "claude-opus-4-5",
     "opus-4.5": "claude-opus-4-5",
   },
-  [OPENCODE_DRIVER_KIND]: {},
+  [OPENCODE_DRIVER_KIND]: {
+    "stealth/ox-alpha": "openrouter/stealth/ox-alpha",
+    "ox-alpha": "openrouter/stealth/ox-alpha",
+    "stealth-ox-alpha": "openrouter/stealth/ox-alpha",
+    ox: "openrouter/stealth/ox-alpha",
+  },
   [ANTIGRAVITY_DRIVER_KIND]: {
     flash: "gemini-3.7-flash",
     pro: "gemini-3.7-pro",

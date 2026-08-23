@@ -544,7 +544,9 @@ export const OpenCodeSettings = makeProviderSettingsSchema(
       }),
     ),
     customModels: Schema.Array(Schema.String).pipe(
-      Schema.withDecodingDefault(Effect.succeed([])),
+      Schema.withDecodingDefault(
+        Effect.succeed(["openrouter/stealth/ox-alpha", "stealth/ox-alpha"]),
+      ),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
