@@ -298,3 +298,78 @@ export function computeSubagentUsage(
     return undefined;
   }
 }
+
+export function extractConversationIdsFromText(text: unknown): ReadonlyArray<string> {
+  if (typeof text !== "string") {
+    if (typeof text === "object" && text !== null) {
+      try {
+        text = JSON.stringify(text);
+      } catch {
+        return [];
+      }
+    } else {
+      return [];
+    }
+  }
+  const uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+  const matches = (text as string).match(uuidRegex);
+  return matches ? [...new Set(matches.map((m) => m.toLowerCase()))] : [];
+}
+
+export function checkSubagentTranscriptStatus(
+  conversationId: string,
+  customPath?: string,
+): {
+  readonly status: "completed" | "failed" | "running";
+  readonly summary?: string;
+  readonly lastToolName?: string;
+} {
+  try {
+    const transcriptPath = customPath || findTranscriptPath(conversationId);
+    if (!transcriptPath || !NodeFS.existsSync(transcriptPath)) {
+      return { status: "running" };
+    }
+    const rawContent = NodeFS.readFileSync(transcriptPath, "utf8");
+    const lines = rawContent
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) {
+      return { status: "running" };
+    }
+
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const obj = JSON.parse(lines[i]!) as {
+          type?: string;
+          status?: string;
+          content?: string;
+          tool_calls?: Array<{ name?: string; args?: Record<string, unknown> }>;
+        };
+        if (obj.type === "PLANNER_RESPONSE") {
+          if (!Array.isArray(obj.tool_calls) || obj.tool_calls.length === 0) {
+            return {
+              status: "completed",
+              summary: obj.content ? obj.content.slice(0, 150) : "Subagent completed",
+            };
+          }
+          const lastTool = obj.tool_calls[obj.tool_calls.length - 1];
+          return {
+            status: "running",
+            lastToolName: lastTool?.name,
+            summary: lastTool?.name ? `Running tool: ${lastTool.name}` : undefined,
+          };
+        }
+        if (obj.type === "ERROR" || obj.status === "ERROR" || obj.status === "FAILED") {
+          return {
+            status: "failed",
+            summary: obj.content ? obj.content.slice(0, 150) : "Subagent failed",
+          };
+        }
+      } catch {}
+    }
+    return { status: "running" };
+  } catch {
+    return { status: "running" };
+  }
+}

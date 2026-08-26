@@ -24,6 +24,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
+import * as Duration from "effect/Duration";
 import * as Semaphore from "effect/Semaphore";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
@@ -44,9 +45,15 @@ import {
   resolveAntigravityBinary,
   resolveAntigravityContextWindow,
 } from "./AntigravityProvider.ts";
-import { computeSubagentUsage } from "../../orchestration/subagentTranscriptQuery.ts";
+import {
+  checkSubagentTranscriptStatus,
+  computeSubagentUsage,
+  extractConversationIdsFromText,
+  findTranscriptPath,
+} from "../../orchestration/subagentTranscriptQuery.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCP from "node:child_process";
+import * as NodeFS from "node:fs";
 
 export const KILLED_SUBAGENT_IDS = new Set<string>();
 
@@ -766,219 +773,448 @@ export function makeAntigravityAdapter(
           let lastResultError: string | undefined;
 
           const monitorEffect = Effect.gen(function* () {
-            yield* Stream.runForEach(
-              processHandle.stderr.pipe(Stream.decodeText(), Stream.splitLines),
-              (line) =>
-                Effect.sync(() => {
-                  const trimmed = line.trim();
-                  if (trimmed) {
-                    stderrChunks.push(trimmed);
-                  }
-                }),
-            ).pipe(Effect.forkIn(ctx.scope));
-
-            const stdoutLines = processHandle.stdout.pipe(Stream.decodeText(), Stream.splitLines);
-
-            yield* Stream.runForEach(stdoutLines, (line) =>
+            const runProcessStream = (proc: typeof processHandle) =>
               Effect.gen(function* () {
-                const trimmed = line.trim();
-                if (!trimmed) return;
-
-                const decoded = decodeJsonExit(trimmed);
-                if (
-                  Exit.isSuccess(decoded) &&
-                  typeof decoded.value === "object" &&
-                  decoded.value !== null
-                ) {
-                  const data = decoded.value as Record<string, unknown>;
-                  const stamp = yield* makeEventStamp();
-
-                  if (nativeEventLogger) {
-                    yield* nativeEventLogger.write(data, threadId);
-                  }
-
-                  if (data.event === "init") {
-                    if (typeof data.conversation_id === "string") {
-                      ctx.antigravityConversationId = data.conversation_id;
-                    }
-                    yield* publishEvent({
-                      ...stamp,
-                      provider: PROVIDER,
-                      threadId,
-                      turnId,
-                      type: "session.state.changed",
-                      payload: { state: "running" },
-                    });
-                  } else if (
-                    data.event === "step_update" &&
-                    typeof data.step_update === "object" &&
-                    data.step_update !== null
-                  ) {
-                    const step = data.step_update as Record<string, unknown>;
-                    turnRecord.items.push(step);
-
-                    if (step.step_type === "agent_response") {
-                      if (typeof step.text_delta === "string" && step.text_delta.length > 0) {
-                        hasEmittedText = true;
-                        yield* publishEvent({
-                          ...stamp,
-                          provider: PROVIDER,
-                          threadId,
-                          turnId,
-                          type: "content.delta",
-                          payload: {
-                            streamKind: "assistant_text",
-                            delta: step.text_delta,
-                          },
-                        });
+                yield* Stream.runForEach(
+                  proc.stderr.pipe(Stream.decodeText(), Stream.splitLines),
+                  (line) =>
+                    Effect.sync(() => {
+                      const trimmed = line.trim();
+                      if (trimmed) {
+                        stderrChunks.push(trimmed);
                       }
-                    } else if (step.step_type === "tool" && typeof step.tool_name === "string") {
-                      const toolItemType = toolNameToItemType(step.tool_name);
-                      const toolInfo =
-                        typeof step.tool_info === "object" && step.tool_info !== null
-                          ? (step.tool_info as Record<string, unknown>)
-                          : undefined;
-                      const toolDetail = toolParamsToDetail(toolInfo?.parameters);
-                      const itemId = RuntimeItemId.make(`step-${step.step_index}`);
+                    }),
+                ).pipe(Effect.forkIn(ctx.scope));
 
-                      if (step.state === "ACTIVE") {
+                const stdoutLines = proc.stdout.pipe(Stream.decodeText(), Stream.splitLines);
+
+                yield* Stream.runForEach(stdoutLines, (line) =>
+                  Effect.gen(function* () {
+                    const trimmed = line.trim();
+                    if (!trimmed) return;
+
+                    const decoded = decodeJsonExit(trimmed);
+                    if (
+                      Exit.isSuccess(decoded) &&
+                      typeof decoded.value === "object" &&
+                      decoded.value !== null
+                    ) {
+                      const data = decoded.value as Record<string, unknown>;
+                      const stamp = yield* makeEventStamp();
+
+                      if (nativeEventLogger) {
+                        yield* nativeEventLogger.write(data, threadId);
+                      }
+
+                      if (data.event === "init") {
+                        if (typeof data.conversation_id === "string") {
+                          ctx.antigravityConversationId = data.conversation_id;
+                        }
                         yield* publishEvent({
                           ...stamp,
                           provider: PROVIDER,
                           threadId,
                           turnId,
-                          itemId,
-                          type: "item.started",
-                          payload: {
-                            itemType: toolItemType,
-                            status: "inProgress",
-                            title: step.tool_name,
-                            ...(toolDetail ? { detail: toolDetail } : {}),
-                            ...(toolInfo ? { data: toolInfo } : {}),
-                          },
+                          type: "session.state.changed",
+                          payload: { state: "running" },
                         });
+                      } else if (
+                        data.event === "step_update" &&
+                        typeof data.step_update === "object" &&
+                        data.step_update !== null
+                      ) {
+                        const step = data.step_update as Record<string, unknown>;
+                        turnRecord.items.push(step);
 
-                        if (step.tool_name === "invoke_subagent") {
-                          const stepIdx = Number(step.step_index) || 0;
-                          const stepKey = `s${stepIdx}`;
-                          if (!ctx.subagents.has(stepKey)) {
-                            ctx.subagents.set(stepKey, {
-                              taskId: RuntimeTaskId.make(`subagent-${threadId}-${stepKey}`),
-                              role: "Subagent",
-                              status: "running",
-                              stepIndex: stepIdx,
+                        if (step.step_type === "agent_response") {
+                          if (typeof step.text_delta === "string" && step.text_delta.length > 0) {
+                            hasEmittedText = true;
+                            yield* publishEvent({
+                              ...stamp,
+                              provider: PROVIDER,
+                              threadId,
+                              turnId,
+                              type: "content.delta",
+                              payload: {
+                                streamKind: "assistant_text",
+                                delta: step.text_delta,
+                              },
                             });
-                            const parsedList = parseSubagentsParam(toolInfo?.parameters);
-                            const subagentList =
-                              parsedList.length > 0 ? parsedList : [{ Role: "Subagent" }];
-                            for (let idx = 0; idx < subagentList.length; idx++) {
-                              const item = subagentList[idx]!;
-                              const taskId = RuntimeTaskId.make(
-                                `subagent-${threadId}-s${stepIdx}-i${idx}`,
-                              );
-                              const role =
-                                item.Role ||
-                                item.role ||
-                                item.TypeName ||
-                                item.typeName ||
-                                "Subagent";
-                              const prompt = item.Prompt || item.prompt;
-                              const rawModel = item.Model || item.model;
-                              const model =
-                                rawModel && rawModel !== "inherit"
-                                  ? rawModel
-                                  : ctx.session.model || undefined;
-                              const tracked: TrackedSubagent = {
-                                taskId,
-                                role,
-                                typeName: item.TypeName || item.typeName,
-                                prompt,
-                                model,
-                                status: "running",
-                                stepIndex: stepIdx,
-                              };
-                              ctx.subagents.set(String(taskId), tracked);
-                              ctx.subagents.set(`s${stepIdx}-i${idx}`, tracked);
+                          }
+                        } else if (
+                          step.step_type === "tool" &&
+                          typeof step.tool_name === "string"
+                        ) {
+                          const toolItemType = toolNameToItemType(step.tool_name);
+                          const toolInfo =
+                            typeof step.tool_info === "object" && step.tool_info !== null
+                              ? (step.tool_info as Record<string, unknown>)
+                              : undefined;
+                          const toolDetail = toolParamsToDetail(toolInfo?.parameters);
+                          const itemId = RuntimeItemId.make(`step-${step.step_index}`);
 
-                              yield* publishEvent({
-                                ...stamp,
-                                provider: PROVIDER,
-                                threadId,
-                                turnId,
-                                type: "task.started",
-                                payload: {
-                                  taskId,
-                                  title: role,
-                                  ...(prompt ? { description: prompt.slice(0, 300) } : {}),
-                                  ...(role ? { role } : {}),
-                                  ...(model ? { model } : {}),
-                                  taskType: "subagent",
-                                  agentKind: "agent",
-                                  timelineBypass: false,
-                                },
-                              });
-                            }
-                          }
-                        } else if (step.tool_name === "send_message") {
-                          const p = (toolInfo?.parameters ?? {}) as Record<string, unknown>;
-                          const recipient = (p.Recipient || p.recipient) as string | undefined;
-                          const message = (p.Message || p.message) as string | undefined;
-                          if (recipient) {
-                            const tracked = ctx.subagents.get(recipient);
-                            if (tracked && tracked.status === "running") {
-                              yield* publishEvent({
-                                ...stamp,
-                                provider: PROVIDER,
-                                threadId,
-                                turnId,
-                                type: "task.progress",
-                                payload: {
-                                  taskId: tracked.taskId,
-                                  description: tracked.prompt || tracked.role || "Subagent",
-                                  summary: message
-                                    ? `Sent message: ${message.slice(0, 100)}`
-                                    : "Sent message to subagent",
-                                  lastToolName: "send_message",
+                          if (step.state === "ACTIVE") {
+                            yield* publishEvent({
+                              ...stamp,
+                              provider: PROVIDER,
+                              threadId,
+                              turnId,
+                              itemId,
+                              type: "item.started",
+                              payload: {
+                                itemType: toolItemType,
+                                status: "inProgress",
+                                title: step.tool_name,
+                                ...(toolDetail ? { detail: toolDetail } : {}),
+                                ...(toolInfo ? { data: toolInfo } : {}),
+                              },
+                            });
+
+                            if (step.tool_name === "invoke_subagent") {
+                              const stepIdx = Number(step.step_index) || 0;
+                              const stepKey = `s${stepIdx}`;
+                              if (!ctx.subagents.has(stepKey)) {
+                                ctx.subagents.set(stepKey, {
+                                  taskId: RuntimeTaskId.make(`subagent-${threadId}-${stepKey}`),
+                                  role: "Subagent",
                                   status: "running",
-                                  taskType: "subagent",
-                                  agentKind: "agent",
-                                  ...(tracked.role ? { role: tracked.role } : {}),
-                                  ...(tracked.model ? { model: tracked.model } : {}),
-                                },
-                              });
-                            }
-                          }
-                        } else if (step.tool_name === "manage_subagents") {
-                          const p = (toolInfo?.parameters ?? {}) as Record<string, unknown>;
-                          const action = (p.Action || p.action) as string | undefined;
-                          const convIds = (p.ConversationIds ||
-                            p.conversation_ids ||
-                            p.conversationIds) as unknown;
-                          if (action === "kill_all") {
-                            for (const tracked of ctx.subagents.values()) {
-                              if (tracked.status === "running") {
-                                tracked.status = "cancelled";
-                                yield* publishEvent({
-                                  ...stamp,
-                                  provider: PROVIDER,
-                                  threadId,
-                                  turnId,
-                                  type: "task.completed",
-                                  payload: {
-                                    taskId: tracked.taskId,
-                                    status: "cancelled",
-                                    taskType: "subagent",
-                                    agentKind: "agent",
-                                  },
+                                  stepIndex: stepIdx,
                                 });
+                                const parsedList = parseSubagentsParam(toolInfo?.parameters);
+                                const subagentList =
+                                  parsedList.length > 0 ? parsedList : [{ Role: "Subagent" }];
+                                for (let idx = 0; idx < subagentList.length; idx++) {
+                                  const item = subagentList[idx]!;
+                                  const taskId = RuntimeTaskId.make(
+                                    `subagent-${threadId}-s${stepIdx}-i${idx}`,
+                                  );
+                                  const role =
+                                    item.Role ||
+                                    item.role ||
+                                    item.TypeName ||
+                                    item.typeName ||
+                                    "Subagent";
+                                  const prompt = item.Prompt || item.prompt;
+                                  const rawModel = item.Model || item.model;
+                                  const model =
+                                    rawModel && rawModel !== "inherit"
+                                      ? rawModel
+                                      : ctx.session.model || undefined;
+                                  const tracked: TrackedSubagent = {
+                                    taskId,
+                                    role,
+                                    typeName: item.TypeName || item.typeName,
+                                    prompt,
+                                    model,
+                                    status: "running",
+                                    stepIndex: stepIdx,
+                                  };
+                                  ctx.subagents.set(String(taskId), tracked);
+                                  ctx.subagents.set(`s${stepIdx}-i${idx}`, tracked);
+
+                                  yield* publishEvent({
+                                    ...stamp,
+                                    provider: PROVIDER,
+                                    threadId,
+                                    turnId,
+                                    type: "task.started",
+                                    payload: {
+                                      taskId,
+                                      title: role,
+                                      ...(prompt ? { description: prompt.slice(0, 300) } : {}),
+                                      ...(role ? { role } : {}),
+                                      ...(model ? { model } : {}),
+                                      taskType: "subagent",
+                                      agentKind: "agent",
+                                      timelineBypass: false,
+                                    },
+                                  });
+                                }
+                              }
+                            } else if (step.tool_name === "send_message") {
+                              const p = (toolInfo?.parameters ?? {}) as Record<string, unknown>;
+                              const recipient = (p.Recipient || p.recipient) as string | undefined;
+                              const message = (p.Message || p.message) as string | undefined;
+                              if (recipient) {
+                                const tracked = ctx.subagents.get(recipient);
+                                if (tracked && tracked.status === "running") {
+                                  yield* publishEvent({
+                                    ...stamp,
+                                    provider: PROVIDER,
+                                    threadId,
+                                    turnId,
+                                    type: "task.progress",
+                                    payload: {
+                                      taskId: tracked.taskId,
+                                      description: tracked.prompt || tracked.role || "Subagent",
+                                      summary: message
+                                        ? `Sent message: ${message.slice(0, 100)}`
+                                        : "Sent message to subagent",
+                                      lastToolName: "send_message",
+                                      status: "running",
+                                      taskType: "subagent",
+                                      agentKind: "agent",
+                                      ...(tracked.role ? { role: tracked.role } : {}),
+                                      ...(tracked.model ? { model: tracked.model } : {}),
+                                    },
+                                  });
+                                }
+                              }
+                            } else if (step.tool_name === "manage_subagents") {
+                              const p = (toolInfo?.parameters ?? {}) as Record<string, unknown>;
+                              const action = (p.Action || p.action) as string | undefined;
+                              const convIds = (p.ConversationIds ||
+                                p.conversation_ids ||
+                                p.conversationIds) as unknown;
+                              if (action === "kill_all") {
+                                for (const tracked of ctx.subagents.values()) {
+                                  if (tracked.status === "running") {
+                                    tracked.status = "cancelled";
+                                    yield* publishEvent({
+                                      ...stamp,
+                                      provider: PROVIDER,
+                                      threadId,
+                                      turnId,
+                                      type: "task.completed",
+                                      payload: {
+                                        taskId: tracked.taskId,
+                                        status: "cancelled",
+                                        taskType: "subagent",
+                                        agentKind: "agent",
+                                      },
+                                    });
+                                  }
+                                }
+                              } else if (action === "kill" && Array.isArray(convIds)) {
+                                for (const cid of convIds) {
+                                  if (typeof cid === "string") {
+                                    const tracked = ctx.subagents.get(cid);
+                                    if (tracked && tracked.status === "running") {
+                                      tracked.status = "cancelled";
+                                      yield* publishEvent({
+                                        ...stamp,
+                                        provider: PROVIDER,
+                                        threadId,
+                                        turnId,
+                                        type: "task.completed",
+                                        payload: {
+                                          taskId: tracked.taskId,
+                                          status: "cancelled",
+                                          taskType: "subagent",
+                                          agentKind: "agent",
+                                        },
+                                      });
+                                    }
+                                  }
+                                }
                               }
                             }
-                          } else if (action === "kill" && Array.isArray(convIds)) {
-                            for (const cid of convIds) {
-                              if (typeof cid === "string") {
-                                const tracked = ctx.subagents.get(cid);
-                                if (tracked && tracked.status === "running") {
-                                  tracked.status = "cancelled";
+                          } else if (
+                            step.state === "DONE" ||
+                            step.state === "ERROR" ||
+                            step.state === "CANCELLED" ||
+                            step.state === "FAILED"
+                          ) {
+                            yield* publishEvent({
+                              ...stamp,
+                              provider: PROVIDER,
+                              threadId,
+                              turnId,
+                              itemId,
+                              type: "item.completed",
+                              payload: {
+                                itemType: toolItemType,
+                                status: step.state === "DONE" ? "completed" : "failed",
+                                title: step.tool_name,
+                                ...(toolDetail ? { detail: toolDetail } : {}),
+                                ...(toolInfo ? { data: toolInfo } : {}),
+                              },
+                            });
+
+                            if (step.tool_name === "invoke_subagent") {
+                              const stepIdx = Number(step.step_index) || 0;
+                              const stepKey = `s${stepIdx}`;
+                              if (!ctx.subagents.has(stepKey)) {
+                                ctx.subagents.set(stepKey, {
+                                  taskId: RuntimeTaskId.make(`subagent-${threadId}-${stepKey}`),
+                                  role: "Subagent",
+                                  status: "running",
+                                  stepIndex: stepIdx,
+                                });
+                                const parsedList = parseSubagentsParam(toolInfo?.parameters);
+                                const subagentList =
+                                  parsedList.length > 0 ? parsedList : [{ Role: "Subagent" }];
+                                for (let idx = 0; idx < subagentList.length; idx++) {
+                                  const item = subagentList[idx]!;
+                                  const taskId = RuntimeTaskId.make(
+                                    `subagent-${threadId}-s${stepIdx}-i${idx}`,
+                                  );
+                                  const role =
+                                    item.Role ||
+                                    item.role ||
+                                    item.TypeName ||
+                                    item.typeName ||
+                                    "Subagent";
+                                  const prompt = item.Prompt || item.prompt;
+                                  const rawModel = item.Model || item.model;
+                                  const model =
+                                    rawModel && rawModel !== "inherit"
+                                      ? rawModel
+                                      : ctx.session.model || undefined;
+                                  const tracked: TrackedSubagent = {
+                                    taskId,
+                                    role,
+                                    typeName: item.TypeName || item.typeName,
+                                    prompt,
+                                    model,
+                                    status: "running",
+                                    stepIndex: stepIdx,
+                                  };
+                                  ctx.subagents.set(String(taskId), tracked);
+                                  ctx.subagents.set(`s${stepIdx}-i${idx}`, tracked);
+
+                                  yield* publishEvent({
+                                    ...stamp,
+                                    provider: PROVIDER,
+                                    threadId,
+                                    turnId,
+                                    type: "task.started",
+                                    payload: {
+                                      taskId,
+                                      title: role,
+                                      ...(prompt ? { description: prompt.slice(0, 300) } : {}),
+                                      ...(role ? { role } : {}),
+                                      ...(model ? { model } : {}),
+                                      taskType: "subagent",
+                                      agentKind: "agent",
+                                      timelineBypass: false,
+                                    },
+                                  });
+                                }
+                              }
+
+                              const isFailed = step.state !== "DONE";
+                              if (isFailed) {
+                                for (const tracked of ctx.subagents.values()) {
+                                  if (
+                                    tracked.stepIndex === stepIdx &&
+                                    tracked.status === "running"
+                                  ) {
+                                    tracked.status = "failed";
+                                    yield* publishEvent({
+                                      ...stamp,
+                                      provider: PROVIDER,
+                                      threadId,
+                                      turnId,
+                                      type: "task.completed",
+                                      payload: {
+                                        taskId: tracked.taskId,
+                                        status: "failed",
+                                        taskType: "subagent",
+                                        agentKind: "agent",
+                                        error: `Subagent launch failed (${step.state})`,
+                                      },
+                                    });
+                                  }
+                                }
+                              } else {
+                                const output =
+                                  typeof step.content === "string"
+                                    ? step.content
+                                    : typeof toolInfo?.output === "string"
+                                      ? toolInfo.output
+                                      : typeof step.output === "string"
+                                        ? step.output
+                                        : "";
+                                const foundCids = extractConversationIdsFromText(output);
+                                if (foundCids.length > 0) {
+                                  let cIdx = 0;
+                                  for (const tracked of ctx.subagents.values()) {
+                                    if (
+                                      tracked.stepIndex === stepIdx &&
+                                      !tracked.conversationId &&
+                                      cIdx < foundCids.length
+                                    ) {
+                                      const cid = foundCids[cIdx++]!;
+                                      tracked.conversationId = cid;
+                                      ctx.subagents.set(cid, tracked);
+                                    }
+                                  }
+                                }
+                              }
+                            } else if (step.tool_name === "manage_subagents") {
+                              const output =
+                                typeof step.content === "string"
+                                  ? step.content
+                                  : typeof toolInfo?.output === "string"
+                                    ? toolInfo.output
+                                    : typeof step.output === "string"
+                                      ? step.output
+                                      : "";
+                              const listedSubagents = parseSubagentListFromOutput(output);
+                              for (const sub of listedSubagents) {
+                                const cid = sub.conversationId;
+                                if (!cid) continue;
+                                if (KILLED_SUBAGENT_IDS.has(cid)) {
+                                  const tracked = ctx.subagents.get(cid);
+                                  if (tracked) tracked.status = "cancelled";
+                                  continue;
+                                }
+                                const taskId = RuntimeTaskId.make(cid);
+                                const role = sub.role || sub.type || "Subagent";
+                                const rawStatus = sub.state;
+                                const status =
+                                  rawStatus === "completed"
+                                    ? "completed"
+                                    : rawStatus === "errored" || rawStatus === "failed"
+                                      ? "failed"
+                                      : rawStatus === "idle"
+                                        ? "idle"
+                                        : "running";
+
+                                const existingTracked = ctx.subagents.get(cid);
+                                if (existingTracked?.status === "cancelled") {
+                                  continue;
+                                }
+
+                                if (!existingTracked) {
+                                  const tracked: TrackedSubagent = {
+                                    taskId,
+                                    role,
+                                    typeName: sub.type,
+                                    status:
+                                      status === "completed" || status === "failed"
+                                        ? status
+                                        : "running",
+                                    stepIndex: Number(step.step_index) || 0,
+                                  };
+                                  ctx.subagents.set(cid, tracked);
+                                  ctx.subagents.set(String(taskId), tracked);
+
+                                  yield* publishEvent({
+                                    ...stamp,
+                                    provider: PROVIDER,
+                                    threadId,
+                                    turnId,
+                                    type: "task.started",
+                                    payload: {
+                                      taskId,
+                                      title: role,
+                                      role,
+                                      taskType: "subagent",
+                                      agentKind: "agent",
+                                      timelineBypass: false,
+                                      runHandles: {
+                                        runId: cid,
+                                        ...(sub.transcript ? { scriptPath: sub.transcript } : {}),
+                                      },
+                                    },
+                                  });
+                                }
+
+                                const usage = computeSubagentUsage(cid, sub.transcript);
+
+                                if (status === "completed" || status === "failed") {
                                   yield* publishEvent({
                                     ...stamp,
                                     provider: PROVIDER,
@@ -986,349 +1222,368 @@ export function makeAntigravityAdapter(
                                     turnId,
                                     type: "task.completed",
                                     payload: {
-                                      taskId: tracked.taskId,
-                                      status: "cancelled",
+                                      taskId,
+                                      status,
                                       taskType: "subagent",
                                       agentKind: "agent",
+                                      ...(usage ? { typedUsage: usage } : {}),
+                                    },
+                                  });
+                                } else if (sub.stateDetail) {
+                                  yield* publishEvent({
+                                    ...stamp,
+                                    provider: PROVIDER,
+                                    threadId,
+                                    turnId,
+                                    type: "task.progress",
+                                    payload: {
+                                      taskId,
+                                      title: role,
+                                      role,
+                                      summary: sub.stateDetail,
+                                      lastToolName:
+                                        sub.stateDetail.split(":")[0]?.trim() || "subagent",
+                                      status: "running",
+                                      taskType: "subagent",
+                                      agentKind: "agent",
+                                      ...(usage ? { typedUsage: usage } : {}),
                                     },
                                   });
                                 }
                               }
                             }
                           }
+                        } else if (step.step_type === "error_message") {
+                          const errorText =
+                            typeof step.error === "string"
+                              ? step.error
+                              : typeof step.content === "string"
+                                ? step.content
+                                : undefined;
+                          if (errorText) {
+                            yield* publishEvent({
+                              ...stamp,
+                              provider: PROVIDER,
+                              threadId,
+                              turnId,
+                              type: "content.delta",
+                              payload: {
+                                streamKind: "assistant_text",
+                                delta: `\n\n> ⚠️ **Antigravity Notice**: ${errorText}\n\n`,
+                              },
+                            });
+                          }
+                        }
+
+                        if (
+                          step.step_type !== "checkpoint" &&
+                          typeof step.usage === "object" &&
+                          step.usage !== null
+                        ) {
+                          const usageSnapshot = parseAntigravityUsageSnapshot(
+                            step.usage,
+                            ctx.lastKnownContextWindow,
+                            ctx.lastKnownTokenUsage,
+                            false,
+                          );
+                          if (usageSnapshot) {
+                            ctx.lastKnownTokenUsage = usageSnapshot;
+                            yield* publishEvent({
+                              ...stamp,
+                              provider: PROVIDER,
+                              threadId,
+                              turnId,
+                              type: "thread.token-usage.updated",
+                              payload: { usage: usageSnapshot },
+                            });
+                          }
                         }
                       } else if (
-                        step.state === "DONE" ||
-                        step.state === "ERROR" ||
-                        step.state === "CANCELLED" ||
-                        step.state === "FAILED"
+                        data.event === "result" &&
+                        typeof data.result === "object" &&
+                        data.result !== null
                       ) {
-                        yield* publishEvent({
-                          ...stamp,
-                          provider: PROVIDER,
-                          threadId,
-                          turnId,
-                          itemId,
-                          type: "item.completed",
-                          payload: {
-                            itemType: toolItemType,
-                            status: step.state === "DONE" ? "completed" : "failed",
-                            title: step.tool_name,
-                            ...(toolDetail ? { detail: toolDetail } : {}),
-                            ...(toolInfo ? { data: toolInfo } : {}),
-                          },
-                        });
-
-                        if (step.tool_name === "invoke_subagent") {
-                          const stepIdx = Number(step.step_index) || 0;
-                          const stepKey = `s${stepIdx}`;
-                          if (!ctx.subagents.has(stepKey)) {
-                            ctx.subagents.set(stepKey, {
-                              taskId: RuntimeTaskId.make(`subagent-${threadId}-${stepKey}`),
-                              role: "Subagent",
-                              status: "running",
-                              stepIndex: stepIdx,
+                        const resultObj = data.result as Record<string, unknown>;
+                        turnRecord.items.push(resultObj);
+                        if (typeof resultObj.conversation_id === "string") {
+                          ctx.antigravityConversationId = resultObj.conversation_id;
+                        }
+                        if (resultObj.status === "ERROR" && typeof resultObj.error === "string") {
+                          lastResultError = resultObj.error;
+                          const formattedError =
+                            resultObj.error === "timeout waiting for response"
+                              ? "timeout waiting for response (synchronous tool execution exceeded time limit; run long commands/builds in background with WaitMsBeforeAsync or manage_task)"
+                              : resultObj.error;
+                          yield* publishEvent({
+                            ...stamp,
+                            provider: PROVIDER,
+                            threadId,
+                            turnId,
+                            type: "content.delta",
+                            payload: {
+                              streamKind: "assistant_text",
+                              delta: `\n\n**Antigravity Error**: ${formattedError}\n`,
+                            },
+                          });
+                        }
+                        if (
+                          typeof resultObj.response === "string" &&
+                          !hasEmittedText &&
+                          resultObj.response.length > 0
+                        ) {
+                          hasEmittedText = true;
+                          yield* publishEvent({
+                            ...stamp,
+                            provider: PROVIDER,
+                            threadId,
+                            turnId,
+                            type: "content.delta",
+                            payload: {
+                              streamKind: "assistant_text",
+                              delta: resultObj.response,
+                            },
+                          });
+                        }
+                        if (typeof resultObj.usage === "object" && resultObj.usage !== null) {
+                          const usageSnapshot = parseAntigravityUsageSnapshot(
+                            resultObj.usage,
+                            ctx.lastKnownContextWindow,
+                            ctx.lastKnownTokenUsage,
+                            true,
+                          );
+                          if (usageSnapshot) {
+                            ctx.lastKnownTokenUsage = usageSnapshot;
+                            yield* publishEvent({
+                              ...stamp,
+                              provider: PROVIDER,
+                              threadId,
+                              turnId,
+                              type: "thread.token-usage.updated",
+                              payload: { usage: usageSnapshot },
                             });
-                            const parsedList = parseSubagentsParam(toolInfo?.parameters);
-                            const subagentList =
-                              parsedList.length > 0 ? parsedList : [{ Role: "Subagent" }];
-                            for (let idx = 0; idx < subagentList.length; idx++) {
-                              const item = subagentList[idx]!;
-                              const taskId = RuntimeTaskId.make(
-                                `subagent-${threadId}-s${stepIdx}-i${idx}`,
-                              );
-                              const role =
-                                item.Role ||
-                                item.role ||
-                                item.TypeName ||
-                                item.typeName ||
-                                "Subagent";
-                              const prompt = item.Prompt || item.prompt;
-                              const rawModel = item.Model || item.model;
-                              const model =
-                                rawModel && rawModel !== "inherit"
-                                  ? rawModel
-                                  : ctx.session.model || undefined;
-                              const tracked: TrackedSubagent = {
-                                taskId,
-                                role,
-                                typeName: item.TypeName || item.typeName,
-                                prompt,
-                                model,
-                                status: "running",
-                                stepIndex: stepIdx,
-                              };
-                              ctx.subagents.set(String(taskId), tracked);
-                              ctx.subagents.set(`s${stepIdx}-i${idx}`, tracked);
-
-                              yield* publishEvent({
-                                ...stamp,
-                                provider: PROVIDER,
-                                threadId,
-                                turnId,
-                                type: "task.started",
-                                payload: {
-                                  taskId,
-                                  title: role,
-                                  ...(prompt ? { description: prompt.slice(0, 300) } : {}),
-                                  ...(role ? { role } : {}),
-                                  ...(model ? { model } : {}),
-                                  taskType: "subagent",
-                                  agentKind: "agent",
-                                  timelineBypass: false,
-                                },
-                              });
-                            }
-                          }
-
-                          const isFailed = step.state !== "DONE";
-                          if (isFailed) {
-                            for (const tracked of ctx.subagents.values()) {
-                              if (tracked.stepIndex === stepIdx && tracked.status === "running") {
-                                tracked.status = "failed";
-                                yield* publishEvent({
-                                  ...stamp,
-                                  provider: PROVIDER,
-                                  threadId,
-                                  turnId,
-                                  type: "task.completed",
-                                  payload: {
-                                    taskId: tracked.taskId,
-                                    status: "failed",
-                                    taskType: "subagent",
-                                    agentKind: "agent",
-                                    error: `Subagent launch failed (${step.state})`,
-                                  },
-                                });
-                              }
-                            }
-                          }
-                        } else if (step.tool_name === "manage_subagents") {
-                          const output =
-                            typeof step.content === "string"
-                              ? step.content
-                              : typeof toolInfo?.output === "string"
-                                ? toolInfo.output
-                                : typeof step.output === "string"
-                                  ? step.output
-                                  : "";
-                          const listedSubagents = parseSubagentListFromOutput(output);
-                          for (const sub of listedSubagents) {
-                            const cid = sub.conversationId;
-                            if (!cid) continue;
-                            if (KILLED_SUBAGENT_IDS.has(cid)) {
-                              const tracked = ctx.subagents.get(cid);
-                              if (tracked) tracked.status = "cancelled";
-                              continue;
-                            }
-                            const taskId = RuntimeTaskId.make(cid);
-                            const role = sub.role || sub.type || "Subagent";
-                            const rawStatus = sub.state;
-                            const status =
-                              rawStatus === "completed"
-                                ? "completed"
-                                : rawStatus === "errored" || rawStatus === "failed"
-                                  ? "failed"
-                                  : rawStatus === "idle"
-                                    ? "idle"
-                                    : "running";
-
-                            const existingTracked = ctx.subagents.get(cid);
-                            if (existingTracked?.status === "cancelled") {
-                              continue;
-                            }
-
-                            if (!existingTracked) {
-                              const tracked: TrackedSubagent = {
-                                taskId,
-                                role,
-                                typeName: sub.type,
-                                status:
-                                  status === "completed" || status === "failed"
-                                    ? status
-                                    : "running",
-                                stepIndex: Number(step.step_index) || 0,
-                              };
-                              ctx.subagents.set(cid, tracked);
-                              ctx.subagents.set(String(taskId), tracked);
-
-                              yield* publishEvent({
-                                ...stamp,
-                                provider: PROVIDER,
-                                threadId,
-                                turnId,
-                                type: "task.started",
-                                payload: {
-                                  taskId,
-                                  title: role,
-                                  role,
-                                  taskType: "subagent",
-                                  agentKind: "agent",
-                                  timelineBypass: false,
-                                  runHandles: {
-                                    runId: cid,
-                                    ...(sub.transcript ? { scriptPath: sub.transcript } : {}),
-                                  },
-                                },
-                              });
-                            }
-
-                            const usage = computeSubagentUsage(cid, sub.transcript);
-
-                            if (status === "completed" || status === "failed") {
-                              yield* publishEvent({
-                                ...stamp,
-                                provider: PROVIDER,
-                                threadId,
-                                turnId,
-                                type: "task.completed",
-                                payload: {
-                                  taskId,
-                                  status,
-                                  taskType: "subagent",
-                                  agentKind: "agent",
-                                  ...(usage ? { typedUsage: usage } : {}),
-                                },
-                              });
-                            } else if (sub.stateDetail) {
-                              yield* publishEvent({
-                                ...stamp,
-                                provider: PROVIDER,
-                                threadId,
-                                turnId,
-                                type: "task.progress",
-                                payload: {
-                                  taskId,
-                                  title: role,
-                                  role,
-                                  summary: sub.stateDetail,
-                                  lastToolName: sub.stateDetail.split(":")[0]?.trim() || "subagent",
-                                  status: "running",
-                                  taskType: "subagent",
-                                  agentKind: "agent",
-                                  ...(usage ? { typedUsage: usage } : {}),
-                                },
-                              });
-                            }
                           }
                         }
                       }
-                    } else if (step.step_type === "error_message") {
-                      const errorText =
-                        typeof step.error === "string"
-                          ? step.error
-                          : typeof step.content === "string"
-                            ? step.content
-                            : undefined;
-                      if (errorText) {
+                    }
+                  }),
+                );
+
+                return yield* proc.exitCode;
+              });
+
+            let currentProc = processHandle;
+            let exitCode = yield* runProcessStream(currentProc);
+
+            while (
+              exitCode === 0 &&
+              !lastResultError &&
+              ctx.activeTurnId === turnId &&
+              !ctx.stopped &&
+              ctx.antigravityConversationId
+            ) {
+              const running = [...ctx.subagents.values()].filter(
+                (s) =>
+                  s.status === "running" &&
+                  !KILLED_SUBAGENT_IDS.has(String(s.taskId)) &&
+                  !KILLED_SUBAGENT_IDS.has(s.conversationId || ""),
+              );
+              if (running.length === 0) {
+                break;
+              }
+
+              // Resolve conversation IDs from parent transcript if available
+              for (const tracked of running) {
+                if (!tracked.conversationId && ctx.antigravityConversationId) {
+                  const pPath = findTranscriptPath(ctx.antigravityConversationId);
+                  if (pPath && NodeFS.existsSync(pPath)) {
+                    try {
+                      const raw = NodeFS.readFileSync(pPath, "utf8");
+                      const foundIds = extractConversationIdsFromText(raw);
+                      for (const fid of foundIds) {
+                        if (fid !== ctx.antigravityConversationId && !ctx.subagents.has(fid)) {
+                          tracked.conversationId = fid;
+                          ctx.subagents.set(fid, tracked);
+                          break;
+                        }
+                      }
+                    } catch {}
+                  }
+                }
+              }
+
+              // Only poll if at least one running subagent has an active transcript file on disk
+              const subagentsWithTranscripts = running.filter(
+                (s) => s.conversationId && findTranscriptPath(s.conversationId),
+              );
+
+              if (subagentsWithTranscripts.length === 0) {
+                break;
+              }
+
+              let allDone = false;
+              const pollInterval = Duration.millis(1500);
+              const maxIterations = 400;
+              let iter = 0;
+
+              while (!allDone && iter < maxIterations) {
+                if (ctx.activeTurnId !== turnId || ctx.stopped) {
+                  break;
+                }
+                yield* Effect.sleep(pollInterval);
+                iter++;
+
+                if (ctx.activeTurnId !== turnId || ctx.stopped) {
+                  break;
+                }
+
+                let stillRunningCount = 0;
+                for (const tracked of running) {
+                  if (tracked.status !== "running") continue;
+
+                  if (!tracked.conversationId && ctx.antigravityConversationId) {
+                    const pPath = findTranscriptPath(ctx.antigravityConversationId);
+                    if (pPath && NodeFS.existsSync(pPath)) {
+                      try {
+                        const raw = NodeFS.readFileSync(pPath, "utf8");
+                        const foundIds = extractConversationIdsFromText(raw);
+                        for (const fid of foundIds) {
+                          if (fid !== ctx.antigravityConversationId && !ctx.subagents.has(fid)) {
+                            tracked.conversationId = fid;
+                            ctx.subagents.set(fid, tracked);
+                            break;
+                          }
+                        }
+                      } catch {}
+                    }
+                  }
+
+                  const targetId = tracked.conversationId;
+                  if (targetId) {
+                    const subStatus = checkSubagentTranscriptStatus(targetId);
+                    const usage = computeSubagentUsage(targetId);
+                    const stamp = yield* makeEventStamp();
+
+                    if (subStatus.status === "completed" || subStatus.status === "failed") {
+                      tracked.status = subStatus.status;
+                      yield* publishEvent({
+                        ...stamp,
+                        provider: PROVIDER,
+                        threadId,
+                        turnId,
+                        type: "task.completed",
+                        payload: {
+                          taskId: tracked.taskId,
+                          status: subStatus.status,
+                          taskType: "subagent",
+                          agentKind: "agent",
+                          ...(usage ? { typedUsage: usage } : {}),
+                        },
+                      });
+                    } else {
+                      stillRunningCount++;
+                      if (subStatus.summary) {
                         yield* publishEvent({
                           ...stamp,
                           provider: PROVIDER,
                           threadId,
                           turnId,
-                          type: "content.delta",
+                          type: "task.progress",
                           payload: {
-                            streamKind: "assistant_text",
-                            delta: `\n\n> ⚠️ **Antigravity Notice**: ${errorText}\n\n`,
+                            taskId: tracked.taskId,
+                            title: tracked.role,
+                            role: tracked.role,
+                            summary: subStatus.summary,
+                            ...(subStatus.lastToolName
+                              ? { lastToolName: subStatus.lastToolName }
+                              : {}),
+                            status: "running",
+                            taskType: "subagent",
+                            agentKind: "agent",
+                            ...(usage ? { typedUsage: usage } : {}),
                           },
                         });
                       }
                     }
-
-                    if (
-                      step.step_type !== "checkpoint" &&
-                      typeof step.usage === "object" &&
-                      step.usage !== null
-                    ) {
-                      const usageSnapshot = parseAntigravityUsageSnapshot(
-                        step.usage,
-                        ctx.lastKnownContextWindow,
-                        ctx.lastKnownTokenUsage,
-                        false,
-                      );
-                      if (usageSnapshot) {
-                        ctx.lastKnownTokenUsage = usageSnapshot;
-                        yield* publishEvent({
-                          ...stamp,
-                          provider: PROVIDER,
-                          threadId,
-                          turnId,
-                          type: "thread.token-usage.updated",
-                          payload: { usage: usageSnapshot },
-                        });
-                      }
-                    }
-                  } else if (
-                    data.event === "result" &&
-                    typeof data.result === "object" &&
-                    data.result !== null
-                  ) {
-                    const resultObj = data.result as Record<string, unknown>;
-                    turnRecord.items.push(resultObj);
-                    if (typeof resultObj.conversation_id === "string") {
-                      ctx.antigravityConversationId = resultObj.conversation_id;
-                    }
-                    if (resultObj.status === "ERROR" && typeof resultObj.error === "string") {
-                      lastResultError = resultObj.error;
-                      const formattedError =
-                        resultObj.error === "timeout waiting for response"
-                          ? "timeout waiting for response (synchronous tool execution exceeded time limit; run long commands/builds in background with WaitMsBeforeAsync or manage_task)"
-                          : resultObj.error;
-                      yield* publishEvent({
-                        ...stamp,
-                        provider: PROVIDER,
-                        threadId,
-                        turnId,
-                        type: "content.delta",
-                        payload: {
-                          streamKind: "assistant_text",
-                          delta: `\n\n**Antigravity Error**: ${formattedError}\n`,
-                        },
-                      });
-                    }
-                    if (
-                      typeof resultObj.response === "string" &&
-                      !hasEmittedText &&
-                      resultObj.response.length > 0
-                    ) {
-                      hasEmittedText = true;
-                      yield* publishEvent({
-                        ...stamp,
-                        provider: PROVIDER,
-                        threadId,
-                        turnId,
-                        type: "content.delta",
-                        payload: {
-                          streamKind: "assistant_text",
-                          delta: resultObj.response,
-                        },
-                      });
-                    }
-                    if (typeof resultObj.usage === "object" && resultObj.usage !== null) {
-                      const usageSnapshot = parseAntigravityUsageSnapshot(
-                        resultObj.usage,
-                        ctx.lastKnownContextWindow,
-                        ctx.lastKnownTokenUsage,
-                        true,
-                      );
-                      if (usageSnapshot) {
-                        ctx.lastKnownTokenUsage = usageSnapshot;
-                        yield* publishEvent({
-                          ...stamp,
-                          provider: PROVIDER,
-                          threadId,
-                          turnId,
-                          type: "thread.token-usage.updated",
-                          payload: { usage: usageSnapshot },
-                        });
-                      }
-                    }
+                  } else {
+                    stillRunningCount++;
                   }
                 }
-              }),
-            );
 
-            const exitCode = yield* processHandle.exitCode;
+                if (stillRunningCount === 0) {
+                  allDone = true;
+                }
+              }
+
+              if (!allDone || ctx.activeTurnId !== turnId || ctx.stopped) {
+                break;
+              }
+
+              const continuationArgs = [
+                "--output-format",
+                "stream-json",
+                "--print-timeout",
+                "24h",
+                ...(settings.dangerouslySkipPermissions !== false
+                  ? ["--dangerously-skip-permissions"]
+                  : []),
+                ...(ctx.cwd ? ["--add-dir", ctx.cwd] : []),
+                ...(selectedModel ? ["--model", selectedModel] : []),
+                ...(effortSupported && effectiveEffort ? ["--effort", effectiveEffort] : []),
+                "--conversation",
+                ctx.antigravityConversationId,
+                "-p",
+                "",
+              ];
+
+              const continuationSpawnCommand = yield* resolveSpawnCommand(
+                binary,
+                continuationArgs,
+                {
+                  env: processEnv,
+                },
+              ).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapterProcessError({
+                      provider: PROVIDER,
+                      threadId,
+                      detail: `Failed to resolve continuation spawn command (${binary})`,
+                      cause,
+                    }),
+                ),
+              );
+
+              const continuationCommand = ChildProcess.make(
+                continuationSpawnCommand.command,
+                continuationSpawnCommand.args,
+                {
+                  cwd: ctx.cwd,
+                  env: processEnv,
+                  shell: continuationSpawnCommand.shell,
+                },
+              );
+
+              const nextProcessHandle = yield* childProcessSpawner.spawn(continuationCommand).pipe(
+                Effect.provideService(Scope.Scope, ctx.scope),
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapterProcessError({
+                      provider: PROVIDER,
+                      threadId,
+                      detail: `Failed to spawn continuation Antigravity CLI process (${binary})`,
+                      cause,
+                    }),
+                ),
+              );
+
+              ctx.activeProcess = {
+                kill: () => Effect.asVoid(Effect.ignore(nextProcessHandle.kill())),
+              };
+
+              currentProc = nextProcessHandle;
+              exitCode = yield* runProcessStream(currentProc);
+            }
+
             const isSuccess =
               exitCode === 0 && (!lastResultError || hasEmittedText || turnRecord.items.length > 0);
             const errorDetail =

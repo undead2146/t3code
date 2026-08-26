@@ -9,6 +9,10 @@ import * as Stream from "effect/Stream";
 import { AntigravitySettings, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 
 import { makeAntigravityAdapter } from "./AntigravityAdapter.ts";
+import {
+  checkSubagentTranscriptStatus,
+  extractConversationIdsFromText,
+} from "../../orchestration/subagentTranscriptQuery.ts";
 
 const decodeAntigravitySettings = Schema.decodeSync(AntigravitySettings);
 
@@ -657,5 +661,65 @@ it.layer(NodeServices.layer)("makeAntigravityAdapter", (it) => {
 
         yield* adapter.stopSession(threadId);
       }),
+  );
+
+  it.effect("extracts conversation IDs from raw tool outputs", () =>
+    Effect.gen(function* () {
+      const single = "Subagent launched: 4315498d-a2c8-40e2-b15b-b173ef2b3de7";
+      expect(extractConversationIdsFromText(single)).toEqual([
+        "4315498d-a2c8-40e2-b15b-b173ef2b3de7",
+      ]);
+
+      const multipleJson = JSON.stringify({
+        subagents: [
+          { conversationId: "4315498d-a2c8-40e2-b15b-b173ef2b3de7" },
+          { conversationId: "1bcb874b-cf4c-4fa4-b19b-1914b640b9b1" },
+        ],
+      });
+      expect(extractConversationIdsFromText(multipleJson)).toEqual([
+        "4315498d-a2c8-40e2-b15b-b173ef2b3de7",
+        "1bcb874b-cf4c-4fa4-b19b-1914b640b9b1",
+      ]);
+
+      expect(extractConversationIdsFromText(null)).toEqual([]);
+    }),
+  );
+
+  it.effect("checks subagent transcript status correctly from transcript file", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectory({ prefix: "subagent-transcript-" });
+      const transcriptFile = path.join(dir, "transcript.jsonl");
+
+      // Empty / non-existent
+      expect(checkSubagentTranscriptStatus("non-existent-cid").status).toBe("running");
+
+      // In-progress with tool call
+      yield* fs.writeFileString(
+        transcriptFile,
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          tool_calls: [{ name: "run_command", args: { CommandLine: "npm test" } }],
+        }) + "\n",
+      );
+      const runningStatus = checkSubagentTranscriptStatus("test-cid", transcriptFile);
+      expect(runningStatus.status).toBe("running");
+      expect(runningStatus.lastToolName).toBe("run_command");
+
+      // Completed with final answer
+      yield* fs.writeFileString(
+        transcriptFile,
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          status: "DONE",
+          content: "I have finished inspecting the tests.",
+        }) + "\n",
+      );
+      const completedStatus = checkSubagentTranscriptStatus("test-cid", transcriptFile);
+      expect(completedStatus.status).toBe("completed");
+      expect(completedStatus.summary).toContain("I have finished inspecting");
+    }),
   );
 });
