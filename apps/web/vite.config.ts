@@ -134,6 +134,15 @@ function devCompressionPlugin(): Plugin {
       // node http objects Connect actually passes — safe to narrow.
       server.middlewares.use(
         compression({
+          filter: (req, res) => {
+            if (
+              req.url &&
+              DEV_PROXIED_PATH_PREFIXES.some((prefix) => req.url?.startsWith(prefix))
+            ) {
+              return false;
+            }
+            return compression.filter(req, res);
+          },
           brotli: { params: { [NodeZlib.constants.BROTLI_PARAM_QUALITY]: 5 } },
         }) as unknown as Connect.NextHandleFunction,
       );
