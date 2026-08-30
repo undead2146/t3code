@@ -36,6 +36,7 @@ import {
   type OrchestrationThreadStreamItem,
   OrchestrationGetFullThreadDiffError,
   OrchestrationGetSnapshotError,
+  OrchestrationKillSubagentError,
   OrchestrationSearchThreadsError,
   OrchestrationGetTurnDiffError,
   ORCHESTRATION_WS_METHODS,
@@ -1336,30 +1337,42 @@ const makeWsRpcLayer = (
             Effect.all({
               commandId: serverCommandId("subagent-kill"),
               activityId: serverEventId,
+              now: DateTime.now,
             }).pipe(
-              Effect.flatMap(({ commandId, activityId }) => {
+              Effect.flatMap(({ commandId, activityId, now }) => {
                 registerKilledSubagent(input.conversationId);
-                const now = new Date().toISOString();
-                return orchestrationEngine.dispatch({
-                  type: "thread.activity.append",
-                  commandId,
-                  threadId: input.threadId,
-                  activity: {
-                    id: activityId,
-                    tone: "tool",
-                    kind: "task.completed",
-                    summary: "Subagent terminated remotely",
-                    payload: {
-                      taskId: input.conversationId,
-                      status: "cancelled",
-                      taskType: "subagent",
-                      agentKind: "agent",
+                const iso = DateTime.formatIso(now);
+                return orchestrationEngine
+                  .dispatch({
+                    type: "thread.activity.append",
+                    commandId,
+                    threadId: input.threadId,
+                    activity: {
+                      id: activityId,
+                      tone: "tool",
+                      kind: "task.completed",
+                      summary: "Subagent terminated remotely",
+                      payload: {
+                        taskId: input.conversationId,
+                        status: "cancelled",
+                        taskType: "subagent",
+                        agentKind: "agent",
+                      },
+                      turnId: null,
+                      createdAt: iso,
                     },
-                    turnId: null,
-                    createdAt: now,
-                  },
-                  createdAt: now,
-                });
+                    createdAt: iso,
+                  })
+                  .pipe(
+                    Effect.mapError(
+                      (error) =>
+                        new OrchestrationKillSubagentError({
+                          conversationId: input.conversationId,
+                          reason: "notFound",
+                          detail: error instanceof Error ? error.message : String(error),
+                        }),
+                    ),
+                  );
               }),
               Effect.map(() => ({
                 conversationId: input.conversationId,

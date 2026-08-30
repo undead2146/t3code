@@ -248,7 +248,7 @@ export const make = Effect.gen(function* () {
       }
     }
 
-    const result: Array<{ provider: UsageProviderKind; dir: string }> = [
+    const result: Array<{ provider: UsageProviderKind; dir: string; fileName?: string }> = [
       { provider: "claude" as const, dir: claudeDir },
       { provider: "codex" as const, dir: path.join(codexLayout.sharedHomePath, "sessions") },
       {

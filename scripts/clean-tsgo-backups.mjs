@@ -16,7 +16,11 @@ const backups = NodeFS.globSync(
 );
 
 for (const backup of backups) {
-  NodeFS.rmSync(backup, { force: true });
+  try {
+    NodeFS.rmSync(backup, { force: true });
+  } catch {
+    // Ignore locked files on Windows
+  }
 }
 
 if (backups.length > 0) {

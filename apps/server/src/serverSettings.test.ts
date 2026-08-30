@@ -230,6 +230,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       assert.deepEqual(next.providers.claudeAgent, {
         enabled: true,
         binaryPath: "/usr/local/bin/claude",
+        apiBaseUrl: "",
+        apiKey: "",
         homePath: "",
         customModels: ["claude-custom"],
         launchArgs: "",
@@ -867,6 +869,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       assert.deepEqual(next.providers.claudeAgent, {
         enabled: true,
         binaryPath: "/opt/homebrew/bin/claude",
+        apiBaseUrl: "",
+        apiKey: "",
         homePath: "",
         customModels: [],
         launchArgs: "",
