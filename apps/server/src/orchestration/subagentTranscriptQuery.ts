@@ -1,4 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics preferSchemaOverJson:off
+// @effect-diagnostics tryCatchInEffectGen:off
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
@@ -111,10 +113,7 @@ function parseToolDetail(toolName: string, args: Record<string, unknown>): strin
 
 export const readSubagentTranscript = Effect.fn("orchestration.readSubagentTranscript")(function* (
   input: OrchestrationGetSubagentTranscriptInput,
-): Effect.Effect<
-  OrchestrationGetSubagentTranscriptResult,
-  OrchestrationGetSubagentTranscriptError
-> {
+) {
   const conversationId = input.conversationId.trim();
   if (
     !conversationId ||
@@ -122,22 +121,18 @@ export const readSubagentTranscript = Effect.fn("orchestration.readSubagentTrans
     conversationId.includes("/") ||
     conversationId.includes("\\")
   ) {
-    return yield* Effect.fail(
-      new OrchestrationGetSubagentTranscriptError({
-        reason: "invalid-id",
-        conversationId,
-      }),
-    );
+    return yield* new OrchestrationGetSubagentTranscriptError({
+      reason: "invalid-id",
+      conversationId,
+    });
   }
 
   const transcriptPath = findTranscriptPath(conversationId);
   if (!transcriptPath) {
-    return yield* Effect.fail(
-      new OrchestrationGetSubagentTranscriptError({
-        reason: "not-found",
-        conversationId,
-      }),
-    );
+    return yield* new OrchestrationGetSubagentTranscriptError({
+      reason: "not-found",
+      conversationId,
+    });
   }
 
   const rawContent = yield* Effect.tryPromise({
@@ -154,7 +149,16 @@ export const readSubagentTranscript = Effect.fn("orchestration.readSubagentTrans
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
-  const allItems: Array<SubagentTranscriptItem> = [];
+  interface MutableTranscriptItem {
+    stepIndex: number;
+    type: string;
+    toolName: string | null;
+    summary: string;
+    detail: string | null;
+    output: string | null;
+    timestamp: string | null;
+  }
+  const allItems: Array<MutableTranscriptItem> = [];
 
   for (const line of lines) {
     try {
@@ -356,8 +360,9 @@ export function checkSubagentTranscriptStatus(
           const lastTool = obj.tool_calls[obj.tool_calls.length - 1];
           return {
             status: "running",
-            lastToolName: lastTool?.name,
-            summary: lastTool?.name ? `Running tool: ${lastTool.name}` : undefined,
+            ...(lastTool?.name
+              ? { lastToolName: lastTool.name, summary: `Running tool: ${lastTool.name}` }
+              : {}),
           };
         }
         if (obj.type === "ERROR" || obj.status === "ERROR" || obj.status === "FAILED") {

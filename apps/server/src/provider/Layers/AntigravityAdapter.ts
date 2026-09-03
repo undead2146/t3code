@@ -81,6 +81,67 @@ import {
 } from "../acp/AntigravityProtocol.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import type { EventNdjsonLogger } from "./EventNdjsonLogger.ts";
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeCP from "node:child_process";
+import * as NodeFS from "node:fs";
+import {
+  checkSubagentTranscriptStatus,
+  computeSubagentUsage,
+  extractConversationIdsFromText,
+  findTranscriptPath,
+} from "../../orchestration/subagentTranscriptQuery.ts";
+
+export const KILLED_SUBAGENT_IDS = new Set<string>();
+
+export function registerKilledSubagent(conversationId: string): void {
+  if (!conversationId || typeof conversationId !== "string" || conversationId.length < 5) return;
+  KILLED_SUBAGENT_IDS.add(conversationId);
+  try {
+    if (process.platform === "win32") {
+      const psCmd = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*${conversationId}*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+      NodeCP.exec(`powershell -NoProfile -Command "${psCmd}"`, () => {});
+    } else {
+      NodeCP.exec(`pkill -9 -f "${conversationId}"`, () => {});
+    }
+  } catch {}
+}
+
+export interface TrackedSubagent {
+  readonly taskId: RuntimeTaskId;
+  readonly role?: string | undefined;
+  readonly typeName?: string | undefined;
+  readonly prompt?: string | undefined;
+  readonly model?: string | undefined;
+  status: "running" | "completed" | "failed" | "cancelled";
+  conversationId?: string | undefined;
+  readonly stepIndex: number;
+}
+
+export interface SubagentListEntry {
+  readonly conversationId?: string;
+  readonly role?: string;
+  readonly type?: string;
+  readonly state?: string;
+  readonly stateDetail?: string;
+  readonly transcript?: string;
+}
+
+export function parseSubagentListFromOutput(data: unknown): ReadonlyArray<SubagentListEntry> {
+  if (typeof data !== "string") return [];
+  const start = data.indexOf("[");
+  const end = data.lastIndexOf("]");
+  if (start !== -1 && end > start) {
+    try {
+      const parsed = JSON.parse(data.slice(start, end + 1));
+      if (Array.isArray(parsed)) {
+        return parsed.filter(
+          (item): item is SubagentListEntry => typeof item === "object" && item !== null,
+        );
+      }
+    } catch {}
+  }
+  return [];
+}
 
 const PROVIDER = ProviderDriverKind.make("antigravity");
 const ResumeCursor = Schema.Struct({
@@ -180,6 +241,8 @@ interface SessionContext {
   readonly questions: Map<ApprovalRequestId, PendingQuestion>;
   readonly commands: Map<string, OpenCommand>;
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
+  readonly subagents: Map<string, TrackedSubagent>;
+  antigravityConversationId: string | undefined;
   session: ProviderSession;
   activeTurnId: TurnId | undefined;
   promptFiber: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError> | undefined;
@@ -589,6 +652,237 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                 });
               }
             }
+
+            const toolTitle = (toolCall.title ?? toolCall.kind ?? "").toLowerCase();
+            const toolData = (toolCall.data ?? {}) as Record<string, unknown>;
+
+            if (toolTitle.includes("invoke_subagent")) {
+              const subagentsArg = (toolData.Subagents || toolData.subagents) as unknown;
+              if (Array.isArray(subagentsArg)) {
+                for (const sub of subagentsArg) {
+                  if (typeof sub === "object" && sub !== null) {
+                    const role = ((sub as Record<string, unknown>).Role ||
+                      (sub as Record<string, unknown>).role ||
+                      (sub as Record<string, unknown>).TypeName ||
+                      (sub as Record<string, unknown>).typeName ||
+                      "Subagent") as string;
+                    const typeName = ((sub as Record<string, unknown>).TypeName ||
+                      (sub as Record<string, unknown>).typeName) as string | undefined;
+                    const prompt = ((sub as Record<string, unknown>).Prompt ||
+                      (sub as Record<string, unknown>).prompt) as string | undefined;
+                    const model = ((sub as Record<string, unknown>).Model ||
+                      (sub as Record<string, unknown>).model) as string | undefined;
+                    const tempId = RuntimeTaskId.make(yield* randomId);
+                    const tracked: TrackedSubagent = {
+                      taskId: tempId,
+                      role,
+                      typeName,
+                      prompt,
+                      model,
+                      status: "running",
+                      stepIndex: context.subagents.size + 1,
+                    };
+                    context.subagents.set(String(tempId), tracked);
+                    yield* emit({
+                      type: "task.started",
+                      ...(yield* stamp),
+                      provider: PROVIDER,
+                      threadId: context.threadId,
+                      turnId: existing?.turnId ?? context.activeTurnId,
+                      payload: {
+                        taskId: tempId,
+                        taskType: "subagent",
+                        agentKind: "agent",
+                        title: role,
+                        description: prompt || role,
+                        role,
+                        model,
+                      },
+                    });
+                  }
+                }
+              }
+            } else if (toolTitle.includes("manage_subagents")) {
+              const action = (toolData.Action || toolData.action) as string | undefined;
+              const convIds = (toolData.ConversationIds ||
+                toolData.conversation_ids ||
+                toolData.conversationIds) as unknown;
+              if (action === "kill_all") {
+                for (const tracked of context.subagents.values()) {
+                  if (tracked.status === "running") {
+                    tracked.status = "cancelled";
+                    yield* emit({
+                      type: "task.completed",
+                      ...(yield* stamp),
+                      provider: PROVIDER,
+                      threadId: context.threadId,
+                      turnId: existing?.turnId ?? context.activeTurnId,
+                      payload: {
+                        taskId: tracked.taskId,
+                        status: "stopped",
+                        taskType: "subagent",
+                        agentKind: "agent",
+                      },
+                    });
+                  }
+                }
+              } else if (action === "kill" && Array.isArray(convIds)) {
+                for (const cid of convIds) {
+                  if (typeof cid === "string") {
+                    const tracked = context.subagents.get(cid);
+                    if (tracked && tracked.status === "running") {
+                      tracked.status = "cancelled";
+                      yield* emit({
+                        type: "task.completed",
+                        ...(yield* stamp),
+                        provider: PROVIDER,
+                        threadId: context.threadId,
+                        turnId: existing?.turnId ?? context.activeTurnId,
+                        payload: {
+                          taskId: tracked.taskId,
+                          status: "stopped",
+                          taskType: "subagent",
+                          agentKind: "agent",
+                        },
+                      });
+                    }
+                  }
+                }
+              }
+
+              if (toolCall.status === "completed" && typeof toolCall.detail === "string") {
+                const listed = parseSubagentListFromOutput(toolCall.detail);
+                for (const sub of listed) {
+                  const cid = sub.conversationId;
+                  if (!cid) continue;
+                  if (KILLED_SUBAGENT_IDS.has(cid)) {
+                    const tracked = context.subagents.get(cid);
+                    if (tracked) tracked.status = "cancelled";
+                    continue;
+                  }
+                  const taskId = RuntimeTaskId.make(cid);
+                  const role = sub.role || sub.type || "Subagent";
+                  const rawStatus = sub.state;
+                  const status =
+                    rawStatus === "completed"
+                      ? "completed"
+                      : rawStatus === "errored" || rawStatus === "failed"
+                        ? "failed"
+                        : rawStatus === "idle"
+                          ? "idle"
+                          : "running";
+
+                  const existingTracked = context.subagents.get(cid);
+                  if (existingTracked?.status === "cancelled") continue;
+
+                  if (!existingTracked) {
+                    const tracked: TrackedSubagent = {
+                      taskId,
+                      role,
+                      typeName: sub.type,
+                      status: status === "idle" ? "running" : status,
+                      conversationId: cid,
+                      stepIndex: context.subagents.size + 1,
+                    };
+                    context.subagents.set(cid, tracked);
+                    context.subagents.set(String(taskId), tracked);
+
+                    yield* emit({
+                      type: "task.started",
+                      ...(yield* stamp),
+                      provider: PROVIDER,
+                      threadId: context.threadId,
+                      turnId: existing?.turnId ?? context.activeTurnId,
+                      payload: {
+                        taskId,
+                        title: role,
+                        role,
+                        taskType: "subagent",
+                        agentKind: "agent",
+                      },
+                    });
+                  }
+
+                  const usage = computeSubagentUsage(cid, sub.transcript);
+
+                  if (status === "completed" || status === "failed") {
+                    yield* emit({
+                      type: "task.completed",
+                      ...(yield* stamp),
+                      provider: PROVIDER,
+                      threadId: context.threadId,
+                      turnId: existing?.turnId ?? context.activeTurnId,
+                      payload: {
+                        taskId,
+                        status,
+                        taskType: "subagent",
+                        agentKind: "agent",
+                        ...(usage ? { typedUsage: usage } : {}),
+                      },
+                    });
+                  } else if (sub.stateDetail) {
+                    yield* emit({
+                      type: "task.progress",
+                      ...(yield* stamp),
+                      provider: PROVIDER,
+                      threadId: context.threadId,
+                      turnId: existing?.turnId ?? context.activeTurnId,
+                      payload: {
+                        taskId,
+                        description: sub.stateDetail || role || "Subagent",
+                        role,
+                        summary: sub.stateDetail,
+                        lastToolName: sub.stateDetail.split(":")[0]?.trim() || "subagent",
+                        status: "running",
+                        taskType: "subagent",
+                        agentKind: "agent",
+                        ...(usage ? { typedUsage: usage } : {}),
+                      },
+                    });
+                  }
+                }
+              }
+            } else if (toolTitle.includes("send_message")) {
+              const recipient = (toolData.Recipient || toolData.recipient) as string | undefined;
+              const message = (toolData.Message || toolData.message) as string | undefined;
+              if (recipient && context.subagents.has(recipient)) {
+                const tracked = context.subagents.get(recipient)!;
+                yield* emit({
+                  type: "task.progress",
+                  ...(yield* stamp),
+                  provider: PROVIDER,
+                  threadId: context.threadId,
+                  turnId: existing?.turnId ?? context.activeTurnId,
+                  payload: {
+                    taskId: tracked.taskId,
+                    description: tracked.prompt || tracked.role || "Subagent",
+                    summary: message
+                      ? `Sent message: ${message.slice(0, 100)}`
+                      : "Sent message to subagent",
+                    lastToolName: "send_message",
+                    status: "running",
+                    taskType: "subagent",
+                    agentKind: "agent",
+                    ...(tracked.role ? { role: tracked.role } : {}),
+                    ...(tracked.model ? { model: tracked.model } : {}),
+                  },
+                });
+              }
+            }
+
+            if (toolCall.status === "completed" && typeof toolCall.detail === "string") {
+              const foundCids = extractConversationIdsFromText(toolCall.detail);
+              if (foundCids.length > 0) {
+                let cIdx = 0;
+                for (const tracked of context.subagents.values()) {
+                  if (!tracked.conversationId && cIdx < foundCids.length) {
+                    const cid = foundCids[cIdx++]!;
+                    tracked.conversationId = cid;
+                    context.subagents.set(cid, tracked);
+                  }
+                }
+              }
+            }
           }),
         );
         return;
@@ -740,6 +1034,8 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                 questions: new Map(),
                 commands: new Map(),
                 turns: [],
+                subagents: new Map(),
+                antigravityConversationId: undefined,
                 session,
                 activeTurnId: undefined,
                 promptFiber: undefined,
@@ -959,6 +1255,73 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       const record = context.turns.find((turn) => turn.id === launch.turn.turnId);
       if (record) record.items.push(result);
       else context.turns.push({ id: launch.turn.turnId, items: [result] });
+      // Monitor active background subagents before finishing the turn
+      const runningSubagents = [...context.subagents.values()].filter(
+        (s) =>
+          s.status === "running" &&
+          !KILLED_SUBAGENT_IDS.has(String(s.taskId)) &&
+          !KILLED_SUBAGENT_IDS.has(s.conversationId || ""),
+      );
+      if (runningSubagents.length > 0) {
+        let iter = 0;
+        const maxIter = 120;
+        while (iter < maxIter) {
+          if (context.stopped) break;
+          yield* Effect.sleep("1500 millis");
+          iter++;
+          let stillRunningCount = 0;
+          for (const tracked of runningSubagents) {
+            if (tracked.status !== "running") continue;
+            const targetId = tracked.conversationId;
+            if (targetId) {
+              const subStatus = checkSubagentTranscriptStatus(targetId);
+              const usage = computeSubagentUsage(targetId);
+              if (subStatus.status === "completed" || subStatus.status === "failed") {
+                tracked.status = subStatus.status;
+                yield* emit({
+                  type: "task.completed",
+                  ...(yield* stamp),
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  turnId: launch.turn.turnId,
+                  payload: {
+                    taskId: tracked.taskId,
+                    status: subStatus.status,
+                    taskType: "subagent",
+                    agentKind: "agent",
+                    ...(usage ? { typedUsage: usage } : {}),
+                  },
+                });
+              } else {
+                stillRunningCount++;
+                if (subStatus.summary || subStatus.lastToolName) {
+                  yield* emit({
+                    type: "task.progress",
+                    ...(yield* stamp),
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    turnId: launch.turn.turnId,
+                    payload: {
+                      taskId: tracked.taskId,
+                      description:
+                        subStatus.summary || tracked.prompt || tracked.role || "Subagent",
+                      role: tracked.role,
+                      summary: subStatus.summary,
+                      lastToolName: subStatus.lastToolName,
+                      status: "running",
+                      taskType: "subagent",
+                      agentKind: "agent",
+                      ...(usage ? { typedUsage: usage } : {}),
+                    },
+                  });
+                }
+              }
+            }
+          }
+          if (stillRunningCount === 0) break;
+        }
+      }
+
       yield* context.promptLock.withPermit(
         finishTurn(launch.turn, {
           state: result.stopReason === "cancelled" ? "cancelled" : "completed",

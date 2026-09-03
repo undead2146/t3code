@@ -1400,11 +1400,11 @@ const makeWsRpcLayer = (
                   })
                   .pipe(
                     Effect.mapError(
-                      (error) =>
+                      (error: unknown) =>
                         new OrchestrationKillSubagentError({
                           conversationId: input.conversationId,
-                          reason: "notFound",
-                          detail: error instanceof Error ? error.message : String(error),
+                          reason: "failed",
+                          cause: error,
                         }),
                     ),
                   );
@@ -1413,6 +1413,15 @@ const makeWsRpcLayer = (
                 conversationId: input.conversationId,
                 status: "cancelled" as const,
               })),
+              Effect.mapError((error: unknown) =>
+                Schema.is(OrchestrationKillSubagentError)(error)
+                  ? error
+                  : new OrchestrationKillSubagentError({
+                      conversationId: input.conversationId,
+                      reason: "failed",
+                      cause: error,
+                    }),
+              ),
             ),
             { "rpc.aggregate": "orchestration" },
           ),

@@ -3,6 +3,7 @@ import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
+import * as NodeURL from "node:url";
 
 const require = NodeModule.createRequire(import.meta.url);
 // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone repair script has no Effect runtime.
@@ -129,12 +130,46 @@ function installElectronRuntime(electronDir, version) {
     if (hostPlatform === "darwin") {
       runChecked("ditto", ["-x", "-k", zipPath, NodePath.join(electronDir, "dist")]);
     } else {
-      runChecked("python3", [
-        "-c",
-        "import os, sys, zipfile; os.makedirs(sys.argv[2], exist_ok=True); zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])",
-        zipPath,
-        NodePath.join(electronDir, "dist"),
-      ]);
+      const targetDir = NodePath.join(electronDir, "dist");
+      const pythonCandidates =
+        hostPlatform === "win32" ? ["python", "python3"] : ["python3", "python"];
+      let extracted = false;
+      let lastError = null;
+
+      for (const pythonCandidate of pythonCandidates) {
+        const result = NodeChildProcess.spawnSync(
+          pythonCandidate,
+          [
+            "-c",
+            "import os, sys, zipfile; os.makedirs(sys.argv[2], exist_ok=True); zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])",
+            zipPath,
+            targetDir,
+          ],
+          {
+            encoding: "utf8",
+            stdio: "inherit",
+          },
+        );
+
+        if (result.status === 0) {
+          extracted = true;
+          break;
+        }
+        lastError =
+          result.error ?? new Error(`${pythonCandidate} failed with status ${result.status}`);
+      }
+
+      if (!extracted) {
+        NodeFS.mkdirSync(targetDir, { recursive: true });
+        const tarResult = NodeChildProcess.spawnSync("tar", ["-xf", zipPath, "-C", targetDir], {
+          encoding: "utf8",
+          stdio: "inherit",
+        });
+
+        if (tarResult.status !== 0) {
+          throw lastError ?? tarResult.error ?? new Error(`Failed to extract ${zipPath}`);
+        }
+      }
     }
   } finally {
     NodeFS.rmSync(tempDir, { recursive: true, force: true });
@@ -176,7 +211,10 @@ export function ensureElectronRuntime() {
   return electronPath;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (
+  process.argv[1] &&
+  NodeURL.pathToFileURL(NodePath.resolve(process.argv[1])).href === import.meta.url
+) {
   const electronPath = ensureElectronRuntime();
   process.stdout.write(`${electronPath}\n`);
 }
