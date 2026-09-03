@@ -122,6 +122,7 @@ interface AntigravityProviderOptions {
   readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
   /** Auth type and label published once a session authenticates. */
   readonly auth?: { readonly type: string; readonly label: string };
+  readonly checkAuthenticated?: Effect.Effect<boolean>;
 }
 
 /** Health uses initialize only. Session callbacks supply account-specific metadata. */
@@ -184,10 +185,13 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     const supportsTextGeneration =
       initialized !== undefined ? yield* options.supportsTextGeneration : false;
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    const isSavedAuth = options.checkAuthenticated
+      ? yield* options.checkAuthenticated.pipe(Effect.orElseSucceed(() => false))
+      : false;
     const next = yield* SubscriptionRef.updateAndGet(metadata, (state) => {
       if (state.authRevision !== before.authRevision) return state;
       const { message: _previousMessage, ...draft } = state.draft;
-      const authenticated = draft.auth.status === "authenticated";
+      const authenticated = draft.auth.status === "authenticated" || isSavedAuth;
       const message =
         errorMessage ??
         (authenticated
@@ -203,6 +207,11 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           version: initialized?.agentInfo?.version || draft.version,
           status: errorMessage ? "error" : authenticated ? "ready" : "warning",
           checkedAt: updatedAt,
+          auth: {
+            status: authenticated ? "authenticated" : draft.auth.status,
+            type: options.auth?.type ?? "oauth-personal",
+            label: options.auth?.label ?? "Google account",
+          },
           ...(missingInstallation
             ? {
                 models: [],

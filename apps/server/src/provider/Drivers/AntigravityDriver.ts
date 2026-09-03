@@ -169,12 +169,10 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
             runtime
               .start()
               .pipe(
-                Effect.tapError(
-                  (cause): Effect.Effect<void> =>
-                    input.onAuthorizationUrl === undefined &&
-                    isAntigravitySignInRequiredError(cause)
-                      ? provider.onAuthRequired
-                      : Effect.void,
+                Effect.tapError((cause): Effect.Effect<void> =>
+                  input.onAuthorizationUrl === undefined && isAntigravitySignInRequiredError(cause)
+                    ? provider.onAuthRequired
+                    : Effect.void,
                 ),
               ),
         };
@@ -276,6 +274,9 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
         stampIdentity: classifyModels,
         probe,
         auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
+        checkAuthenticated: fileSystem
+          .exists(path.join(profileDirectory, "antigravity-acp", "acp_token.json"))
+          .pipe(Effect.orElseSucceed(() => false)),
         supportsTextGeneration: isAntigravityTextGenerationAvailable(profileDirectory).pipe(
           Effect.provideService(FileSystem.FileSystem, fileSystem),
           Effect.provideService(Path.Path, path),
