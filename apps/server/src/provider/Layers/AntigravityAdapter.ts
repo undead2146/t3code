@@ -650,7 +650,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             if (!NodeFS.existsSync(logsDir)) {
               NodeFS.mkdirSync(logsDir, { recursive: true });
             }
-            const now = DateTime.unsafeNow();
+            const now = DateTime.nowUnsafe();
             const stepIndex = DateTime.toEpochMillis(now);
             const stepObj = {
               step_index: stepIndex,
