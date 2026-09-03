@@ -17,6 +17,8 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import type * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
 
 import type { AcpSessionRuntimeStartResult } from "../acp/AcpSessionRuntime.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
@@ -35,6 +37,27 @@ const MAX_WORKSPACE_SNAPSHOTS = 32;
 const SIGN_IN_MESSAGE = "Sign in with Google to use Antigravity.";
 const AUTH_UNCHECKED_MESSAGE =
   "Antigravity is installed. Google account access is not checked yet.";
+
+function readCachedModels(filePath?: string): ReadonlyArray<ServerProviderModel> {
+  if (!filePath) return [];
+  try {
+    if (!NodeFS.existsSync(filePath)) return [];
+    const data = JSON.parse(NodeFS.readFileSync(filePath, "utf8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeCachedModels(
+  filePath: string | undefined,
+  models: ReadonlyArray<ServerProviderModel>,
+): void {
+  if (!filePath || models.length === 0) return;
+  try {
+    NodeFS.writeFileSync(filePath, JSON.stringify(models, null, 2), "utf8");
+  } catch {}
+}
 
 type SessionSetupResult = AcpSessionRuntimeStartResult["sessionSetupResult"];
 
@@ -123,6 +146,7 @@ interface AntigravityProviderOptions {
   /** Auth type and label published once a session authenticates. */
   readonly auth?: { readonly type: string; readonly label: string };
   readonly checkAuthenticated?: Effect.Effect<boolean>;
+  readonly cachedModelsPath?: string;
 }
 
 /** Health uses initialize only. Session callbacks supply account-specific metadata. */
@@ -131,12 +155,13 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   options: AntigravityProviderOptions,
 ) {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
+  const cachedModels = readCachedModels(options.cachedModelsPath);
   const initialDraft = {
     ...buildServerProvider({
       presentation: { displayName: "Antigravity", showInteractionModeToggle: false },
       enabled: settings.enabled,
       checkedAt,
-      models: [],
+      models: cachedModels,
       probe: {
         installed: false,
         version: null,
@@ -212,9 +237,9 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             type: options.auth?.type ?? "oauth-personal",
             label: options.auth?.label ?? "Google account",
           },
+          models: missingInstallation ? [] : draft.models.length > 0 ? draft.models : cachedModels,
           ...(missingInstallation
             ? {
-                models: [],
                 slashCommands: [],
                 skills: [],
                 workspaceSnapshots: [],
@@ -261,6 +286,8 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     const before = yield* SubscriptionRef.get(metadata);
     const supportsTextGeneration = yield* options.supportsTextGeneration;
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    const sessionModels = buildAntigravityModelsFromSession(started.sessionSetupResult);
+    writeCachedModels(options.cachedModelsPath, sessionModels);
     yield* SubscriptionRef.update(metadata, (state) => {
       if (
         state.authRevision !== before.authRevision &&
@@ -284,7 +311,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             label: options.auth?.label ?? "Google account",
           },
           checkedAt: updatedAt,
-          models: buildAntigravityModelsFromSession(started.sessionSetupResult),
+          models: sessionModels,
           supportsTextGeneration,
           ...(cwd
             ? {

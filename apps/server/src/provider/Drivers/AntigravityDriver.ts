@@ -274,6 +274,7 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
         stampIdentity: classifyModels,
         probe,
         auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
+        cachedModelsPath: path.join(profileDirectory, "antigravity-acp", "models.json"),
         checkAuthenticated: fileSystem
           .exists(path.join(profileDirectory, "antigravity-acp", "acp_token.json"))
           .pipe(Effect.orElseSucceed(() => false)),
