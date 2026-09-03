@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
+import { ANTIGRAVITY_DEFAULT_MODEL } from "./model.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import {
   ClientSettingsSchema,
@@ -260,7 +261,7 @@ describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
   it("defaults text generation to default model at low reasoning effort", () => {
     expect(DEFAULT_SERVER_SETTINGS.textGenerationModelSelection).toEqual({
       instanceId: ProviderInstanceId.make("antigravity"),
-      model: "gpt-5.6-luna",
+      model: ANTIGRAVITY_DEFAULT_MODEL,
       options: [{ id: "effort", value: "low" }],
     });
   });

@@ -1,4 +1,4 @@
-import { ORCHESTRATION_WS_METHODS, WsOrchestrationKillSubagentRpc } from "@t3tools/contracts";
+import { ORCHESTRATION_WS_METHODS } from "@t3tools/contracts";
 import { Atom } from "effect/unstable/reactivity";
 
 import { createEnvironmentRpcCommand, createEnvironmentRpcQueryAtomFamily } from "./runtime.ts";
@@ -28,7 +28,6 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
     killSubagent: createEnvironmentRpcCommand(runtime, {
       label: "environment-command:orchestration:kill-subagent",
       tag: ORCHESTRATION_WS_METHODS.killSubagent,
-      rpc: WsOrchestrationKillSubagentRpc,
     }),
     fullThreadDiff: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:orchestration:full-thread-diff",

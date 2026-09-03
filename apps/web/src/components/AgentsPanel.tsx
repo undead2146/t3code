@@ -185,7 +185,7 @@ function SubagentTranscriptView({
     );
   }
 
-  if (result._tag === "Failure") {
+  if (result._tag !== "Success") {
     return (
       <p className="text-[.68rem] text-muted-foreground/80">
         Live log available once subagent logs to disk.

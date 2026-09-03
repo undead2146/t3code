@@ -746,6 +746,7 @@ export const make = Effect.gen(function* () {
     const revealSubscribers: RevealSubscription[] = [
       (fire) => window.once("ready-to-show", fire),
       (fire) => window.webContents.once("did-finish-load", fire),
+      // @effect-diagnostics-next-line globalTimers:off
       (fire) => setTimeout(fire, 3_000),
     ];
     bindFirstRevealTrigger(revealSubscribers, () => {

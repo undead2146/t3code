@@ -158,7 +158,7 @@ const configuredAllowedHosts = (process.env.T3CODE_DEV_ALLOWED_HOSTS ?? "")
   .split(",")
   .map((entry) => entry.trim())
   .filter((entry) => entry.length > 0);
-const allowedHosts =
+const allowedHosts: true | string[] =
   configuredAllowedHosts.includes("*") || host === "0.0.0.0"
     ? true
     : [".ts.net", ...configuredAllowedHosts];

@@ -143,7 +143,9 @@ export class VcsProcessExitError extends Schema.TaggedErrorClass<VcsProcessExitE
               : context.command === "gh" || context.command === "az"
                 ? "Pull request not found."
                 : "VCS resource not found."
-            : "Process exited with a non-zero status.";
+            : context.command === "git" && error.stderr.trim().length > 0
+              ? error.stderr.trim().split("\n")[0]!
+              : "Process exited with a non-zero status.";
 
     return new VcsProcessExitError({
       ...context,

@@ -213,12 +213,280 @@ export interface TokenTracker {
   userMessagesChars: number;
   agentResponsesChars: number;
   toolCallsChars: number;
+  subagentsChars: number;
   systemPromptTokens: number;
   systemToolsTokens: number;
   skillsTokens: number;
   checkpointBufferTokens: number;
   totalLifetimeProcessedTokens: number;
   toolUses: number;
+  toolCallCharsById?: Map<string, number> | undefined;
+}
+
+export const ANTIGRAVITY_SYSTEM_PROMPT_TOKENS = 7900;
+export const ANTIGRAVITY_SYSTEM_TOOLS_TOKENS = 13800;
+export const ANTIGRAVITY_SKILLS_TOKENS = 2900;
+export const ANTIGRAVITY_CHECKPOINT_BUFFER_TOKENS = 3200;
+
+export function findConversationDb(sessionId: string): string | null {
+  try {
+    const home = NodeOS.homedir();
+    const candidateDirs = [
+      NodePath.join(home, ".t3", "userdata", "providers", "antigravity"),
+      NodePath.join(process.cwd(), ".t3", "userdata", "providers", "antigravity"),
+      NodePath.join(home, ".gemini", "antigravity-cli", "conversations"),
+    ];
+    for (const root of candidateDirs) {
+      if (!NodeFS.existsSync(root)) continue;
+      if (root.endsWith("conversations")) {
+        const p = NodePath.join(root, `${sessionId}.db`);
+        if (NodeFS.existsSync(p)) return p;
+      } else {
+        const hashes = NodeFS.readdirSync(root);
+        for (const h of hashes) {
+          const p = NodePath.join(root, h, "antigravity-acp", "conversations", `${sessionId}.db`);
+          if (NodeFS.existsSync(p)) return p;
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
+export function parseProtoTokens(buf: Uint8Array): {
+  userTokens: number;
+  agentTokens: number;
+  toolTokens: number;
+} | null {
+  try {
+    let pos = 0;
+    let f1Data: Uint8Array | null = null;
+    while (pos < buf.length) {
+      const key = buf[pos++];
+      if (key === undefined) break;
+      const fieldNum = key >> 3;
+      const wireType = key & 0x7;
+      if (wireType === 0) {
+        while (pos < buf.length) {
+          const b = buf[pos++];
+          if (b === undefined || (b & 0x80) === 0) break;
+        }
+      } else if (wireType === 2) {
+        let len = 0;
+        let shift = 0;
+        while (pos < buf.length) {
+          const b = buf[pos++];
+          if (b === undefined) break;
+          len |= (b & 0x7f) << shift;
+          shift += 7;
+          if ((b & 0x80) === 0) break;
+        }
+        if (fieldNum === 1 && len > 1000) {
+          f1Data = buf.subarray(pos, pos + len);
+          break;
+        }
+        pos += len;
+      } else {
+        break;
+      }
+    }
+    if (!f1Data) return null;
+
+    let subPos = 0;
+    let userTokens = 0;
+    let agentTokens = 0;
+    let toolTokens = 0;
+    let foundMessages = false;
+
+    while (subPos < f1Data.length) {
+      const key = f1Data[subPos++];
+      if (key === undefined) break;
+      const fieldNum = key >> 3;
+      const wireType = key & 0x7;
+      if (wireType === 0) {
+        while (subPos < f1Data.length) {
+          const b = f1Data[subPos++];
+          if (b === undefined || (b & 0x80) === 0) break;
+        }
+      } else if (wireType === 2) {
+        let len = 0;
+        let shift = 0;
+        while (subPos < f1Data.length) {
+          const b = f1Data[subPos++];
+          if (b === undefined) break;
+          len |= (b & 0x7f) << shift;
+          shift += 7;
+          if ((b & 0x80) === 0) break;
+        }
+        if (fieldNum === 2) {
+          const msgBuf = f1Data.subarray(subPos, subPos + len);
+          let mPos = 0;
+          let role = -1;
+          let tokens = 0;
+          while (mPos < msgBuf.length) {
+            const mKey = msgBuf[mPos++];
+            if (mKey === undefined) break;
+            const mFieldNum = mKey >> 3;
+            const mWireType = mKey & 0x7;
+            if (mWireType === 0) {
+              let val = 0;
+              let mShift = 0;
+              while (mPos < msgBuf.length) {
+                const b = msgBuf[mPos++];
+                if (b === undefined) break;
+                val |= (b & 0x7f) << mShift;
+                mShift += 7;
+                if ((b & 0x80) === 0) break;
+              }
+              if (mFieldNum === 2) role = val;
+              else if (mFieldNum === 4) tokens = val;
+            } else if (mWireType === 2) {
+              let mLen = 0;
+              let mShift = 0;
+              while (mPos < msgBuf.length) {
+                const b = msgBuf[mPos++];
+                if (b === undefined) break;
+                mLen |= (b & 0x7f) << mShift;
+                mShift += 7;
+                if ((b & 0x80) === 0) break;
+              }
+              mPos += mLen;
+            } else {
+              break;
+            }
+          }
+          if (role === 1) userTokens += tokens;
+          else if (role === 2) agentTokens += tokens;
+          else if (role === 4) toolTokens += tokens;
+          foundMessages = true;
+        }
+        subPos += len;
+      } else {
+        break;
+      }
+    }
+    return foundMessages ? { userTokens, agentTokens, toolTokens } : null;
+  } catch {
+    return null;
+  }
+}
+
+export function syncTokenTrackerFromDb(context: {
+  nativeSessionId?: string | undefined;
+  antigravityConversationId?: string | undefined;
+  tokenTracker: TokenTracker;
+}): void {
+  try {
+    const sessionId = context.nativeSessionId ?? context.antigravityConversationId;
+    if (!sessionId) return;
+    const dbPath = findConversationDb(sessionId);
+    if (!dbPath || !NodeFS.existsSync(dbPath)) return;
+
+    const sqliteModule = (
+      process as unknown as { getBuiltinModule?: (name: string) => unknown }
+    ).getBuiltinModule?.("node:sqlite") as
+      | {
+          DatabaseSync: new (
+            path: string,
+            options?: { readOnly?: boolean },
+          ) => {
+            prepare: (sql: string) => {
+              all: (...args: unknown[]) => Array<Record<string, unknown>>;
+              get: (...args: unknown[]) => Record<string, unknown> | undefined;
+            };
+            close: () => void;
+          };
+        }
+      | undefined;
+
+    if (!sqliteModule?.DatabaseSync) return;
+
+    const db = new sqliteModule.DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const latestGen = db
+        .prepare("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1")
+        .get() as { data?: Uint8Array } | undefined;
+
+      const protoTokens = latestGen?.data ? parseProtoTokens(latestGen.data) : null;
+
+      const latestCp = db
+        .prepare("SELECT idx FROM steps WHERE step_type = 23 ORDER BY idx DESC LIMIT 1")
+        .get() as { idx?: number | bigint } | undefined;
+      const activeCpIdx = latestCp?.idx != null ? Number(latestCp.idx) : -1;
+
+      if (protoTokens) {
+        context.tokenTracker.userMessagesChars = Math.round(protoTokens.userTokens * 4.2);
+        context.tokenTracker.agentResponsesChars = Math.round(protoTokens.agentTokens * 4.2);
+        context.tokenTracker.toolCallsChars = Math.round(protoTokens.toolTokens * 4.2);
+      } else {
+        const userSteps = db
+          .prepare(
+            "SELECT length(step_payload) as plen FROM steps WHERE step_type = 14 AND idx >= ?",
+          )
+          .all(activeCpIdx) as Array<{ plen: number }>;
+
+        let userChars = 0;
+        let agentChars = 0;
+        let toolChars = 0;
+
+        for (const s of userSteps) {
+          const plen = Number(s.plen ?? 0);
+          if (plen < 100_000) {
+            userChars += plen;
+          }
+        }
+
+        const activeSteps = db
+          .prepare(
+            "SELECT idx, step_type, length(step_payload) as plen FROM steps WHERE idx >= ? ORDER BY idx",
+          )
+          .all(activeCpIdx) as Array<{ idx: number; step_type: number; plen: number }>;
+
+        for (const s of activeSteps) {
+          const plen = Number(s.plen ?? 0);
+          if (s.step_type === 15 || s.step_type === 23) {
+            agentChars += plen;
+          } else if ([7, 9, 21, 25, 103].includes(s.step_type)) {
+            toolChars += plen;
+          }
+        }
+
+        if (userChars > 0) {
+          context.tokenTracker.userMessagesChars = userChars;
+        }
+        if (agentChars > 0) {
+          context.tokenTracker.agentResponsesChars = agentChars;
+        }
+        if (toolChars > 0) {
+          context.tokenTracker.toolCallsChars = toolChars;
+        }
+      }
+
+      const activeToolCount = db
+        .prepare(
+          "SELECT count(*) as cnt FROM steps WHERE idx >= ? AND step_type IN (7, 9, 21, 25, 103)",
+        )
+        .get(activeCpIdx) as { cnt?: number | bigint } | undefined;
+      const toolCount = activeToolCount?.cnt != null ? Number(activeToolCount.cnt) : 0;
+      if (toolCount > 0) {
+        context.tokenTracker.toolUses = toolCount;
+      }
+
+      const subagentRow = db
+        .prepare(
+          "SELECT coalesce(sum(length(step_payload)), 0) as plen FROM steps WHERE idx >= ? AND step_type = 17",
+        )
+        .get(activeCpIdx) as { plen?: number | bigint } | undefined;
+      const subagentChars = subagentRow?.plen != null ? Number(subagentRow.plen) : 0;
+      if (subagentChars > 0) {
+        context.tokenTracker.subagentsChars = subagentChars;
+      }
+
+      context.tokenTracker.toolCallCharsById?.clear();
+    } finally {
+      db.close();
+    }
+  } catch {}
 }
 
 export interface SubagentListEntry {
@@ -561,9 +829,9 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
   const emit = (event: ProviderRuntimeEvent) => PubSub.publish(events, event).pipe(Effect.asVoid);
 
   function buildTokenUsageSnapshot(context: SessionContext): ThreadTokenUsageSnapshot {
-    const userMessages = Math.max(1, Math.round(context.tokenTracker.userMessagesChars / 4));
-    const agentResponses = Math.round(context.tokenTracker.agentResponsesChars / 4);
-    const toolCalls = Math.round(context.tokenTracker.toolCallsChars / 4);
+    const userMessages = Math.round(context.tokenTracker.userMessagesChars / 4.2);
+    const agentResponses = Math.round(context.tokenTracker.agentResponsesChars / 4.2);
+    const toolCalls = Math.round(context.tokenTracker.toolCallsChars / 4.2);
     const systemPrompt = context.tokenTracker.systemPromptTokens;
     const systemTools = context.tokenTracker.systemToolsTokens;
     const skills = context.tokenTracker.skillsTokens;
@@ -574,19 +842,15 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       const sTok = Math.round(((s.inputChars ?? 0) + (s.outputChars ?? 0)) / 4);
       subagents += Math.max(0, sTok);
     }
+    if (context.tokenTracker.subagentsChars > 0) {
+      subagents = Math.max(subagents, Math.round(context.tokenTracker.subagentsChars / 4));
+    }
 
     const usedTokens =
-      userMessages +
-      agentResponses +
-      toolCalls +
-      systemPrompt +
-      systemTools +
-      skills +
-      subagents +
-      checkpointBuffer;
+      userMessages + agentResponses + toolCalls + systemPrompt + systemTools + skills + subagents;
 
     const cachedInputTokens = systemPrompt + systemTools + skills;
-    const inputTokens = userMessages + toolCalls + checkpointBuffer + subagents;
+    const inputTokens = userMessages + toolCalls + subagents;
     const outputTokens = agentResponses;
     const maxTokens = 1_000_000;
 
@@ -605,13 +869,13 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       toolUses: context.tokenTracker.toolUses,
       compactsAutomatically: true,
       categories: {
-        userMessages,
-        agentResponses,
-        toolCalls,
+        ...(userMessages > 0 ? { userMessages } : {}),
+        ...(agentResponses > 0 ? { agentResponses } : {}),
+        ...(toolCalls > 0 ? { toolCalls } : {}),
         systemPrompt,
         systemTools,
         skills,
-        subagents,
+        ...(subagents > 0 ? { subagents } : {}),
         checkpointBuffer,
       },
     };
@@ -619,6 +883,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
 
   const emitTokenUsage = (context: SessionContext, turnId?: TurnId) =>
     Effect.gen(function* () {
+      syncTokenTrackerFromDb(context);
       const snapshot = buildTokenUsageSnapshot(context);
       context.lastEmittedUsage = snapshot;
       yield* emit({
@@ -650,6 +915,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             if (!NodeFS.existsSync(logsDir)) {
               NodeFS.mkdirSync(logsDir, { recursive: true });
             }
+            const transcriptPath = NodePath.join(logsDir, "transcript.jsonl");
             const now = DateTime.nowUnsafe();
             const stepIndex = DateTime.toEpochMillis(now);
             const stepObj = {
@@ -886,6 +1152,10 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         return;
       case "ThoughtDelta":
       case "ContentDelta":
+        if (event.text) {
+          context.tokenTracker.agentResponsesChars += event.text.length;
+          context.tokenTracker.totalLifetimeProcessedTokens += Math.round(event.text.length / 4);
+        }
         yield* emit(
           makeAcpContentDeltaEvent({
             stamp: yield* stamp,
@@ -1093,10 +1363,25 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               const callChars =
                 (toolCall.title?.length ?? 0) +
                 (toolCall.detail?.length ?? 0) +
+                (toolCall.command?.length ?? 0) +
                 JSON["stringify"](toolData).length;
-              context.tokenTracker.toolUses += 1;
-              context.tokenTracker.toolCallsChars += callChars;
-              context.tokenTracker.totalLifetimeProcessedTokens += Math.round(callChars / 4);
+              if (!context.tokenTracker.toolCallCharsById) {
+                context.tokenTracker.toolCallCharsById = new Map();
+              }
+              const prevChars =
+                context.tokenTracker.toolCallCharsById.get(toolCall.toolCallId) ?? 0;
+              const delta = Math.max(0, callChars - prevChars);
+              if (delta > 0) {
+                context.tokenTracker.toolCallCharsById.set(toolCall.toolCallId, callChars);
+                context.tokenTracker.toolCallsChars += delta;
+                context.tokenTracker.totalLifetimeProcessedTokens += Math.round(delta / 4);
+              }
+              if (
+                (toolCall.status === "completed" || toolCall.status === "failed") &&
+                prevChars === 0
+              ) {
+                context.tokenTracker.toolUses += 1;
+              }
               yield* emitTokenUsage(context);
             }
 
@@ -1534,10 +1819,11 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               userMessagesChars: 0,
               agentResponsesChars: 0,
               toolCallsChars: 0,
-              systemPromptTokens: 5200,
-              systemToolsTokens: 12400,
-              skillsTokens: 1300,
-              checkpointBufferTokens: 2500,
+              subagentsChars: 0,
+              systemPromptTokens: ANTIGRAVITY_SYSTEM_PROMPT_TOKENS,
+              systemToolsTokens: ANTIGRAVITY_SYSTEM_TOOLS_TOKENS,
+              skillsTokens: ANTIGRAVITY_SKILLS_TOKENS,
+              checkpointBufferTokens: ANTIGRAVITY_CHECKPOINT_BUFFER_TOKENS,
               totalLifetimeProcessedTokens: 0,
               toolUses: 0,
             },
@@ -1553,6 +1839,8 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           const running = context;
           sessions.set(input.threadId, running);
           startingSessions.delete(input.threadId);
+          syncTokenTrackerFromDb(running);
+          yield* emitTokenUsage(running);
           yield* Stream.runForEach(runtime.getEvents(), (event) =>
             handleEvent(running, event),
           ).pipe(
@@ -1679,6 +1967,8 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         if (turn.settled || context.stopped || context.generation !== turn.generation) return;
         turn.settled = true;
         yield* promoteBackgroundCommands(context);
+        syncTokenTrackerFromDb(context);
+        yield* emitTokenUsage(context, turn.turnId);
         context.activeTurnId = undefined;
         context.promptFiber = undefined;
         context.session = {
@@ -1955,15 +2245,21 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         });
         return;
       }
-      const context = yield* requireSession(threadId);
+      const context = sessions.get(threadId);
+      if (!context) {
+        return;
+      }
       yield* context.promptLock
         .withPermit(
           Effect.gen(function* () {
             yield* cancelRequests(context);
-            yield* context.runtime.cancel;
+            yield* Effect.ignore(context.runtime.cancel);
           }),
         )
-        .pipe(Effect.mapError((cause) => mapAntigravityError(threadId, "session/cancel", cause)));
+        .pipe(
+          Effect.mapError((cause) => mapAntigravityError(threadId, "session/cancel", cause)),
+          Effect.ignore,
+        );
     });
 
   const respondToRequest: Adapter["respondToRequest"] = (threadId, requestId, decision) =>

@@ -731,7 +731,13 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           yield* execute({
             operation,
             cwd: input.cwd,
-            args: ["read-tree", "HEAD"],
+            args: [
+              ...WORKSPACE_GIT_HARDENED_CONFIG_ARGS,
+              "-c",
+              "core.safecrlf=false",
+              "read-tree",
+              "HEAD",
+            ],
             env: commitEnv,
           });
         }
@@ -739,14 +745,22 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         yield* execute({
           operation,
           cwd: input.cwd,
-          args: ["add", "-A", "--", "."],
+          args: [
+            ...WORKSPACE_GIT_HARDENED_CONFIG_ARGS,
+            "-c",
+            "core.safecrlf=false",
+            "add",
+            "-A",
+            "--",
+            ".",
+          ],
           env: commitEnv,
         });
 
         const writeTreeResult = yield* execute({
           operation,
           cwd: input.cwd,
-          args: ["write-tree"],
+          args: [...WORKSPACE_GIT_HARDENED_CONFIG_ARGS, "-c", "core.safecrlf=false", "write-tree"],
           env: commitEnv,
         });
         const treeOid = writeTreeResult.stdout.trim();

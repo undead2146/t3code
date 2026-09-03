@@ -1,4 +1,6 @@
 import {
+  ANTIGRAVITY_DEFAULT_MODEL,
+  DEFAULT_TEXT_GENERATION_MODEL,
   type ModelSelection,
   type ProviderSetupError,
   TextGenerationError,
@@ -235,9 +237,13 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
               });
             }
             yield* runtime.setMode("default");
+            const requestedModel =
+              input.modelSelection.model === DEFAULT_TEXT_GENERATION_MODEL
+                ? ANTIGRAVITY_DEFAULT_MODEL
+                : input.modelSelection.model;
             yield* applyAntigravityAcpModelSelection({
               runtime,
-              model: input.modelSelection.model,
+              model: requestedModel,
               defaultModel: yield* options.defaultModel ?? Effect.succeed(undefined),
               mapError: (cause) =>
                 new TextGenerationError({
