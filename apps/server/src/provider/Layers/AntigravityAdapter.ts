@@ -1,1852 +1,1121 @@
 import {
-  type CanonicalItemType,
-  type AntigravitySettings,
+  ANTIGRAVITY_DEFAULT_MODEL,
+  ApprovalRequestId,
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
+  RuntimeRequestId,
+  RuntimeTaskId,
+  TurnId,
+  type AntigravitySettings,
+  type ProviderApprovalDecision,
   type ProviderRuntimeEvent,
   type ProviderSession,
-  type ThreadTokenUsageSnapshot,
-  RuntimeItemId,
-  RuntimeTaskId,
-  ThreadId,
-  TurnId,
+  type ProviderSetupError,
+  type ProviderUserInputAnswers,
+  type ThreadId,
+  type TurnCompletedPayload,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
-import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
-import * as Duration from "effect/Duration";
-import * as Semaphore from "effect/Semaphore";
-import * as ChildProcess from "effect/unstable/process/ChildProcess";
-import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
-import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
-import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import * as EffectAcpErrors from "effect-acp/errors";
+import type * as EffectAcpSchema from "effect-acp/schema";
 
+import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import type { AntigravityAuth } from "../AntigravityAuth.ts";
 import {
-  ProviderAdapterProcessError,
   ProviderAdapterRequestError,
+  ProviderAdapterSessionClosedError,
   ProviderAdapterSessionNotFoundError,
   ProviderAdapterValidationError,
   type ProviderAdapterError,
 } from "../Errors.ts";
-import { type AntigravityAdapterShape } from "../Services/AntigravityAdapter.ts";
-import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import {
-  isAntigravityEffortSupported,
-  resolveAntigravityBinary,
-  resolveAntigravityContextWindow,
-} from "./AntigravityProvider.ts";
+  ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE,
+  isAntigravitySignInRequiredError,
+} from "../antigravityAuthSupport.ts";
+import { mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
 import {
-  checkSubagentTranscriptStatus,
-  computeSubagentUsage,
-  extractConversationIdsFromText,
-  findTranscriptPath,
-} from "../../orchestration/subagentTranscriptQuery.ts";
-// @effect-diagnostics nodeBuiltinImport:off
-import * as NodeCP from "node:child_process";
-import * as NodeFS from "node:fs";
-
-export const KILLED_SUBAGENT_IDS = new Set<string>();
-
-export function registerKilledSubagent(conversationId: string): void {
-  if (!conversationId || typeof conversationId !== "string" || conversationId.length < 5) return;
-  KILLED_SUBAGENT_IDS.add(conversationId);
-  try {
-    if (process.platform === "win32") {
-      const psCmd = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*${conversationId}*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
-      NodeCP.exec(`powershell -NoProfile -Command "${psCmd}"`, () => {});
-    } else {
-      NodeCP.exec(`pkill -9 -f "${conversationId}"`, () => {});
-    }
-  } catch {}
-}
+  makeAcpAssistantItemEvent,
+  makeAcpContentDeltaEvent,
+  makeAcpPlanUpdatedEvent,
+  makeAcpRequestOpenedEvent,
+  makeAcpRequestResolvedEvent,
+  makeAcpToolCallEvent,
+} from "../acp/AcpCoreRuntimeEvents.ts";
+import { makeAcpNativeLoggerFactory } from "../acp/AcpNativeLogging.ts";
+import { parsePermissionRequest, type AcpToolCallState } from "../acp/AcpRuntimeModel.ts";
+import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
+import {
+  antigravityPermissionMode,
+  antigravityModelOptions,
+  applyAntigravityAcpModelSelection,
+  buildAntigravityPrompt,
+  type AntigravityAcpRuntimeInput,
+  resolveAntigravityModel,
+} from "../acp/AntigravityAcpSupport.ts";
+import {
+  antigravityApprovalOptions,
+  extractAntigravityUserInputQuestion,
+  isAntigravityOpenCommand,
+  isAntigravityUserInputRequest,
+  makeAntigravityUserInputResponse,
+  normalizeAntigravityToolCall,
+  sanitizeAntigravityToolPayload,
+  selectAntigravityPermissionOptionId,
+} from "../acp/AntigravityProtocol.ts";
+import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type { EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const PROVIDER = ProviderDriverKind.make("antigravity");
-const decodeJsonExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
+const ResumeCursor = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  sessionId: Schema.NonEmptyString,
+});
+const decodeResumeCursor = Schema.decodeUnknownOption(ResumeCursor);
+const isAcpError = Schema.is(EffectAcpErrors.AcpError);
 
-export interface AntigravityAdapterLiveOptions {
-  readonly environment?: NodeJS.ProcessEnv;
-  readonly nativeEventLogPath?: string;
+type Adapter = ProviderAdapterShape<ProviderAdapterError>;
+type Runtime = Pick<
+  AcpSessionRuntime.AcpSessionRuntime["Service"],
+  | "handleRequestPermission"
+  | "handleReadTextFile"
+  | "handleWriteTextFile"
+  | "start"
+  | "setMode"
+  | "setModel"
+  | "getConfigOptions"
+  | "getEvents"
+  | "drainEvents"
+  | "prompt"
+  | "cancel"
+>;
+type NativePermission = EffectAcpSchema.RequestPermissionRequest;
+type NativePermissionResponse = EffectAcpSchema.RequestPermissionResponse;
+
+function mapAntigravityError(threadId: ThreadId, method: string, cause: EffectAcpErrors.AcpError) {
+  return isAntigravitySignInRequiredError(cause)
+    ? new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method,
+        detail: ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE,
+        cause,
+      })
+    : mapAcpToAdapterError(PROVIDER, threadId, method, cause);
+}
+
+export interface AntigravityAdapterOptions {
+  readonly instanceId: ProviderInstanceId;
+  readonly makeRuntime: (
+    input: Omit<AntigravityAcpRuntimeInput, "spawn" | "childProcessSpawner" | "onAuthorizationUrl">,
+  ) => Effect.Effect<Runtime, EffectAcpErrors.AcpError | ProviderSetupError, Scope.Scope>;
+  readonly withProcess: AntigravityAuth["withProcess"];
+  readonly onSessionStarted?: (
+    started: AcpSessionRuntime.AcpSessionRuntimeStartResult,
+    cwd: string,
+  ) => Effect.Effect<void>;
+  readonly onAvailableCommands?: (
+    commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
+    cwd: string,
+  ) => Effect.Effect<void>;
+  readonly onAuthRequired?: Effect.Effect<void>;
+  /** Model the provider default alias selects, when the account offers it. */
+  readonly defaultModel?: Effect.Effect<string | undefined>;
   readonly nativeEventLogger?: EventNdjsonLogger;
-  readonly instanceId?: ProviderInstanceId;
 }
 
-interface ActiveProcessHandle {
-  readonly kill: () => Effect.Effect<void, never, never>;
+interface PendingApproval {
+  readonly request: NativePermission;
+  readonly response: Deferred.Deferred<{
+    readonly decision: ProviderApprovalDecision;
+    readonly result: NativePermissionResponse;
+  }>;
 }
 
-interface TrackedSubagent {
-  readonly taskId: RuntimeTaskId;
-  readonly role?: string;
-  readonly typeName?: string;
-  readonly prompt?: string;
-  readonly model?: string;
-  status: "running" | "completed" | "failed" | "cancelled";
-  conversationId?: string;
-  readonly stepIndex: number;
+interface PendingQuestion {
+  readonly request: NativePermission;
+  readonly response: Deferred.Deferred<{
+    readonly answers: ProviderUserInputAnswers;
+    readonly result: NativePermissionResponse;
+  }>;
 }
 
-interface AntigravitySessionContext {
+interface OpenCommand {
+  readonly toolCall: AcpToolCallState;
+  readonly turnId: TurnId | undefined;
+  readonly promoted: boolean;
+}
+
+interface TurnIntent {
+  readonly turnId: TurnId;
+  readonly generation: number;
+  settled: boolean;
+}
+
+interface SessionContext {
   readonly threadId: ThreadId;
-  session: ProviderSession;
+  readonly cwd: string;
+  readonly nativeSessionId: string;
   readonly scope: Scope.Closeable;
-  cwd: string;
-  antigravityConversationId: string | undefined;
-  activeProcess: ActiveProcessHandle | undefined;
+  readonly runtime: Runtime;
+  readonly promptLock: Semaphore.Semaphore;
+  readonly stopLock: Semaphore.Semaphore;
+  readonly commandLock: Semaphore.Semaphore;
+  readonly approvals: Map<ApprovalRequestId, PendingApproval>;
+  readonly questions: Map<ApprovalRequestId, PendingQuestion>;
+  readonly commands: Map<string, OpenCommand>;
+  readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
+  session: ProviderSession;
   activeTurnId: TurnId | undefined;
-  turns: Array<{ id: TurnId; items: Array<unknown> }>;
+  promptFiber: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError> | undefined;
+  generation: number;
   stopped: boolean;
-  lastKnownContextWindow: number | undefined;
-  lastKnownTokenUsage: ThreadTokenUsageSnapshot | undefined;
-  readonly subagents: Map<string, TrackedSubagent>;
+  closed: boolean;
+  disconnected: boolean;
 }
 
-interface RawSubagentInput {
-  readonly Role?: string;
-  readonly role?: string;
-  readonly TypeName?: string;
-  readonly typeName?: string;
-  readonly Prompt?: string;
-  readonly prompt?: string;
-  readonly Model?: string;
-  readonly model?: string;
-  readonly Workspace?: string;
-  readonly workspace?: string;
+const CLIENT_FILE_MAX_BYTES = 8 * 1024 * 1024;
+
+function isInsideRoot(path: Path.Path, root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-function parseSubagentsParam(parameters: unknown): ReadonlyArray<RawSubagentInput> {
-  if (!parameters || typeof parameters !== "object") return [];
-  const p = parameters as Record<string, unknown>;
-  let raw = p.Subagents ?? p.subagents ?? p.Subagent ?? p.subagent ?? p.agents ?? p.Agents;
-  if (typeof raw === "string") {
-    try {
-      raw = JSON.parse(raw);
-    } catch {}
-  }
-  if (Array.isArray(raw)) {
-    return raw.filter(
-      (item): item is RawSubagentInput => typeof item === "object" && item !== null,
+/** Resolves an agent-supplied path and rejects anything outside the session roots. */
+const resolveClientFilePath = Effect.fn("AntigravityAdapter.resolveClientFilePath")(
+  function* (input: {
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly path: Path.Path;
+    readonly allowedRoots: ReadonlyArray<string>;
+    readonly requestPath: string;
+  }) {
+    const { path } = input;
+    const resolved = path.resolve(input.requestPath);
+    // Follow symlinks on the parent so a link out of the workspace cannot escape it.
+    const parent = yield* input.fileSystem
+      .realPath(path.dirname(resolved))
+      .pipe(Effect.orElseSucceed(() => path.dirname(resolved)));
+    const real = path.join(parent, path.basename(resolved));
+    const roots = yield* Effect.forEach(input.allowedRoots, (root) =>
+      input.fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root)),
     );
-  }
-  if (typeof raw === "object" && raw !== null) {
-    return [raw as RawSubagentInput];
-  }
-  if (p.Prompt || p.prompt || p.Role || p.role || p.TypeName || p.typeName) {
-    return [p as RawSubagentInput];
-  }
-  return [];
-}
-
-interface SubagentListEntry {
-  readonly role?: string;
-  readonly type?: string;
-  readonly conversationId?: string;
-  readonly transcript?: string;
-  readonly state?: string;
-  readonly stateDetail?: string;
-}
-
-function parseSubagentListFromOutput(data: unknown): ReadonlyArray<SubagentListEntry> {
-  if (typeof data !== "string") return [];
-  const start = data.indexOf("[");
-  const end = data.lastIndexOf("]");
-  if (start !== -1 && end > start) {
-    try {
-      const parsed = JSON.parse(data.slice(start, end + 1));
-      if (Array.isArray(parsed)) {
-        return parsed.filter(
-          (item): item is SubagentListEntry => typeof item === "object" && item !== null,
-        );
-      }
-    } catch {}
-  }
-  return [];
-}
-
-function toolNameToItemType(toolName: string): CanonicalItemType {
-  switch (toolName) {
-    case "run_command":
-    case "command_status":
-    case "send_command_input":
-      return "command_execution";
-    case "replace_file_content":
-    case "multi_replace_file_content":
-    case "write_to_file":
-    case "sed_file":
-    case "notebook_edit":
-      return "file_change";
-    case "view_file":
-    case "list_dir":
-    case "read_resource":
-      return "dynamic_tool_call";
-    case "search_web":
-    case "read_url_content":
-    case "grep_search":
-    case "find_by_name":
-      return "web_search";
-    case "call_mcp_tool":
-      return "mcp_tool_call";
-    case "invoke_subagent":
-    case "define_subagent":
-    case "manage_subagents":
-    case "send_message":
-      return "collab_agent_tool_call";
-    default:
-      return "dynamic_tool_call";
-  }
-}
-
-function toolParamsToDetail(parameters: unknown): string | undefined {
-  if (!parameters || typeof parameters !== "object") return undefined;
-  const p = parameters as Record<string, unknown>;
-  if (p.Subagents !== undefined || p.subagents !== undefined) {
-    const subagents = parseSubagentsParam(parameters);
-    if (subagents.length > 0) {
-      return subagents
-        .map((s) => s.Role || s.role || s.TypeName || s.typeName || "Subagent")
-        .join(", ");
-    }
-  }
-  const candidate =
-    p.CommandLine ??
-    p.TargetFile ??
-    p.AbsolutePath ??
-    p.DirectoryPath ??
-    p.Query ??
-    p.query ??
-    p.Url ??
-    p.Prompt ??
-    p.prompt ??
-    p.Recipient ??
-    p.recipient ??
-    p.Action ??
-    p.action;
-  return typeof candidate === "string" && candidate.trim().length > 0
-    ? candidate.trim()
-    : undefined;
-}
-
-function parseAntigravityUsageSnapshot(
-  rawUsage: unknown,
-  contextWindow: number | undefined,
-  existingUsage?: ThreadTokenUsageSnapshot,
-  isResultEvent = false,
-): ThreadTokenUsageSnapshot | undefined {
-  if (!rawUsage || typeof rawUsage !== "object") {
-    return undefined;
-  }
-  const usage = rawUsage as Record<string, unknown>;
-  const count = (v: unknown): number | undefined =>
-    typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined;
-
-  const rawInputTokens = count(usage.input_tokens);
-  const outputTokens = count(usage.output_tokens);
-  const reasoningOutputTokens = count(usage.thinking_tokens);
-  const cachedInputTokens = count(usage.cache_read_tokens ?? usage.cached_tokens);
-  const totalTokens = count(usage.total_tokens);
-
-  const maxTokens = contextWindow ?? existingUsage?.maxTokens ?? 1_000_000;
-
-  if (isResultEvent) {
-    // result.usage from agy represents cumulative lifetime totals across all turns of the session.
-    // We update totalProcessedTokens, but MUST NOT overwrite the active context window usage.
-    const totalProcessed =
-      totalTokens ??
-      (rawInputTokens !== undefined && outputTokens !== undefined
-        ? rawInputTokens + outputTokens
-        : undefined);
-    const totalProcessedTokens =
-      totalProcessed !== undefined
-        ? Math.max(totalProcessed, existingUsage?.totalProcessedTokens ?? 0)
-        : existingUsage?.totalProcessedTokens;
-
-    if (existingUsage) {
-      return {
-        ...existingUsage,
-        ...(maxTokens !== undefined ? { maxTokens } : {}),
-        ...(totalProcessedTokens !== undefined ? { totalProcessedTokens } : {}),
-      };
-    }
-
-    const inputTokens = rawInputTokens ?? 0;
-    const cachedTokens = cachedInputTokens ?? 0;
-    const activeTokens = inputTokens + cachedTokens + (outputTokens ?? 0);
-    if (activeTokens <= 0) {
-      return undefined;
-    }
-    const usedTokens = Math.min(activeTokens, maxTokens);
-    const rawCategories =
-      usage.categories ??
-      usage.category_breakdown ??
-      usage.token_usage_by_category ??
-      (typeof usage.by_category === "object" ? usage.by_category : undefined);
-    const categoriesObj =
-      typeof rawCategories === "object" && rawCategories !== null
-        ? (rawCategories as Record<string, unknown>)
-        : usage;
-
-    const userMessages = count(
-      categoriesObj.user_messages ??
-        categoriesObj.user_messages_tokens ??
-        categoriesObj.userMessages,
-    );
-    const agentResponses = count(
-      categoriesObj.agent_responses ??
-        categoriesObj.agent_responses_tokens ??
-        categoriesObj.agentResponses,
-    );
-    const toolCalls = count(
-      categoriesObj.tool_calls ?? categoriesObj.tool_calls_tokens ?? categoriesObj.toolCalls,
-    );
-    const systemPrompt = count(
-      categoriesObj.system_prompt ??
-        categoriesObj.system_prompt_tokens ??
-        categoriesObj.systemPrompt,
-    );
-    const systemTools = count(
-      categoriesObj.system_tools ?? categoriesObj.system_tools_tokens ?? categoriesObj.systemTools,
-    );
-    const skills = count(
-      categoriesObj.skills ?? categoriesObj.skills_tokens ?? categoriesObj.skills,
-    );
-    const subagents = count(
-      categoriesObj.subagents ?? categoriesObj.subagents_tokens ?? categoriesObj.subagents,
-    );
-    const checkpointBuffer = count(
-      categoriesObj.checkpoint_buffer ??
-        categoriesObj.checkpoint_buffer_tokens ??
-        categoriesObj.checkpointBuffer,
-    );
-
-    const hasAnyCategory =
-      userMessages !== undefined ||
-      agentResponses !== undefined ||
-      toolCalls !== undefined ||
-      systemPrompt !== undefined ||
-      systemTools !== undefined ||
-      skills !== undefined ||
-      subagents !== undefined ||
-      checkpointBuffer !== undefined;
-
-    const categories = hasAnyCategory
-      ? {
-          ...(userMessages !== undefined ? { userMessages } : {}),
-          ...(agentResponses !== undefined ? { agentResponses } : {}),
-          ...(toolCalls !== undefined ? { toolCalls } : {}),
-          ...(systemPrompt !== undefined ? { systemPrompt } : {}),
-          ...(systemTools !== undefined ? { systemTools } : {}),
-          ...(skills !== undefined ? { skills } : {}),
-          ...(subagents !== undefined ? { subagents } : {}),
-          ...(checkpointBuffer !== undefined ? { checkpointBuffer } : {}),
-        }
-      : existingUsage?.categories;
-
-    return {
-      usedTokens,
-      ...(maxTokens !== undefined ? { maxTokens } : {}),
-      ...(totalProcessedTokens !== undefined ? { totalProcessedTokens } : {}),
-      ...(inputTokens > 0 ? { inputTokens } : {}),
-      ...(outputTokens !== undefined && outputTokens > 0 ? { outputTokens } : {}),
-      ...(reasoningOutputTokens !== undefined && reasoningOutputTokens > 0
-        ? { reasoningOutputTokens }
-        : {}),
-      ...(cachedTokens > 0 ? { cachedInputTokens: cachedTokens } : {}),
-      compactsAutomatically: true,
-      ...(categories ? { categories } : {}),
-    };
-  }
-
-  // For step_update.usage (the active LLM call state in the conversation):
-  // The context window size is the full prompt in the model (uncached + cached input tokens + generated output tokens).
-  const inputTokens = rawInputTokens ?? 0;
-  const cachedTokens = cachedInputTokens ?? 0;
-  const activeTokens = inputTokens + cachedTokens + (outputTokens ?? 0);
-
-  if (activeTokens <= 0) {
-    return undefined;
-  }
-
-  const usedTokens = Math.min(activeTokens, maxTokens);
-  const totalProcessedTokens = existingUsage?.totalProcessedTokens;
-
-  const rawCategories =
-    usage.categories ??
-    usage.category_breakdown ??
-    usage.token_usage_by_category ??
-    (typeof usage.by_category === "object" ? usage.by_category : undefined);
-  const categoriesObj =
-    typeof rawCategories === "object" && rawCategories !== null
-      ? (rawCategories as Record<string, unknown>)
-      : usage;
-
-  const userMessages = count(
-    categoriesObj.user_messages ?? categoriesObj.user_messages_tokens ?? categoriesObj.userMessages,
-  );
-  const agentResponses = count(
-    categoriesObj.agent_responses ??
-      categoriesObj.agent_responses_tokens ??
-      categoriesObj.agentResponses,
-  );
-  const toolCalls = count(
-    categoriesObj.tool_calls ?? categoriesObj.tool_calls_tokens ?? categoriesObj.toolCalls,
-  );
-  const systemPrompt = count(
-    categoriesObj.system_prompt ?? categoriesObj.system_prompt_tokens ?? categoriesObj.systemPrompt,
-  );
-  const systemTools = count(
-    categoriesObj.system_tools ?? categoriesObj.system_tools_tokens ?? categoriesObj.systemTools,
-  );
-  const skills = count(categoriesObj.skills ?? categoriesObj.skills_tokens ?? categoriesObj.skills);
-  const subagents = count(
-    categoriesObj.subagents ?? categoriesObj.subagents_tokens ?? categoriesObj.subagents,
-  );
-  const checkpointBuffer = count(
-    categoriesObj.checkpoint_buffer ??
-      categoriesObj.checkpoint_buffer_tokens ??
-      categoriesObj.checkpointBuffer,
-  );
-
-  const hasAnyCategory =
-    userMessages !== undefined ||
-    agentResponses !== undefined ||
-    toolCalls !== undefined ||
-    systemPrompt !== undefined ||
-    systemTools !== undefined ||
-    skills !== undefined ||
-    subagents !== undefined ||
-    checkpointBuffer !== undefined;
-
-  const categories = hasAnyCategory
-    ? {
-        ...(userMessages !== undefined ? { userMessages } : {}),
-        ...(agentResponses !== undefined ? { agentResponses } : {}),
-        ...(toolCalls !== undefined ? { toolCalls } : {}),
-        ...(systemPrompt !== undefined ? { systemPrompt } : {}),
-        ...(systemTools !== undefined ? { systemTools } : {}),
-        ...(skills !== undefined ? { skills } : {}),
-        ...(subagents !== undefined ? { subagents } : {}),
-        ...(checkpointBuffer !== undefined ? { checkpointBuffer } : {}),
-      }
-    : existingUsage?.categories;
-
-  return {
-    usedTokens,
-    ...(maxTokens !== undefined ? { maxTokens } : {}),
-    ...(totalProcessedTokens !== undefined ? { totalProcessedTokens } : {}),
-    ...(inputTokens > 0 ? { inputTokens } : {}),
-    ...(outputTokens !== undefined && outputTokens > 0 ? { outputTokens } : {}),
-    ...(reasoningOutputTokens !== undefined && reasoningOutputTokens > 0
-      ? { reasoningOutputTokens }
-      : {}),
-    ...(cachedTokens > 0 ? { cachedInputTokens: cachedTokens } : {}),
-    compactsAutomatically: true,
-    ...(categories ? { categories } : {}),
-  };
-}
-
-export function makeAntigravityAdapter(
-  settings: AntigravitySettings,
-  options?: AntigravityAdapterLiveOptions,
-) {
-  return Effect.gen(function* () {
-    const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const crypto = yield* Crypto.Crypto;
-    const processEnv = options?.environment ?? process.env;
-
-    const nativeEventLogger =
-      options?.nativeEventLogger ??
-      (options?.nativeEventLogPath !== undefined
-        ? yield* makeEventNdjsonLogger(options.nativeEventLogPath, { stream: "native" })
-        : undefined);
-    const managedNativeEventLogger =
-      options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
-
-    const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("antigravity");
-    const sessions = new Map<ThreadId, AntigravitySessionContext>();
-    const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
-    const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
-
-    const getThreadSemaphore = (threadId: string) =>
-      SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
-        const existing: Option.Option<Semaphore.Semaphore> = Option.fromNullishOr(
-          current.get(threadId),
-        );
-        if (Option.isSome(existing)) {
-          return Effect.succeed([existing.value, current] as const);
-        }
-        return Semaphore.make(1).pipe(
-          Effect.map((semaphore) => {
-            const next = new Map(current);
-            next.set(threadId, semaphore);
-            return [semaphore, next] as const;
-          }),
-        );
-      });
-
-    const withThreadLock = <A, E, R>(
-      threadId: ThreadId,
-      effect: Effect.Effect<A, E, R>,
-    ): Effect.Effect<A, E, R> =>
-      Effect.flatMap(getThreadSemaphore(threadId), (semaphore) =>
-        Semaphore.withPermit(semaphore)(effect),
+    if (!roots.some((root) => isInsideRoot(path, root, real))) {
+      return yield* EffectAcpErrors.AcpRequestError.invalidParams(
+        `Path '${input.requestPath}' is outside the session workspace.`,
       );
+    }
+    return real;
+  },
+);
 
-    const publishEvent = (event: ProviderRuntimeEvent): Effect.Effect<void, never, never> =>
-      Queue.offer(runtimeEventQueue, event).pipe(Effect.asVoid);
-
-    const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
-
-    const randomUUIDv4 = crypto.randomUUIDv4.pipe(
-      Effect.mapError(
-        (cause) =>
-          new ProviderAdapterRequestError({
-            provider: PROVIDER,
-            method: "crypto/randomUUIDv4",
-            detail: "Failed to generate Antigravity runtime identifier.",
-            cause,
-          }),
+const readClientTextFile = Effect.fn("AntigravityAdapter.readClientTextFile")(function* (input: {
+  readonly fileSystem: FileSystem.FileSystem;
+  readonly path: Path.Path;
+  readonly allowedRoots: ReadonlyArray<string>;
+  readonly request: EffectAcpSchema.ReadTextFileRequest;
+}): Effect.fn.Return<EffectAcpSchema.ReadTextFileResponse, EffectAcpErrors.AcpError> {
+  const filePath = yield* resolveClientFilePath({ ...input, requestPath: input.request.path });
+  const info = yield* input.fileSystem
+    .stat(filePath)
+    .pipe(
+      Effect.mapError(() =>
+        EffectAcpErrors.AcpRequestError.resourceNotFound(`File '${input.request.path}' not found.`),
       ),
     );
+  if (info.type !== "File" || Number(info.size) > CLIENT_FILE_MAX_BYTES) {
+    return yield* EffectAcpErrors.AcpRequestError.invalidParams(
+      `File '${input.request.path}' is not a readable text file under ${CLIENT_FILE_MAX_BYTES} bytes.`,
+    );
+  }
+  const text = yield* input.fileSystem
+    .readFileString(filePath)
+    .pipe(
+      Effect.mapError(() =>
+        EffectAcpErrors.AcpRequestError.internalError(`Could not read '${input.request.path}'.`),
+      ),
+    );
+  const line = input.request.line ?? undefined;
+  const limit = input.request.limit ?? undefined;
+  if (line === undefined && limit === undefined) {
+    return { content: text };
+  }
+  // ACP lines are 1-indexed. `limit` is a line count.
+  const lines = text.split("\n");
+  const start = Math.max(0, (line ?? 1) - 1);
+  const end = limit === undefined ? lines.length : Math.min(lines.length, start + limit);
+  return { content: lines.slice(start, end).join("\n") };
+});
 
-    const nextEventId = Effect.map(randomUUIDv4, (id) => EventId.make(id));
-    const nextTurnId = Effect.map(randomUUIDv4, (id) => TurnId.make(id));
-    const makeEventStamp = () => Effect.all({ eventId: nextEventId, createdAt: nowIso });
+const writeClientTextFile = Effect.fn("AntigravityAdapter.writeClientTextFile")(function* (input: {
+  readonly fileSystem: FileSystem.FileSystem;
+  readonly path: Path.Path;
+  readonly allowedRoots: ReadonlyArray<string>;
+  readonly request: EffectAcpSchema.WriteTextFileRequest;
+}): Effect.fn.Return<EffectAcpSchema.WriteTextFileResponse, EffectAcpErrors.AcpError> {
+  const filePath = yield* resolveClientFilePath({ ...input, requestPath: input.request.path });
+  yield* input.fileSystem.makeDirectory(input.path.dirname(filePath), { recursive: true }).pipe(
+    Effect.andThen(input.fileSystem.writeFileString(filePath, input.request.content)),
+    Effect.mapError(() =>
+      EffectAcpErrors.AcpRequestError.internalError(`Could not write '${input.request.path}'.`),
+    ),
+  );
+  return {};
+});
 
-    const requireSession = (
-      threadId: ThreadId,
-    ): Effect.Effect<AntigravitySessionContext, ProviderAdapterError> =>
-      Effect.sync(() => sessions.get(threadId)).pipe(
-        Effect.flatMap((ctx) =>
-          ctx && !ctx.stopped
-            ? Effect.succeed(ctx)
-            : Effect.fail(
-                new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }),
-              ),
-        ),
+/** Keeps one official ACP process per thread and drains a cancelled prompt before steering. */
+export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(function* (
+  settings: AntigravitySettings,
+  options: AntigravityAdapterOptions,
+) {
+  const crypto = yield* Crypto.Crypto;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const serverConfig = yield* ServerConfig;
+  const ownerScope = yield* Effect.scope;
+  const makeNativeLoggers = yield* makeAcpNativeLoggerFactory();
+  const sessions = new Map<ThreadId, SessionContext>();
+  const locks = yield* SynchronizedRef.make(new Map<ThreadId, Semaphore.Semaphore>());
+  const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+  const randomId = crypto.randomUUIDv4.pipe(
+    Effect.mapError(
+      (cause) =>
+        new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "crypto/randomUUIDv4",
+          detail: "Could not create an Antigravity event ID.",
+          cause,
+        }),
+    ),
+  );
+  const stamp = Effect.all({
+    eventId: Effect.map(randomId, EventId.make),
+    createdAt: nowIso,
+  });
+  const emit = (event: ProviderRuntimeEvent) => PubSub.publish(events, event).pipe(Effect.asVoid);
+
+  const withThreadLock = <A, E, R>(threadId: ThreadId, task: Effect.Effect<A, E, R>) =>
+    SynchronizedRef.modifyEffect(locks, (current) => {
+      const existing = current.get(threadId);
+      if (existing) return Effect.succeed([existing, current] as const);
+      return Semaphore.make(1).pipe(
+        Effect.map((lock) => [lock, new Map(current).set(threadId, lock)] as const),
       );
+    }).pipe(Effect.flatMap((lock) => lock.withPermit(task)));
 
-    const startSession: AntigravityAdapterShape["startSession"] = (input) =>
-      withThreadLock(
-        input.threadId,
-        Effect.gen(function* () {
-          const threadId = input.threadId;
-          const existing = sessions.get(threadId);
-          if (existing && !existing.stopped) {
-            return existing.session;
-          }
+  const requireSession = (threadId: ThreadId) => {
+    const context = sessions.get(threadId);
+    return context && !context.stopped
+      ? Effect.succeed(context)
+      : Effect.fail(new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }));
+  };
 
-          const sessionScope = yield* Scope.make();
-          const createdAt = yield* nowIso;
-          const isTargetInstance =
-            input.modelSelection?.instanceId === boundInstanceId ||
-            !input.modelSelection?.instanceId;
-          const session: ProviderSession = {
-            threadId,
-            status: "ready",
+  const cancelRequests = Effect.fn("AntigravityAdapter.cancelRequests")(function* (
+    context: SessionContext,
+  ) {
+    for (const pending of context.approvals.values()) {
+      yield* Deferred.succeed(pending.response, {
+        decision: "cancel",
+        result: { outcome: { outcome: "cancelled" } },
+      });
+    }
+    for (const pending of context.questions.values()) {
+      yield* Deferred.succeed(pending.response, {
+        answers: {},
+        result: { outcome: { outcome: "cancelled" } },
+      });
+    }
+  });
+
+  const finishBackgroundCommands = (context: SessionContext) =>
+    context.commandLock.withPermit(
+      Effect.gen(function* () {
+        for (const [id, command] of context.commands) {
+          if (!command.promoted) continue;
+          yield* emit({
+            type: "task.completed",
+            ...(yield* stamp),
             provider: PROVIDER,
-            providerInstanceId: boundInstanceId,
-            runtimeMode: input.runtimeMode,
-            model: isTargetInstance ? input.modelSelection?.model : undefined,
-            createdAt,
-            updatedAt: createdAt,
-          };
-
-          const contextWindow = resolveAntigravityContextWindow(input.modelSelection);
-          const ctx: AntigravitySessionContext = {
-            threadId,
-            session,
-            scope: sessionScope,
-            cwd: input.cwd ?? process.cwd(),
-            antigravityConversationId: undefined,
-            activeProcess: undefined,
-            activeTurnId: undefined,
-            turns: [],
-            stopped: false,
-            lastKnownContextWindow: contextWindow,
-            lastKnownTokenUsage: undefined,
-            subagents: new Map(),
-          };
-
-          sessions.set(threadId, ctx);
-
-          const stamp = yield* makeEventStamp();
-          yield* publishEvent({
-            ...stamp,
-            provider: PROVIDER,
-            threadId,
-            type: "session.started",
-            payload: {},
+            threadId: context.threadId,
+            turnId: command.turnId,
+            payload: {
+              taskId: RuntimeTaskId.make(id),
+              taskType: "local_bash",
+              toolUseId: id,
+              status: "stopped",
+            },
           });
+        }
+        context.commands.clear();
+      }),
+    );
 
-          return session;
+  const stopContext = (context: SessionContext) =>
+    context.stopLock
+      .withPermit(
+        Effect.gen(function* () {
+          if (context.closed) return;
+          context.stopped = true;
+          yield* Effect.gen(function* () {
+            yield* cancelRequests(context);
+            if (context.promptFiber && !context.disconnected) {
+              yield* Effect.ignore(context.runtime.cancel);
+            }
+          }).pipe(Effect.ensuring(Scope.close(context.scope, Exit.void)));
+          context.closed = true;
+          if (sessions.get(context.threadId) === context) sessions.delete(context.threadId);
+          yield* finishBackgroundCommands(context);
+          yield* emit({
+            type: "session.exited",
+            ...(yield* stamp),
+            provider: PROVIDER,
+            threadId: context.threadId,
+            payload: {
+              exitKind: context.disconnected ? "error" : "graceful",
+              ...(context.disconnected ? { reason: "Antigravity process stopped." } : {}),
+            },
+          });
+        }),
+      )
+      .pipe(Effect.uninterruptible);
+
+  const handlePermission = Effect.fn("AntigravityAdapter.handlePermission")(function* (
+    context: SessionContext,
+    request: NativePermission,
+  ): Effect.fn.Return<NativePermissionResponse, ProviderAdapterError> {
+    if (context.stopped || request.sessionId !== context.nativeSessionId) {
+      return { outcome: { outcome: "cancelled" } };
+    }
+    const requestId = ApprovalRequestId.make(yield* randomId);
+    const runtimeRequestId = RuntimeRequestId.make(requestId);
+    const turnId = context.activeTurnId;
+    const rawPayload = sanitizeAntigravityToolPayload(request);
+
+    if (isAntigravityUserInputRequest(request)) {
+      const question = extractAntigravityUserInputQuestion(request);
+      if (!question) return { outcome: { outcome: "cancelled" } };
+      const response = yield* Deferred.make<{
+        answers: ProviderUserInputAnswers;
+        result: NativePermissionResponse;
+      }>();
+      context.questions.set(requestId, { request, response });
+      return yield* Effect.gen(function* () {
+        yield* emit({
+          type: "user-input.requested",
+          ...(yield* stamp),
+          provider: PROVIDER,
+          threadId: context.threadId,
+          turnId,
+          requestId: runtimeRequestId,
+          payload: { questions: [question] },
+          raw: { source: "acp.jsonrpc", method: "session/request_permission", payload: rawPayload },
+        });
+        const answer = yield* Deferred.await(response);
+        yield* emit({
+          type: "user-input.resolved",
+          ...(yield* stamp),
+          provider: PROVIDER,
+          threadId: context.threadId,
+          turnId,
+          requestId: runtimeRequestId,
+          payload: { answers: answer.answers },
+        });
+        return answer.result;
+      }).pipe(Effect.ensuring(Effect.sync(() => context.questions.delete(requestId))));
+    }
+
+    const response = yield* Deferred.make<{
+      decision: ProviderApprovalDecision;
+      result: NativePermissionResponse;
+    }>();
+    context.approvals.set(requestId, { request, response });
+    const parsed = parsePermissionRequest(request);
+    const toolCall = parsed.toolCall ? normalizeAntigravityToolCall(parsed.toolCall) : undefined;
+    const permissionRequest = {
+      ...parsed,
+      ...(toolCall ? { toolCall } : {}),
+      detail:
+        toolCall?.command ??
+        toolCall?.detail ??
+        toolCall?.title ??
+        "Antigravity requests permission.",
+    };
+    return yield* Effect.gen(function* () {
+      yield* emit(
+        makeAcpRequestOpenedEvent({
+          stamp: yield* stamp,
+          provider: PROVIDER,
+          threadId: context.threadId,
+          turnId,
+          requestId: runtimeRequestId,
+          permissionRequest,
+          approvalOptions: antigravityApprovalOptions(request),
+          detail: permissionRequest.detail ?? "Antigravity requests permission.",
+          args: rawPayload,
+          source: "acp.jsonrpc",
+          method: "session/request_permission",
+          rawPayload,
         }),
       );
+      const answer = yield* Deferred.await(response);
+      yield* emit(
+        makeAcpRequestResolvedEvent({
+          stamp: yield* stamp,
+          provider: PROVIDER,
+          threadId: context.threadId,
+          turnId,
+          requestId: runtimeRequestId,
+          permissionRequest,
+          decision: answer.decision,
+        }),
+      );
+      return answer.result;
+    }).pipe(Effect.ensuring(Effect.sync(() => context.approvals.delete(requestId))));
+  });
 
-    const sendTurn: AntigravityAdapterShape["sendTurn"] = (input) =>
-      withThreadLock(
-        input.threadId,
-        Effect.gen(function* () {
-          const threadId = input.threadId;
-          const ctx = yield* requireSession(threadId);
-
-          if (ctx.activeProcess) {
-            yield* ctx.activeProcess.kill();
-            ctx.activeProcess = undefined;
-          }
-
-          const turnContextWindow = resolveAntigravityContextWindow(input.modelSelection);
-          if (turnContextWindow !== undefined) {
-            ctx.lastKnownContextWindow = turnContextWindow;
-          }
-
-          if (ctx.activeTurnId) {
-            const abortedStamp = yield* makeEventStamp();
-            yield* publishEvent({
-              ...abortedStamp,
-              provider: PROVIDER,
-              threadId,
-              turnId: ctx.activeTurnId,
-              type: "turn.aborted",
-              payload: {
-                reason: "Superseded by new turn",
-              },
-            });
-            yield* publishEvent({
-              ...abortedStamp,
-              provider: PROVIDER,
-              threadId,
-              turnId: ctx.activeTurnId,
-              type: "turn.completed",
-              payload: {
-                state: "interrupted",
-              },
-            });
-            ctx.activeTurnId = undefined;
-          }
-
-          const turnId = yield* nextTurnId;
-
-          ctx.activeTurnId = turnId;
-          const turnStartedAt = yield* nowIso;
-          const turnStartEventId = yield* nextEventId;
-
-          const turnRecord: { id: TurnId; items: Array<unknown> } = {
-            id: turnId,
-            items: [{ prompt: input.input ?? "" }],
-          };
-          ctx.turns.push(turnRecord);
-
-          yield* publishEvent({
-            eventId: turnStartEventId,
+  const handleEvent = Effect.fn("AntigravityAdapter.handleEvent")(function* (
+    context: SessionContext,
+    event: AcpSessionRuntime.AcpSessionRuntimeEvent,
+  ) {
+    if (event._tag === "EventStreamBarrier") {
+      yield* Deferred.succeed(event.acknowledge, undefined);
+      return;
+    }
+    if (context.stopped) return;
+    switch (event._tag) {
+      case "ModeChanged":
+        return;
+      case "AvailableCommandsUpdated":
+        yield* options.onAvailableCommands?.(event.availableCommands, context.cwd) ?? Effect.void;
+        return;
+      case "ConnectionTerminated":
+        context.stopped = true;
+        context.disconnected = true;
+        yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
+        return;
+      case "AssistantItemStarted":
+      case "AssistantItemCompleted":
+        yield* emit(
+          makeAcpAssistantItemEvent({
+            stamp: yield* stamp,
             provider: PROVIDER,
-            threadId,
-            turnId,
-            createdAt: turnStartedAt,
-            type: "turn.started",
-            payload: {},
-          });
-
-          const binary = resolveAntigravityBinary(settings.binaryPath, processEnv);
-          const args = ["--output-format", "stream-json", "--print-timeout", "24h"];
-
-          if (settings.dangerouslySkipPermissions !== false) {
-            args.push("--dangerously-skip-permissions");
-          }
-
-          if (ctx.cwd) {
-            args.push("--add-dir", ctx.cwd);
-          }
-
-          const selectedModel = input.modelSelection?.model;
-          const effortSupported = isAntigravityEffortSupported(selectedModel);
-          const selectedEffort = effortSupported
-            ? getModelSelectionStringOptionValue(input.modelSelection, "effort")
-            : undefined;
-          let effectiveEffort = selectedEffort || (effortSupported ? settings.effort : undefined);
-
-          if (selectedModel) {
-            args.push("--model", selectedModel);
-          }
-
-          // If effort is not specified, effort is supported, and model doesn't embed it in the slug, default to "medium"
-          if (
-            effortSupported &&
-            !effectiveEffort &&
-            (!selectedModel || !selectedModel.match(/-(low|medium|high)$/i))
-          ) {
-            effectiveEffort = "medium";
-          }
-
-          if (effortSupported && effectiveEffort) {
-            args.push("--effort", effectiveEffort);
-          }
-
-          if (ctx.antigravityConversationId) {
-            args.push("--conversation", ctx.antigravityConversationId);
-          }
-
-          const promptText = input.input ?? "";
-          args.push("-p", promptText);
-
-          const spawnCommand = yield* resolveSpawnCommand(binary, args, {
-            env: processEnv,
-          }).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProviderAdapterProcessError({
-                  provider: PROVIDER,
-                  threadId,
-                  detail: `Failed to resolve spawn command (${binary})`,
-                  cause,
-                }),
-            ),
-            Effect.tapError((error) =>
-              Effect.gen(function* () {
-                ctx.activeTurnId = undefined;
-                const completedStamp = yield* makeEventStamp();
-                yield* publishEvent({
-                  ...completedStamp,
-                  provider: PROVIDER,
-                  threadId,
-                  turnId,
-                  type: "turn.completed",
-                  payload: {
-                    state: "failed",
-                    errorMessage: error.detail,
-                  },
-                });
-              }),
-            ),
-          );
-
-          const command = ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-            cwd: ctx.cwd,
-            env: processEnv,
-            shell: spawnCommand.shell,
-          });
-
-          const processHandle = yield* childProcessSpawner.spawn(command).pipe(
-            Effect.provideService(Scope.Scope, ctx.scope),
-            Effect.mapError(
-              (cause) =>
-                new ProviderAdapterProcessError({
-                  provider: PROVIDER,
-                  threadId,
-                  detail: `Failed to spawn Antigravity CLI process (${binary})`,
-                  cause,
-                }),
-            ),
-            Effect.tapError((error) =>
-              Effect.gen(function* () {
-                ctx.activeTurnId = undefined;
-                const completedStamp = yield* makeEventStamp();
-                yield* publishEvent({
-                  ...completedStamp,
-                  provider: PROVIDER,
-                  threadId,
-                  turnId,
-                  type: "turn.completed",
-                  payload: {
-                    state: "failed",
-                    errorMessage: error.detail,
-                  },
-                });
-              }),
-            ),
-          );
-
-          ctx.activeProcess = {
-            kill: () => Effect.asVoid(Effect.ignore(processHandle.kill())),
-          };
-
-          const stderrChunks: Array<string> = [];
-          let hasEmittedText = false;
-          let lastResultError: string | undefined;
-
-          const monitorEffect = Effect.gen(function* () {
-            const runProcessStream = (proc: typeof processHandle) =>
-              Effect.gen(function* () {
-                yield* Stream.runForEach(
-                  proc.stderr.pipe(Stream.decodeText(), Stream.splitLines),
-                  (line) =>
-                    Effect.sync(() => {
-                      const trimmed = line.trim();
-                      if (trimmed) {
-                        stderrChunks.push(trimmed);
-                      }
-                    }),
-                ).pipe(Effect.forkIn(ctx.scope));
-
-                const stdoutLines = proc.stdout.pipe(Stream.decodeText(), Stream.splitLines);
-
-                yield* Stream.runForEach(stdoutLines, (line) =>
-                  Effect.gen(function* () {
-                    const trimmed = line.trim();
-                    if (!trimmed) return;
-
-                    const decoded = decodeJsonExit(trimmed);
-                    if (
-                      Exit.isSuccess(decoded) &&
-                      typeof decoded.value === "object" &&
-                      decoded.value !== null
-                    ) {
-                      const data = decoded.value as Record<string, unknown>;
-                      const stamp = yield* makeEventStamp();
-
-                      if (nativeEventLogger) {
-                        yield* nativeEventLogger.write(data, threadId);
-                      }
-
-                      if (data.event === "init") {
-                        if (typeof data.conversation_id === "string") {
-                          ctx.antigravityConversationId = data.conversation_id;
-                        }
-                        yield* publishEvent({
-                          ...stamp,
-                          provider: PROVIDER,
-                          threadId,
-                          turnId,
-                          type: "session.state.changed",
-                          payload: { state: "running" },
-                        });
-                      } else if (
-                        data.event === "step_update" &&
-                        typeof data.step_update === "object" &&
-                        data.step_update !== null
-                      ) {
-                        const step = data.step_update as Record<string, unknown>;
-                        turnRecord.items.push(step);
-
-                        if (step.step_type === "agent_response") {
-                          if (typeof step.text_delta === "string" && step.text_delta.length > 0) {
-                            hasEmittedText = true;
-                            yield* publishEvent({
-                              ...stamp,
-                              provider: PROVIDER,
-                              threadId,
-                              turnId,
-                              type: "content.delta",
-                              payload: {
-                                streamKind: "assistant_text",
-                                delta: step.text_delta,
-                              },
-                            });
-                          }
-                        } else if (
-                          step.step_type === "tool" &&
-                          typeof step.tool_name === "string"
-                        ) {
-                          const toolItemType = toolNameToItemType(step.tool_name);
-                          const toolInfo =
-                            typeof step.tool_info === "object" && step.tool_info !== null
-                              ? (step.tool_info as Record<string, unknown>)
-                              : undefined;
-                          const toolDetail = toolParamsToDetail(toolInfo?.parameters);
-                          const itemId = RuntimeItemId.make(`step-${step.step_index}`);
-
-                          if (step.state === "ACTIVE") {
-                            yield* publishEvent({
-                              ...stamp,
-                              provider: PROVIDER,
-                              threadId,
-                              turnId,
-                              itemId,
-                              type: "item.started",
-                              payload: {
-                                itemType: toolItemType,
-                                status: "inProgress",
-                                title: step.tool_name,
-                                ...(toolDetail ? { detail: toolDetail } : {}),
-                                ...(toolInfo ? { data: toolInfo } : {}),
-                              },
-                            });
-
-                            if (step.tool_name === "invoke_subagent") {
-                              const stepIdx = Number(step.step_index) || 0;
-                              const stepKey = `s${stepIdx}`;
-                              if (!ctx.subagents.has(stepKey)) {
-                                ctx.subagents.set(stepKey, {
-                                  taskId: RuntimeTaskId.make(`subagent-${threadId}-${stepKey}`),
-                                  role: "Subagent",
-                                  status: "running",
-                                  stepIndex: stepIdx,
-                                });
-                                const parsedList = parseSubagentsParam(toolInfo?.parameters);
-                                const subagentList =
-                                  parsedList.length > 0 ? parsedList : [{ Role: "Subagent" }];
-                                for (let idx = 0; idx < subagentList.length; idx++) {
-                                  const item = subagentList[idx]!;
-                                  const taskId = RuntimeTaskId.make(
-                                    `subagent-${threadId}-s${stepIdx}-i${idx}`,
-                                  );
-                                  const role =
-                                    item.Role ||
-                                    item.role ||
-                                    item.TypeName ||
-                                    item.typeName ||
-                                    "Subagent";
-                                  const prompt = item.Prompt || item.prompt;
-                                  const rawModel = item.Model || item.model;
-                                  const model =
-                                    rawModel && rawModel !== "inherit"
-                                      ? rawModel
-                                      : ctx.session.model || undefined;
-                                  const tracked: TrackedSubagent = {
-                                    taskId,
-                                    role,
-                                    typeName: item.TypeName || item.typeName,
-                                    prompt,
-                                    model,
-                                    status: "running",
-                                    stepIndex: stepIdx,
-                                  };
-                                  ctx.subagents.set(String(taskId), tracked);
-                                  ctx.subagents.set(`s${stepIdx}-i${idx}`, tracked);
-
-                                  yield* publishEvent({
-                                    ...stamp,
-                                    provider: PROVIDER,
-                                    threadId,
-                                    turnId,
-                                    type: "task.started",
-                                    payload: {
-                                      taskId,
-                                      title: role,
-                                      ...(prompt ? { description: prompt.slice(0, 300) } : {}),
-                                      ...(role ? { role } : {}),
-                                      ...(model ? { model } : {}),
-                                      taskType: "subagent",
-                                      agentKind: "agent",
-                                      timelineBypass: false,
-                                    },
-                                  });
-                                }
-                              }
-                            } else if (step.tool_name === "send_message") {
-                              const p = (toolInfo?.parameters ?? {}) as Record<string, unknown>;
-                              const recipient = (p.Recipient || p.recipient) as string | undefined;
-                              const message = (p.Message || p.message) as string | undefined;
-                              if (recipient) {
-                                const tracked = ctx.subagents.get(recipient);
-                                if (tracked && tracked.status === "running") {
-                                  yield* publishEvent({
-                                    ...stamp,
-                                    provider: PROVIDER,
-                                    threadId,
-                                    turnId,
-                                    type: "task.progress",
-                                    payload: {
-                                      taskId: tracked.taskId,
-                                      description: tracked.prompt || tracked.role || "Subagent",
-                                      summary: message
-                                        ? `Sent message: ${message.slice(0, 100)}`
-                                        : "Sent message to subagent",
-                                      lastToolName: "send_message",
-                                      status: "running",
-                                      taskType: "subagent",
-                                      agentKind: "agent",
-                                      ...(tracked.role ? { role: tracked.role } : {}),
-                                      ...(tracked.model ? { model: tracked.model } : {}),
-                                    },
-                                  });
-                                }
-                              }
-                            } else if (step.tool_name === "manage_subagents") {
-                              const p = (toolInfo?.parameters ?? {}) as Record<string, unknown>;
-                              const action = (p.Action || p.action) as string | undefined;
-                              const convIds = (p.ConversationIds ||
-                                p.conversation_ids ||
-                                p.conversationIds) as unknown;
-                              if (action === "kill_all") {
-                                for (const tracked of ctx.subagents.values()) {
-                                  if (tracked.status === "running") {
-                                    tracked.status = "cancelled";
-                                    yield* publishEvent({
-                                      ...stamp,
-                                      provider: PROVIDER,
-                                      threadId,
-                                      turnId,
-                                      type: "task.completed",
-                                      payload: {
-                                        taskId: tracked.taskId,
-                                        status: "cancelled",
-                                        taskType: "subagent",
-                                        agentKind: "agent",
-                                      },
-                                    });
-                                  }
-                                }
-                              } else if (action === "kill" && Array.isArray(convIds)) {
-                                for (const cid of convIds) {
-                                  if (typeof cid === "string") {
-                                    const tracked = ctx.subagents.get(cid);
-                                    if (tracked && tracked.status === "running") {
-                                      tracked.status = "cancelled";
-                                      yield* publishEvent({
-                                        ...stamp,
-                                        provider: PROVIDER,
-                                        threadId,
-                                        turnId,
-                                        type: "task.completed",
-                                        payload: {
-                                          taskId: tracked.taskId,
-                                          status: "cancelled",
-                                          taskType: "subagent",
-                                          agentKind: "agent",
-                                        },
-                                      });
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          } else if (
-                            step.state === "DONE" ||
-                            step.state === "ERROR" ||
-                            step.state === "CANCELLED" ||
-                            step.state === "FAILED"
-                          ) {
-                            yield* publishEvent({
-                              ...stamp,
-                              provider: PROVIDER,
-                              threadId,
-                              turnId,
-                              itemId,
-                              type: "item.completed",
-                              payload: {
-                                itemType: toolItemType,
-                                status: step.state === "DONE" ? "completed" : "failed",
-                                title: step.tool_name,
-                                ...(toolDetail ? { detail: toolDetail } : {}),
-                                ...(toolInfo ? { data: toolInfo } : {}),
-                              },
-                            });
-
-                            if (step.tool_name === "invoke_subagent") {
-                              const stepIdx = Number(step.step_index) || 0;
-                              const stepKey = `s${stepIdx}`;
-                              if (!ctx.subagents.has(stepKey)) {
-                                ctx.subagents.set(stepKey, {
-                                  taskId: RuntimeTaskId.make(`subagent-${threadId}-${stepKey}`),
-                                  role: "Subagent",
-                                  status: "running",
-                                  stepIndex: stepIdx,
-                                });
-                                const parsedList = parseSubagentsParam(toolInfo?.parameters);
-                                const subagentList =
-                                  parsedList.length > 0 ? parsedList : [{ Role: "Subagent" }];
-                                for (let idx = 0; idx < subagentList.length; idx++) {
-                                  const item = subagentList[idx]!;
-                                  const taskId = RuntimeTaskId.make(
-                                    `subagent-${threadId}-s${stepIdx}-i${idx}`,
-                                  );
-                                  const role =
-                                    item.Role ||
-                                    item.role ||
-                                    item.TypeName ||
-                                    item.typeName ||
-                                    "Subagent";
-                                  const prompt = item.Prompt || item.prompt;
-                                  const rawModel = item.Model || item.model;
-                                  const model =
-                                    rawModel && rawModel !== "inherit"
-                                      ? rawModel
-                                      : ctx.session.model || undefined;
-                                  const tracked: TrackedSubagent = {
-                                    taskId,
-                                    role,
-                                    typeName: item.TypeName || item.typeName,
-                                    prompt,
-                                    model,
-                                    status: "running",
-                                    stepIndex: stepIdx,
-                                  };
-                                  ctx.subagents.set(String(taskId), tracked);
-                                  ctx.subagents.set(`s${stepIdx}-i${idx}`, tracked);
-
-                                  yield* publishEvent({
-                                    ...stamp,
-                                    provider: PROVIDER,
-                                    threadId,
-                                    turnId,
-                                    type: "task.started",
-                                    payload: {
-                                      taskId,
-                                      title: role,
-                                      ...(prompt ? { description: prompt.slice(0, 300) } : {}),
-                                      ...(role ? { role } : {}),
-                                      ...(model ? { model } : {}),
-                                      taskType: "subagent",
-                                      agentKind: "agent",
-                                      timelineBypass: false,
-                                    },
-                                  });
-                                }
-                              }
-
-                              const isFailed = step.state !== "DONE";
-                              if (isFailed) {
-                                for (const tracked of ctx.subagents.values()) {
-                                  if (
-                                    tracked.stepIndex === stepIdx &&
-                                    tracked.status === "running"
-                                  ) {
-                                    tracked.status = "failed";
-                                    yield* publishEvent({
-                                      ...stamp,
-                                      provider: PROVIDER,
-                                      threadId,
-                                      turnId,
-                                      type: "task.completed",
-                                      payload: {
-                                        taskId: tracked.taskId,
-                                        status: "failed",
-                                        taskType: "subagent",
-                                        agentKind: "agent",
-                                        error: `Subagent launch failed (${step.state})`,
-                                      },
-                                    });
-                                  }
-                                }
-                              } else {
-                                const output =
-                                  typeof step.content === "string"
-                                    ? step.content
-                                    : typeof toolInfo?.output === "string"
-                                      ? toolInfo.output
-                                      : typeof step.output === "string"
-                                        ? step.output
-                                        : "";
-                                const foundCids = extractConversationIdsFromText(output);
-                                if (foundCids.length > 0) {
-                                  let cIdx = 0;
-                                  for (const tracked of ctx.subagents.values()) {
-                                    if (
-                                      tracked.stepIndex === stepIdx &&
-                                      !tracked.conversationId &&
-                                      cIdx < foundCids.length
-                                    ) {
-                                      const cid = foundCids[cIdx++]!;
-                                      tracked.conversationId = cid;
-                                      ctx.subagents.set(cid, tracked);
-                                    }
-                                  }
-                                }
-                              }
-                            } else if (step.tool_name === "manage_subagents") {
-                              const output =
-                                typeof step.content === "string"
-                                  ? step.content
-                                  : typeof toolInfo?.output === "string"
-                                    ? toolInfo.output
-                                    : typeof step.output === "string"
-                                      ? step.output
-                                      : "";
-                              const listedSubagents = parseSubagentListFromOutput(output);
-                              for (const sub of listedSubagents) {
-                                const cid = sub.conversationId;
-                                if (!cid) continue;
-                                if (KILLED_SUBAGENT_IDS.has(cid)) {
-                                  const tracked = ctx.subagents.get(cid);
-                                  if (tracked) tracked.status = "cancelled";
-                                  continue;
-                                }
-                                const taskId = RuntimeTaskId.make(cid);
-                                const role = sub.role || sub.type || "Subagent";
-                                const rawStatus = sub.state;
-                                const status =
-                                  rawStatus === "completed"
-                                    ? "completed"
-                                    : rawStatus === "errored" || rawStatus === "failed"
-                                      ? "failed"
-                                      : rawStatus === "idle"
-                                        ? "idle"
-                                        : "running";
-
-                                const existingTracked = ctx.subagents.get(cid);
-                                if (existingTracked?.status === "cancelled") {
-                                  continue;
-                                }
-
-                                if (!existingTracked) {
-                                  const tracked: TrackedSubagent = {
-                                    taskId,
-                                    role,
-                                    typeName: sub.type,
-                                    status:
-                                      status === "completed" || status === "failed"
-                                        ? status
-                                        : "running",
-                                    stepIndex: Number(step.step_index) || 0,
-                                  };
-                                  ctx.subagents.set(cid, tracked);
-                                  ctx.subagents.set(String(taskId), tracked);
-
-                                  yield* publishEvent({
-                                    ...stamp,
-                                    provider: PROVIDER,
-                                    threadId,
-                                    turnId,
-                                    type: "task.started",
-                                    payload: {
-                                      taskId,
-                                      title: role,
-                                      role,
-                                      taskType: "subagent",
-                                      agentKind: "agent",
-                                      timelineBypass: false,
-                                      runHandles: {
-                                        runId: cid,
-                                        ...(sub.transcript ? { scriptPath: sub.transcript } : {}),
-                                      },
-                                    },
-                                  });
-                                }
-
-                                const usage = computeSubagentUsage(cid, sub.transcript);
-
-                                if (status === "completed" || status === "failed") {
-                                  yield* publishEvent({
-                                    ...stamp,
-                                    provider: PROVIDER,
-                                    threadId,
-                                    turnId,
-                                    type: "task.completed",
-                                    payload: {
-                                      taskId,
-                                      status,
-                                      taskType: "subagent",
-                                      agentKind: "agent",
-                                      ...(usage ? { typedUsage: usage } : {}),
-                                    },
-                                  });
-                                } else if (sub.stateDetail) {
-                                  yield* publishEvent({
-                                    ...stamp,
-                                    provider: PROVIDER,
-                                    threadId,
-                                    turnId,
-                                    type: "task.progress",
-                                    payload: {
-                                      taskId,
-                                      title: role,
-                                      role,
-                                      summary: sub.stateDetail,
-                                      lastToolName:
-                                        sub.stateDetail.split(":")[0]?.trim() || "subagent",
-                                      status: "running",
-                                      taskType: "subagent",
-                                      agentKind: "agent",
-                                      ...(usage ? { typedUsage: usage } : {}),
-                                    },
-                                  });
-                                }
-                              }
-                            }
-                          }
-                        } else if (step.step_type === "error_message") {
-                          const errorText =
-                            typeof step.error === "string"
-                              ? step.error
-                              : typeof step.content === "string"
-                                ? step.content
-                                : undefined;
-                          if (errorText) {
-                            yield* publishEvent({
-                              ...stamp,
-                              provider: PROVIDER,
-                              threadId,
-                              turnId,
-                              type: "content.delta",
-                              payload: {
-                                streamKind: "assistant_text",
-                                delta: `\n\n> ⚠️ **Antigravity Notice**: ${errorText}\n\n`,
-                              },
-                            });
-                          }
-                        }
-
-                        if (
-                          step.step_type !== "checkpoint" &&
-                          typeof step.usage === "object" &&
-                          step.usage !== null
-                        ) {
-                          const usageSnapshot = parseAntigravityUsageSnapshot(
-                            step.usage,
-                            ctx.lastKnownContextWindow,
-                            ctx.lastKnownTokenUsage,
-                            false,
-                          );
-                          if (usageSnapshot) {
-                            ctx.lastKnownTokenUsage = usageSnapshot;
-                            yield* publishEvent({
-                              ...stamp,
-                              provider: PROVIDER,
-                              threadId,
-                              turnId,
-                              type: "thread.token-usage.updated",
-                              payload: { usage: usageSnapshot },
-                            });
-                          }
-                        }
-                      } else if (
-                        data.event === "result" &&
-                        typeof data.result === "object" &&
-                        data.result !== null
-                      ) {
-                        const resultObj = data.result as Record<string, unknown>;
-                        turnRecord.items.push(resultObj);
-                        if (typeof resultObj.conversation_id === "string") {
-                          ctx.antigravityConversationId = resultObj.conversation_id;
-                        }
-                        if (resultObj.status === "ERROR" && typeof resultObj.error === "string") {
-                          lastResultError = resultObj.error;
-                          const formattedError =
-                            resultObj.error === "timeout waiting for response"
-                              ? "timeout waiting for response (synchronous tool execution exceeded time limit; run long commands/builds in background with WaitMsBeforeAsync or manage_task)"
-                              : resultObj.error;
-                          yield* publishEvent({
-                            ...stamp,
-                            provider: PROVIDER,
-                            threadId,
-                            turnId,
-                            type: "content.delta",
-                            payload: {
-                              streamKind: "assistant_text",
-                              delta: `\n\n**Antigravity Error**: ${formattedError}\n`,
-                            },
-                          });
-                        }
-                        if (
-                          typeof resultObj.response === "string" &&
-                          !hasEmittedText &&
-                          resultObj.response.length > 0
-                        ) {
-                          hasEmittedText = true;
-                          yield* publishEvent({
-                            ...stamp,
-                            provider: PROVIDER,
-                            threadId,
-                            turnId,
-                            type: "content.delta",
-                            payload: {
-                              streamKind: "assistant_text",
-                              delta: resultObj.response,
-                            },
-                          });
-                        }
-                        if (typeof resultObj.usage === "object" && resultObj.usage !== null) {
-                          const usageSnapshot = parseAntigravityUsageSnapshot(
-                            resultObj.usage,
-                            ctx.lastKnownContextWindow,
-                            ctx.lastKnownTokenUsage,
-                            true,
-                          );
-                          if (usageSnapshot) {
-                            ctx.lastKnownTokenUsage = usageSnapshot;
-                            yield* publishEvent({
-                              ...stamp,
-                              provider: PROVIDER,
-                              threadId,
-                              turnId,
-                              type: "thread.token-usage.updated",
-                              payload: { usage: usageSnapshot },
-                            });
-                          }
-                        }
-                      }
-                    }
-                  }),
-                );
-
-                return yield* proc.exitCode;
-              });
-
-            let currentProc = processHandle;
-            let exitCode = yield* runProcessStream(currentProc);
-
-            while (
-              exitCode === 0 &&
-              !lastResultError &&
-              ctx.activeTurnId === turnId &&
-              !ctx.stopped &&
-              ctx.antigravityConversationId
-            ) {
-              const running = [...ctx.subagents.values()].filter(
-                (s) =>
-                  s.status === "running" &&
-                  !KILLED_SUBAGENT_IDS.has(String(s.taskId)) &&
-                  !KILLED_SUBAGENT_IDS.has(s.conversationId || ""),
-              );
-              if (running.length === 0) {
-                break;
-              }
-
-              // Resolve conversation IDs from parent transcript if available
-              for (const tracked of running) {
-                if (!tracked.conversationId && ctx.antigravityConversationId) {
-                  const pPath = findTranscriptPath(ctx.antigravityConversationId);
-                  if (pPath && NodeFS.existsSync(pPath)) {
-                    try {
-                      const raw = NodeFS.readFileSync(pPath, "utf8");
-                      const foundIds = extractConversationIdsFromText(raw);
-                      for (const fid of foundIds) {
-                        if (fid !== ctx.antigravityConversationId && !ctx.subagents.has(fid)) {
-                          tracked.conversationId = fid;
-                          ctx.subagents.set(fid, tracked);
-                          break;
-                        }
-                      }
-                    } catch {}
-                  }
-                }
-              }
-
-              // Only poll if at least one running subagent has an active transcript file on disk
-              const subagentsWithTranscripts = running.filter(
-                (s) => s.conversationId && findTranscriptPath(s.conversationId),
-              );
-
-              if (subagentsWithTranscripts.length === 0) {
-                break;
-              }
-
-              let allDone = false;
-              const pollInterval = Duration.millis(1500);
-              const maxIterations = 400;
-              let iter = 0;
-
-              while (!allDone && iter < maxIterations) {
-                if (ctx.activeTurnId !== turnId || ctx.stopped) {
-                  break;
-                }
-                yield* Effect.sleep(pollInterval);
-                iter++;
-
-                if (ctx.activeTurnId !== turnId || ctx.stopped) {
-                  break;
-                }
-
-                let stillRunningCount = 0;
-                for (const tracked of running) {
-                  if (tracked.status !== "running") continue;
-
-                  if (!tracked.conversationId && ctx.antigravityConversationId) {
-                    const pPath = findTranscriptPath(ctx.antigravityConversationId);
-                    if (pPath && NodeFS.existsSync(pPath)) {
-                      try {
-                        const raw = NodeFS.readFileSync(pPath, "utf8");
-                        const foundIds = extractConversationIdsFromText(raw);
-                        for (const fid of foundIds) {
-                          if (fid !== ctx.antigravityConversationId && !ctx.subagents.has(fid)) {
-                            tracked.conversationId = fid;
-                            ctx.subagents.set(fid, tracked);
-                            break;
-                          }
-                        }
-                      } catch {}
-                    }
-                  }
-
-                  const targetId = tracked.conversationId;
-                  if (targetId) {
-                    const subStatus = checkSubagentTranscriptStatus(targetId);
-                    const usage = computeSubagentUsage(targetId);
-                    const stamp = yield* makeEventStamp();
-
-                    if (subStatus.status === "completed" || subStatus.status === "failed") {
-                      tracked.status = subStatus.status;
-                      yield* publishEvent({
-                        ...stamp,
-                        provider: PROVIDER,
-                        threadId,
-                        turnId,
-                        type: "task.completed",
-                        payload: {
-                          taskId: tracked.taskId,
-                          status: subStatus.status,
-                          taskType: "subagent",
-                          agentKind: "agent",
-                          ...(usage ? { typedUsage: usage } : {}),
-                        },
-                      });
-                    } else {
-                      stillRunningCount++;
-                      if (subStatus.summary) {
-                        yield* publishEvent({
-                          ...stamp,
-                          provider: PROVIDER,
-                          threadId,
-                          turnId,
-                          type: "task.progress",
-                          payload: {
-                            taskId: tracked.taskId,
-                            title: tracked.role,
-                            role: tracked.role,
-                            summary: subStatus.summary,
-                            ...(subStatus.lastToolName
-                              ? { lastToolName: subStatus.lastToolName }
-                              : {}),
-                            status: "running",
-                            taskType: "subagent",
-                            agentKind: "agent",
-                            ...(usage ? { typedUsage: usage } : {}),
-                          },
-                        });
-                      }
-                    }
-                  } else {
-                    stillRunningCount++;
-                  }
-                }
-
-                if (stillRunningCount === 0) {
-                  allDone = true;
-                }
-              }
-
-              if (!allDone || ctx.activeTurnId !== turnId || ctx.stopped) {
-                break;
-              }
-
-              const continuationArgs = [
-                "--output-format",
-                "stream-json",
-                "--print-timeout",
-                "24h",
-                ...(settings.dangerouslySkipPermissions !== false
-                  ? ["--dangerously-skip-permissions"]
-                  : []),
-                ...(ctx.cwd ? ["--add-dir", ctx.cwd] : []),
-                ...(selectedModel ? ["--model", selectedModel] : []),
-                ...(effortSupported && effectiveEffort ? ["--effort", effectiveEffort] : []),
-                "--conversation",
-                ctx.antigravityConversationId,
-                "-p",
-                "",
-              ];
-
-              const continuationSpawnCommand = yield* resolveSpawnCommand(
-                binary,
-                continuationArgs,
-                {
-                  env: processEnv,
-                },
-              ).pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapterProcessError({
-                      provider: PROVIDER,
-                      threadId,
-                      detail: `Failed to resolve continuation spawn command (${binary})`,
-                      cause,
-                    }),
-                ),
-              );
-
-              const continuationCommand = ChildProcess.make(
-                continuationSpawnCommand.command,
-                continuationSpawnCommand.args,
-                {
-                  cwd: ctx.cwd,
-                  env: processEnv,
-                  shell: continuationSpawnCommand.shell,
-                },
-              );
-
-              const nextProcessHandle = yield* childProcessSpawner.spawn(continuationCommand).pipe(
-                Effect.provideService(Scope.Scope, ctx.scope),
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapterProcessError({
-                      provider: PROVIDER,
-                      threadId,
-                      detail: `Failed to spawn continuation Antigravity CLI process (${binary})`,
-                      cause,
-                    }),
-                ),
-              );
-
-              ctx.activeProcess = {
-                kill: () => Effect.asVoid(Effect.ignore(nextProcessHandle.kill())),
-              };
-
-              currentProc = nextProcessHandle;
-              exitCode = yield* runProcessStream(currentProc);
-            }
-
-            const isSuccess =
-              exitCode === 0 && (!lastResultError || hasEmittedText || turnRecord.items.length > 0);
-            const errorDetail =
-              (exitCode !== 0 ? lastResultError : undefined) ||
-              (stderrChunks.length > 0 ? stderrChunks.join("\n") : undefined) ||
-              (!isSuccess ? `Antigravity CLI process exited with code ${exitCode}` : undefined);
-
-            yield* withThreadLock(
-              threadId,
-              Effect.gen(function* () {
-                if (ctx.activeTurnId !== turnId) return;
-                ctx.activeProcess = undefined;
-                ctx.activeTurnId = undefined;
-
-                const completedStamp = yield* makeEventStamp();
-                yield* publishEvent({
-                  ...completedStamp,
-                  provider: PROVIDER,
-                  threadId,
-                  turnId,
-                  type: "turn.completed",
-                  payload: {
-                    state: isSuccess ? "completed" : "failed",
-                    ...(!isSuccess ? { errorMessage: errorDetail } : {}),
-                  },
-                });
+            threadId: context.threadId,
+            turnId: context.activeTurnId,
+            itemId: event.itemId,
+            lifecycle: event._tag === "AssistantItemStarted" ? "item.started" : "item.completed",
+          }),
+        );
+        return;
+      case "ThoughtDelta":
+      case "ContentDelta":
+        yield* emit(
+          makeAcpContentDeltaEvent({
+            stamp: yield* stamp,
+            provider: PROVIDER,
+            threadId: context.threadId,
+            turnId: context.activeTurnId,
+            ...(event._tag === "ContentDelta" && event.itemId ? { itemId: event.itemId } : {}),
+            ...(event._tag === "ThoughtDelta" ? { streamKind: "reasoning_text" } : {}),
+            text: event.text,
+            rawPayload: sanitizeAntigravityToolPayload(event.rawPayload),
+          }),
+        );
+        return;
+      case "PlanUpdated":
+        yield* emit(
+          makeAcpPlanUpdatedEvent({
+            stamp: yield* stamp,
+            provider: PROVIDER,
+            threadId: context.threadId,
+            turnId: context.activeTurnId,
+            payload: event.payload,
+            source: "acp.jsonrpc",
+            method: "session/update",
+            rawPayload: sanitizeAntigravityToolPayload(event.rawPayload),
+          }),
+        );
+        return;
+      case "ToolCallUpdated":
+        yield* context.commandLock.withPermit(
+          Effect.gen(function* () {
+            const toolCall = normalizeAntigravityToolCall(event.toolCall);
+            const existing = context.commands.get(toolCall.toolCallId);
+            yield* emit(
+              makeAcpToolCallEvent({
+                stamp: yield* stamp,
+                provider: PROVIDER,
+                threadId: context.threadId,
+                turnId: existing?.turnId ?? context.activeTurnId,
+                toolCall,
+                rawPayload: sanitizeAntigravityToolPayload(event.rawPayload),
               }),
             );
-          }).pipe(
-            Effect.catchCause((cause) =>
-              withThreadLock(
-                threadId,
-                Effect.gen(function* () {
-                  if (Cause.hasInterruptsOnly(cause)) {
-                    return yield* Effect.failCause(cause);
-                  }
-                  if (ctx.activeTurnId !== turnId) return;
-                  if (ctx.activeProcess) {
-                    yield* ctx.activeProcess.kill();
-                    ctx.activeProcess = undefined;
-                  }
-                  ctx.activeTurnId = undefined;
-
-                  const completedStamp = yield* makeEventStamp();
-                  yield* publishEvent({
-                    ...completedStamp,
-                    provider: PROVIDER,
-                    threadId,
-                    turnId,
-                    type: "turn.completed",
-                    payload: {
-                      state: "failed",
-                      errorMessage: "Antigravity CLI process monitor failed.",
-                    },
-                  });
-                  yield* Effect.logWarning("Antigravity process monitor failed", {
-                    cause,
-                  });
-                }),
-              ),
-            ),
-          );
-
-          yield* Effect.forkIn(monitorEffect, ctx.scope);
-
-          return {
-            threadId,
-            turnId,
-          };
-        }),
-      );
-
-    const interruptTurn: AntigravityAdapterShape["interruptTurn"] = (threadId, turnId) =>
-      withThreadLock(
-        threadId,
-        Effect.gen(function* () {
-          const ctx = sessions.get(threadId);
-          if (!ctx) {
-            if (turnId) {
-              const stamp = yield* makeEventStamp();
-              yield* publishEvent({
-                ...stamp,
-                provider: PROVIDER,
-                threadId,
-                turnId,
-                type: "turn.aborted",
-                payload: {
-                  reason: "Turn interrupted by user",
-                },
+            if (isAntigravityOpenCommand(toolCall)) {
+              context.commands.set(toolCall.toolCallId, {
+                toolCall,
+                turnId: existing?.turnId ?? context.activeTurnId,
+                promoted: existing?.promoted ?? false,
               });
-              yield* publishEvent({
-                ...stamp,
-                provider: PROVIDER,
-                threadId,
-                turnId,
-                type: "turn.completed",
-                payload: {
-                  state: "interrupted",
-                },
-              });
+            } else if (toolCall.status === "completed" || toolCall.status === "failed") {
+              context.commands.delete(toolCall.toolCallId);
+              if (existing?.promoted) {
+                yield* emit({
+                  type: "task.completed",
+                  ...(yield* stamp),
+                  provider: PROVIDER,
+                  threadId: context.threadId,
+                  turnId: existing.turnId,
+                  payload: {
+                    taskId: RuntimeTaskId.make(toolCall.toolCallId),
+                    taskType: "local_bash",
+                    toolUseId: toolCall.toolCallId,
+                    status: toolCall.status === "failed" ? "failed" : "completed",
+                  },
+                });
+              }
             }
-            return;
-          }
+          }),
+        );
+        return;
+    }
+  });
 
-          if (turnId !== undefined && ctx.activeTurnId !== turnId) {
-            return;
-          }
-
-          const effectiveTurnId = turnId ?? ctx.activeTurnId;
-          if (ctx.activeProcess) {
-            yield* ctx.activeProcess.kill();
-            ctx.activeProcess = undefined;
-          }
-
-          if (effectiveTurnId) {
-            ctx.activeTurnId = undefined;
-            const stamp = yield* makeEventStamp();
-
-            yield* publishEvent({
-              ...stamp,
-              provider: PROVIDER,
-              threadId,
-              turnId: effectiveTurnId,
-              type: "turn.aborted",
-              payload: {
-                reason: "Turn interrupted by user",
-              },
-            });
-
-            yield* publishEvent({
-              ...stamp,
-              provider: PROVIDER,
-              threadId,
-              turnId: effectiveTurnId,
-              type: "turn.completed",
-              payload: {
-                state: "interrupted",
-              },
-            });
-          }
-        }),
-      );
-
-    const respondToRequest: AntigravityAdapterShape["respondToRequest"] = () => Effect.void;
-
-    const respondToUserInput: AntigravityAdapterShape["respondToUserInput"] = () => Effect.void;
-
-    const stopSessionInternal = (
-      ctx: AntigravitySessionContext,
-    ): Effect.Effect<void, ProviderAdapterError, never> =>
+  const startSession: Adapter["startSession"] = (input) =>
+    withThreadLock(
+      input.threadId,
       Effect.gen(function* () {
-        ctx.stopped = true;
-        if (ctx.activeProcess) {
-          yield* ctx.activeProcess.kill();
-          ctx.activeProcess = undefined;
-        }
-
-        yield* Scope.close(ctx.scope, Exit.void).pipe(Effect.ignore);
-        sessions.delete(ctx.threadId);
-
-        const stamp = yield* makeEventStamp();
-        yield* publishEvent({
-          ...stamp,
-          provider: PROVIDER,
-          threadId: ctx.threadId,
-          type: "session.exited",
-          payload: {
-            exitKind: "graceful",
-          },
-        });
-      });
-
-    const stopSession: AntigravityAdapterShape["stopSession"] = (threadId) =>
-      withThreadLock(
-        threadId,
-        Effect.gen(function* () {
-          const ctx = sessions.get(threadId);
-          if (!ctx) {
-            const stamp = yield* makeEventStamp();
-            yield* publishEvent({
-              ...stamp,
-              provider: PROVIDER,
-              threadId,
-              type: "session.exited",
-              payload: {
-                exitKind: "graceful",
-              },
-            });
-            return;
-          }
-          yield* stopSessionInternal(ctx);
-        }),
-      );
-
-    const listSessions: AntigravityAdapterShape["listSessions"] = () =>
-      Effect.sync(() => Array.from(sessions.values(), (c) => ({ ...c.session })));
-
-    const hasSession: AntigravityAdapterShape["hasSession"] = (threadId) =>
-      Effect.sync(() => {
-        const c = sessions.get(threadId);
-        return c !== undefined && !c.stopped;
-      });
-
-    const readThread: AntigravityAdapterShape["readThread"] = (threadId) =>
-      Effect.gen(function* () {
-        const ctx = yield* requireSession(threadId);
-        return {
-          threadId,
-          turns: ctx.turns.map((turn) => ({
-            id: turn.id,
-            items: turn.items,
-          })),
-        };
-      });
-
-    const rollbackThread: AntigravityAdapterShape["rollbackThread"] = (threadId, numTurns) =>
-      Effect.gen(function* () {
-        const ctx = yield* requireSession(threadId);
-        if (!Number.isInteger(numTurns) || numTurns < 1) {
+        if (!settings.enabled) {
           return yield* new ProviderAdapterValidationError({
             provider: PROVIDER,
-            operation: "rollbackThread",
-            issue: "numTurns must be an integer >= 1.",
+            operation: "startSession",
+            issue: "Enable Antigravity in provider settings before starting a thread.",
           });
         }
-        return yield* new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method: "thread/rollback",
-          detail: "Antigravity CLI sessions do not support provider-side rollback.",
+        if (
+          (input.provider !== undefined && input.provider !== PROVIDER) ||
+          (input.providerInstanceId !== undefined &&
+            input.providerInstanceId !== options.instanceId) ||
+          (input.modelSelection !== undefined &&
+            input.modelSelection.instanceId !== options.instanceId)
+        ) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "The Antigravity provider instance does not match the requested session.",
+          });
+        }
+        if (!input.cwd?.trim()) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "The session requires a workspace directory.",
+          });
+        }
+        const cursor = decodeResumeCursor(input.resumeCursor);
+        if (input.resumeCursor !== undefined && Option.isNone(cursor)) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "The saved Antigravity session is invalid. Start a new thread.",
+          });
+        }
+        const previous = sessions.get(input.threadId);
+        if (previous) yield* stopContext(previous);
+        const cwd = path.resolve(input.cwd);
+        const sessionScope = yield* Scope.make("sequential");
+        let transferred = false;
+        let context: SessionContext | undefined;
+        yield* Effect.addFinalizer(() => {
+          if (transferred) return Effect.void;
+          sessions.delete(input.threadId);
+          return Scope.close(sessionScope, Exit.void);
         });
+        const stopOwned = Effect.suspend(() =>
+          context ? stopContext(context).pipe(Effect.ignore) : Scope.close(sessionScope, Exit.void),
+        );
+
+        return yield* options
+          .withProcess(
+            stopOwned,
+            Effect.gen(function* () {
+              const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
+              // The attachments dir grant lets the agent read pasted files at
+              // the paths ProviderService injects into the turn text. It is a
+              // leaf directory holding only uploads.
+              const runtime = yield* options.makeRuntime({
+                cwd,
+                clientInfo: { name: "t3-code", version: "0.0.0" },
+                clientFileSystem: true,
+                additionalDirectories: [serverConfig.attachmentsDir],
+                ...(Option.isSome(cursor) ? { resumeSessionId: cursor.value.sessionId } : {}),
+                mcpServers: mcp
+                  ? [
+                      {
+                        type: "http",
+                        name: "t3-code",
+                        url: mcp.endpoint,
+                        headers: [{ name: "Authorization", value: mcp.authorizationHeader }],
+                      },
+                    ]
+                  : [],
+                ...makeNativeLoggers({
+                  nativeEventLogger: options.nativeEventLogger,
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                }),
+              });
+              // Workspace file access requested through the client fs
+              // capability. The agent gates each write behind
+              // `session/request_permission`, so only path containment is
+              // checked here.
+              const allowedRoots = [cwd, serverConfig.attachmentsDir];
+              yield* runtime.handleReadTextFile((request) =>
+                readClientTextFile({ fileSystem, path, allowedRoots, request }),
+              );
+              yield* runtime.handleWriteTextFile((request) =>
+                writeClientTextFile({ fileSystem, path, allowedRoots, request }),
+              );
+              yield* runtime.handleRequestPermission((request) =>
+                context
+                  ? handlePermission(context, request).pipe(
+                      Effect.mapError((cause) =>
+                        EffectAcpErrors.AcpRequestError.internalError(
+                          "Could not process an Antigravity permission request.",
+                          undefined,
+                          { cause },
+                        ),
+                      ),
+                    )
+                  : Effect.succeed({
+                      outcome: { outcome: "cancelled" },
+                    } satisfies NativePermissionResponse),
+              );
+              const started = yield* runtime.start();
+              const model = yield* applyAntigravityAcpModelSelection({
+                runtime,
+                model: input.modelSelection?.model,
+                defaultModel: yield* options.defaultModel ?? Effect.succeed(undefined),
+                mapError: (cause) => cause,
+              });
+              yield* runtime.setMode(antigravityPermissionMode(input.runtimeMode));
+              yield* options.onSessionStarted?.(started, cwd) ?? Effect.void;
+              const createdAt = yield* nowIso;
+              const session: ProviderSession = {
+                provider: PROVIDER,
+                providerInstanceId: options.instanceId,
+                threadId: input.threadId,
+                cwd,
+                status: "ready",
+                runtimeMode: input.runtimeMode,
+                ...(model ? { model } : {}),
+                resumeCursor: { schemaVersion: 1, sessionId: started.sessionId },
+                createdAt,
+                updatedAt: createdAt,
+              };
+              context = {
+                threadId: input.threadId,
+                cwd,
+                nativeSessionId: started.sessionId,
+                scope: sessionScope,
+                runtime,
+                promptLock: yield* Semaphore.make(1),
+                stopLock: yield* Semaphore.make(1),
+                commandLock: yield* Semaphore.make(1),
+                approvals: new Map(),
+                questions: new Map(),
+                commands: new Map(),
+                turns: [],
+                session,
+                activeTurnId: undefined,
+                promptFiber: undefined,
+                generation: 0,
+                stopped: false,
+                closed: false,
+                disconnected: false,
+              };
+              const running = context;
+              sessions.set(input.threadId, running);
+              yield* Stream.runForEach(runtime.getEvents(), (event) =>
+                handleEvent(running, event),
+              ).pipe(
+                Effect.catchCause(() =>
+                  Effect.logError("Could not process an Antigravity runtime event."),
+                ),
+                Effect.forkIn(sessionScope),
+              );
+              yield* emit({
+                type: "session.started",
+                ...(yield* stamp),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                payload: { resume: started.initializeResult },
+              });
+              yield* emit({
+                type: "session.state.changed",
+                ...(yield* stamp),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                payload: { state: "ready", reason: "Antigravity ACP session ready" },
+              });
+              yield* emit({
+                type: "thread.started",
+                ...(yield* stamp),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                payload: { providerThreadId: started.sessionId },
+              });
+              yield* runtime.drainEvents;
+              if (running.stopped) {
+                return yield* new ProviderAdapterSessionClosedError({
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                });
+              }
+              transferred = true;
+              return session;
+            }),
+          )
+          .pipe(
+            Effect.provideService(Scope.Scope, sessionScope),
+            Effect.tapError((cause) =>
+              isAntigravitySignInRequiredError(cause)
+                ? (options.onAuthRequired ?? Effect.void)
+                : Effect.void,
+            ),
+            Effect.mapError((cause) =>
+              isAcpError(cause)
+                ? mapAntigravityError(input.threadId, "session/start", cause)
+                : new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "session/start",
+                    detail: "Could not start Antigravity. Check the provider setup status.",
+                    cause,
+                  }),
+            ),
+          );
+      }).pipe(Effect.scoped),
+    );
+
+  const promoteBackgroundCommands = (context: SessionContext) =>
+    context.commandLock.withPermit(
+      Effect.gen(function* () {
+        for (const [id, command] of context.commands) {
+          if (command.promoted) continue;
+          yield* emit({
+            type: "task.started",
+            ...(yield* stamp),
+            provider: PROVIDER,
+            threadId: context.threadId,
+            turnId: command.turnId,
+            payload: {
+              taskId: RuntimeTaskId.make(id),
+              taskType: "local_bash",
+              toolUseId: id,
+              description:
+                command.toolCall.command ?? command.toolCall.title ?? "Antigravity command",
+            },
+          });
+          context.commands.set(id, { ...command, promoted: true });
+        }
+      }),
+    );
+
+  const sendTurn: Adapter["sendTurn"] = Effect.fn("AntigravityAdapter.sendTurn")(function* (input) {
+    const context = yield* requireSession(input.threadId);
+    if (input.modelSelection && input.modelSelection.instanceId !== options.instanceId) {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "sendTurn",
+        issue: "The selected model belongs to another provider instance.",
       });
+    }
+    const prompt = yield* buildAntigravityPrompt({
+      input: input.input,
+      attachments: input.attachments,
+      attachmentsDir: serverConfig.attachmentsDir,
+    }).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+      Effect.mapError((cause) => mapAntigravityError(input.threadId, "session/prompt", cause)),
+    );
+    let intent: TurnIntent | undefined;
+    // The caller holds promptLock while it changes or settles the active turn.
+    const finishTurn = (turn: TurnIntent, payload: TurnCompletedPayload) =>
+      Effect.gen(function* () {
+        if (turn.settled || context.stopped || context.generation !== turn.generation) return;
+        turn.settled = true;
+        yield* promoteBackgroundCommands(context);
+        context.activeTurnId = undefined;
+        context.promptFiber = undefined;
+        context.session = {
+          ...context.session,
+          status: payload.state === "failed" ? "error" : "ready",
+          activeTurnId: undefined,
+          updatedAt: yield* nowIso,
+          ...(payload.errorMessage
+            ? { lastError: payload.errorMessage }
+            : { lastError: undefined }),
+        };
+        yield* emit({
+          type: "turn.completed",
+          ...(yield* stamp),
+          provider: PROVIDER,
+          threadId: input.threadId,
+          turnId: turn.turnId,
+          payload,
+        });
+      }).pipe(Effect.uninterruptible);
 
-    const stopAll: AntigravityAdapterShape["stopAll"] = () =>
-      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true });
-
-    yield* Effect.addFinalizer(() =>
-      Effect.ignore(stopAll()).pipe(
-        Effect.tap(() => Queue.shutdown(runtimeEventQueue)),
-        Effect.tap(() =>
-          managedNativeEventLogger ? managedNativeEventLogger.close() : Effect.void,
+    return yield* Effect.gen(function* () {
+      const launch = yield* context.promptLock.withPermit(
+        Effect.gen(function* () {
+          yield* requireSession(input.threadId);
+          const requestedModel = input.modelSelection?.model ?? context.session.model;
+          const configOptions = yield* context.runtime.getConfigOptions;
+          const model = resolveAntigravityModel({
+            configOptions,
+            model: requestedModel,
+            defaultModel: yield* options.defaultModel ?? Effect.succeed(undefined),
+          });
+          const availableModels = antigravityModelOptions(configOptions);
+          if (model && !availableModels.some((option) => option.value === model)) {
+            return yield* EffectAcpErrors.AcpRequestError.invalidParams(
+              `Antigravity model '${model}' is unavailable for this Google account. Select an available model.`,
+            );
+          }
+          const turnId = context.activeTurnId ?? TurnId.make(yield* randomId);
+          const steering = context.activeTurnId !== undefined;
+          const turn: TurnIntent = { turnId, generation: ++context.generation, settled: false };
+          intent = turn;
+          context.activeTurnId = turnId;
+          if (!steering) {
+            yield* emit({
+              type: "turn.started",
+              ...(yield* stamp),
+              provider: PROVIDER,
+              threadId: input.threadId,
+              turnId,
+              payload: model ? { model } : {},
+            });
+          }
+          if (context.promptFiber) {
+            yield* cancelRequests(context);
+            yield* context.runtime.cancel;
+            yield* Fiber.await(context.promptFiber);
+          }
+          yield* applyAntigravityAcpModelSelection({
+            runtime: context.runtime,
+            model,
+            mapError: (cause) => cause,
+          });
+          yield* context.runtime.setMode(antigravityPermissionMode(context.session.runtimeMode));
+          context.session = {
+            ...context.session,
+            status: "running",
+            activeTurnId: turnId,
+            ...(model ? { model } : {}),
+            updatedAt: yield* nowIso,
+          };
+          const dispatched = yield* Deferred.make<void>();
+          const fiber = yield* context.runtime
+            .prompt({ prompt }, { dispatched })
+            .pipe(Effect.forkIn(context.scope));
+          context.promptFiber = fiber;
+          // Fiber.join can skip a scope-close waiter when the child is interrupted.
+          // Unwrap the Exit after Fiber.await returns.
+          yield* Effect.raceFirst(
+            Deferred.await(dispatched),
+            Fiber.await(fiber).pipe(
+              Effect.flatMap((exit) => exit),
+              Effect.asVoid,
+            ),
+          );
+          return { turn, fiber };
+        }),
+      );
+      const result = yield* Fiber.await(launch.fiber).pipe(Effect.flatMap((exit) => exit));
+      yield* context.runtime.drainEvents;
+      if (context.stopped) {
+        return yield* new ProviderAdapterSessionClosedError({
+          provider: PROVIDER,
+          threadId: input.threadId,
+        });
+      }
+      const record = context.turns.find((turn) => turn.id === launch.turn.turnId);
+      if (record) record.items.push(result);
+      else context.turns.push({ id: launch.turn.turnId, items: [result] });
+      yield* context.promptLock.withPermit(
+        finishTurn(launch.turn, {
+          state: result.stopReason === "cancelled" ? "cancelled" : "completed",
+          stopReason: result.stopReason,
+        }),
+      );
+      return {
+        threadId: input.threadId,
+        turnId: launch.turn.turnId,
+        resumeCursor: context.session.resumeCursor,
+      };
+    }).pipe(
+      Effect.tapError((cause) =>
+        isAntigravitySignInRequiredError(cause)
+          ? (options.onAuthRequired ?? Effect.void)
+          : Effect.void,
+      ),
+      Effect.mapError((cause) =>
+        isAcpError(cause) ? mapAntigravityError(input.threadId, "session/prompt", cause) : cause,
+      ),
+      Effect.tapError((cause) =>
+        Effect.suspend(() =>
+          intent
+            ? context.promptLock.withPermit(
+                finishTurn(intent, { state: "failed", errorMessage: cause.message }),
+              )
+            : Effect.void,
+        ),
+      ),
+      Effect.onInterrupt(() =>
+        context.promptLock.withPermit(
+          Effect.gen(function* () {
+            const turn = intent;
+            if (!turn || turn.settled || context.stopped || context.generation !== turn.generation)
+              return;
+            const promptFiber = context.promptFiber;
+            yield* cancelRequests(context);
+            yield* Effect.ignore(context.runtime.cancel);
+            if (promptFiber) yield* Fiber.interrupt(promptFiber);
+            yield* finishTurn(turn, { state: "cancelled", stopReason: "cancelled" });
+          }),
         ),
       ),
     );
-
-    const streamEvents = Stream.fromQueue(runtimeEventQueue);
-
-    return {
-      provider: PROVIDER,
-      capabilities: {
-        sessionModelSwitch: "in-session",
-      },
-      startSession,
-      sendTurn,
-      interruptTurn,
-      respondToRequest,
-      respondToUserInput,
-      stopSession,
-      listSessions,
-      hasSession,
-      readThread,
-      rollbackThread,
-      stopAll,
-      streamEvents,
-    } satisfies AntigravityAdapterShape;
   });
-}
+
+  const interruptTurn: Adapter["interruptTurn"] = (threadId) =>
+    Effect.gen(function* () {
+      const context = yield* requireSession(threadId);
+      yield* context.promptLock
+        .withPermit(
+          Effect.gen(function* () {
+            yield* cancelRequests(context);
+            yield* context.runtime.cancel;
+          }),
+        )
+        .pipe(Effect.mapError((cause) => mapAntigravityError(threadId, "session/cancel", cause)));
+    });
+
+  const respondToRequest: Adapter["respondToRequest"] = (threadId, requestId, decision) =>
+    Effect.gen(function* () {
+      const context = yield* requireSession(threadId);
+      const pending = context.approvals.get(requestId);
+      if (!pending) {
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "session/request_permission",
+          detail: "This approval request is no longer pending.",
+        });
+      }
+      const optionId =
+        decision === "cancel"
+          ? undefined
+          : selectAntigravityPermissionOptionId(pending.request, decision);
+      if (decision !== "cancel" && optionId === undefined) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "respondToRequest",
+          issue:
+            "Antigravity did not offer this permission choice. Select one of the available choices.",
+        });
+      }
+      yield* Deferred.succeed(pending.response, {
+        decision,
+        result: {
+          outcome:
+            optionId === undefined ? { outcome: "cancelled" } : { outcome: "selected", optionId },
+        },
+      });
+    });
+
+  const respondToUserInput: Adapter["respondToUserInput"] = (threadId, requestId, answers) =>
+    Effect.gen(function* () {
+      const context = yield* requireSession(threadId);
+      const pending = context.questions.get(requestId);
+      if (!pending) {
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "session/request_permission",
+          detail: "This question is no longer pending.",
+        });
+      }
+      const result = makeAntigravityUserInputResponse(pending.request, answers);
+      if (!result) {
+        return yield* new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "respondToUserInput",
+          issue:
+            "Select one of Antigravity's offered answers. Custom answers are not supported for this question.",
+        });
+      }
+      yield* Deferred.succeed(pending.response, { answers, result });
+    });
+
+  const stopSession: Adapter["stopSession"] = (threadId) =>
+    withThreadLock(threadId, Effect.flatMap(requireSession(threadId), stopContext));
+  const stopAll: Adapter["stopAll"] = () =>
+    Effect.forEach([...sessions.values()], stopContext, { discard: true });
+  yield* Effect.addFinalizer(() =>
+    stopAll().pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterrupts(cause)
+          ? Effect.void
+          : Effect.logError("Could not stop an Antigravity session."),
+      ),
+      Effect.ensuring(PubSub.shutdown(events)),
+    ),
+  );
+
+  return {
+    provider: PROVIDER,
+    capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: false },
+    startSession,
+    sendTurn,
+    interruptTurn,
+    respondToRequest,
+    respondToUserInput,
+    stopSession,
+    stopAll,
+    listSessions: () =>
+      Effect.sync(() =>
+        [...sessions.values()]
+          .filter((context) => !context.stopped)
+          .map((context) => ({ ...context.session })),
+      ),
+    hasSession: (threadId) =>
+      Effect.sync(() => sessions.has(threadId) && !sessions.get(threadId)?.stopped),
+    readThread: (threadId) =>
+      Effect.map(requireSession(threadId), (context) => ({ threadId, turns: context.turns })),
+    rollbackThread: (_threadId: ThreadId, _numTurns: number) =>
+      Effect.fail(
+        new ProviderAdapterValidationError({
+          provider: PROVIDER,
+          operation: "rollbackThread",
+          issue: "Antigravity does not support conversation rewind. Start a new thread instead.",
+        }),
+      ),
+    streamEvents: Stream.fromPubSub(events),
+  } satisfies Adapter;
+});

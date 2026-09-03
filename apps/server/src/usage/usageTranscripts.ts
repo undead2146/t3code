@@ -492,7 +492,7 @@ export function parseAntigravityLine(
   return {
     provider: "antigravity",
     timestampMs,
-    model: state.model || "gemini-3.7-flash",
+    model: state.model || "gemini-3.8-flash",
     sessionId: state.sessionId,
     totals,
     reportedCostUsd,

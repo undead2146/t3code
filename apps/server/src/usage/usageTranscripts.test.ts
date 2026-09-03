@@ -246,11 +246,11 @@ describe("parseAntigravityLine", () => {
     const initLine = JSON.stringify({
       event: "init",
       conversation_id: "conv-agy-1",
-      init: { model: "gemini-3.7-flash" },
+      init: { model: "gemini-3.8-flash" },
     });
     expect(parseAntigravityLine(initLine, state)).toBeNull();
     expect(state.sessionId).toBe("conv-agy-1");
-    expect(state.model).toBe("gemini-3.7-flash");
+    expect(state.model).toBe("gemini-3.8-flash");
 
     const stepLine = JSON.stringify({
       event: "step_update",
@@ -273,7 +273,7 @@ describe("parseAntigravityLine", () => {
     const record = parseAntigravityLine(stepLine, state);
     expect(record).not.toBeNull();
     expect(record?.provider).toBe("antigravity");
-    expect(record?.model).toBe("gemini-3.7-flash");
+    expect(record?.model).toBe("gemini-3.8-flash");
     expect(record?.sessionId).toBe("conv-agy-1");
     expect(record?.totals).toEqual({
       uncachedInputTokens: 5000,

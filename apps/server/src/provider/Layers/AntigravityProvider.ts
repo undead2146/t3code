@@ -1,450 +1,377 @@
-import * as NodeFS from "node:fs";
 import {
+  ANTIGRAVITY_DEFAULT_MODEL,
+  ProviderDriverKind,
   type AntigravitySettings,
-  type ModelCapabilities,
-  type ModelSelection,
+  type ProviderSetupError,
   type ServerProvider,
   type ServerProviderModel,
+  type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
-import { causeErrorTag } from "@t3tools/shared/observability";
-import * as Crypto from "effect/Crypto";
+import { createModelCapabilities } from "@t3tools/shared/model";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
 import * as Result from "effect/Result";
-import { HttpClient } from "effect/unstable/http";
-import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import { createModelCapabilities, getModelSelectionStringOptionValue } from "@t3tools/shared/model";
-import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
+import type * as EffectAcpErrors from "effect-acp/errors";
+import type * as EffectAcpSchema from "effect-acp/schema";
 
+import type { AcpSessionRuntimeStartResult } from "../acp/AcpSessionRuntime.ts";
+import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
-  buildSelectOptionDescriptor,
-  buildServerProvider,
-  isCommandMissingCause,
-  parseGenericCliVersion,
-  providerModelsFromSettings,
-  spawnAndCollect,
-  type ServerProviderDraft,
-} from "../providerSnapshot.ts";
-import {
-  enrichProviderSnapshotWithVersionAdvisory,
+  makeManualOnlyProviderMaintenanceCapabilities,
   type ProviderMaintenanceCapabilities,
 } from "../providerMaintenance.ts";
+import {
+  buildServerProvider,
+  isCommandMissingCause,
+  type ServerProviderDraft,
+} from "../providerSnapshot.ts";
 
-const ANTIGRAVITY_PRESENTATION = {
-  displayName: "Antigravity",
-  badgeLabel: "Gemini",
-  showInteractionModeToggle: true,
-  requiresNewThreadForModelChange: false,
-} as const;
+const EMPTY_MODEL_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
+const MAX_WORKSPACE_SNAPSHOTS = 32;
+const SIGN_IN_MESSAGE = "Sign in with Google to use Antigravity.";
+const AUTH_UNCHECKED_MESSAGE =
+  "Antigravity is installed. Google account access is not checked yet.";
 
-const ANTIGRAVITY_EFFORT_DESCRIPTOR = buildSelectOptionDescriptor({
-  id: "effort",
-  label: "Reasoning",
-  options: [
-    { value: "low", label: "Low" },
-    { value: "medium", label: "Medium", isDefault: true },
-    { value: "high", label: "High" },
-  ],
-});
+type SessionSetupResult = AcpSessionRuntimeStartResult["sessionSetupResult"];
 
-export function isAntigravityEffortSupported(modelSlug?: string): boolean {
-  if (!modelSlug) return true;
-  const slug = modelSlug.toLowerCase();
-  if (slug.includes("claude") || slug.includes("gpt") || slug.includes("-thinking")) {
-    return false;
-  }
-  return slug.startsWith("gemini") || !slug.match(/-(low|medium|high)$/i);
-}
-
-export function getAntigravityModelCapabilities(slug?: string): ModelCapabilities {
-  if (slug && !isAntigravityEffortSupported(slug)) {
-    return createModelCapabilities({
-      optionDescriptors: [],
-    });
-  }
-  return createModelCapabilities({
-    optionDescriptors: [ANTIGRAVITY_EFFORT_DESCRIPTOR],
+/** Keep the native model IDs, including model-specific thinking levels. */
+export function buildAntigravityModelsFromSession(
+  setup: SessionSetupResult,
+): ReadonlyArray<ServerProviderModel> {
+  const config = setup.configOptions?.find(
+    (option) => option.id === "model" || option.category === "model",
+  );
+  const currentValue =
+    config?.type === "select" ? config.currentValue : setup.models?.currentModelId;
+  const entries =
+    config?.type === "select"
+      ? config.options.flatMap((entry) => ("value" in entry ? [entry] : entry.options))
+      : config === undefined
+        ? (setup.models?.availableModels.map((model) => ({
+            value: model.modelId,
+            name: model.name,
+          })) ?? [])
+        : [];
+  const seen = new Set<string>();
+  return entries.flatMap((entry): ServerProviderModel[] => {
+    if (!entry.value.trim() || seen.has(entry.value)) return [];
+    seen.add(entry.value);
+    return [
+      {
+        slug: entry.value,
+        name: entry.name.trim() ? entry.name : entry.value,
+        isCustom: false,
+        ...(entry.value === currentValue
+          ? { isDefault: true, aliases: [ANTIGRAVITY_DEFAULT_MODEL] }
+          : {}),
+        capabilities: EMPTY_MODEL_CAPABILITIES,
+      },
+    ];
   });
 }
 
-const ANTIGRAVITY_CAPABILITIES: ModelCapabilities = getAntigravityModelCapabilities();
-
-export function resolveAntigravityContextWindow(
-  modelSelection: ModelSelection | { model?: string; options?: unknown } | undefined,
-): number {
-  const model = modelSelection?.model?.toLowerCase() ?? "";
-  if (model.includes("claude")) return 200_000;
-  if (model.includes("gpt")) return 128_000;
-  return 1_000_000;
+function nativeCommands(
+  commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
+): ReadonlyArray<ServerProviderSlashCommand> {
+  const seen = new Set<string>();
+  return commands.flatMap((command): ServerProviderSlashCommand[] => {
+    if (!command.name.trim() || seen.has(command.name)) return [];
+    seen.add(command.name);
+    const description = command.description.trim();
+    const hint = command.input?.hint.trim();
+    return [
+      {
+        name: command.name,
+        ...(description ? { description } : {}),
+        ...(hint ? { input: { hint } } : {}),
+      },
+    ];
+  });
 }
 
-const VERSION_PROBE_TIMEOUT_MS = 15_000;
-
-const ANTIGRAVITY_BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
-  {
-    slug: "gemini-3.7-flash",
-    name: "Gemini 3.7 Flash",
-    isCustom: false,
-    capabilities: getAntigravityModelCapabilities("gemini-3.7-flash"),
-  },
-  {
-    slug: "gemini-3.6-flash",
-    name: "Gemini 3.6 Flash",
-    isCustom: false,
-    capabilities: getAntigravityModelCapabilities("gemini-3.6-flash"),
-  },
-  {
-    slug: "gemini-3.5-flash",
-    name: "Gemini 3.5 Flash",
-    isCustom: false,
-    capabilities: getAntigravityModelCapabilities("gemini-3.5-flash"),
-  },
-  {
-    slug: "gemini-3.1-pro",
-    name: "Gemini 3.1 Pro",
-    isCustom: false,
-    capabilities: getAntigravityModelCapabilities("gemini-3.1-pro"),
-  },
-  {
-    slug: "claude-sonnet-4-6",
-    name: "Claude Sonnet 4.6 (Thinking)",
-    isCustom: false,
-    capabilities: getAntigravityModelCapabilities("claude-sonnet-4-6"),
-  },
-  {
-    slug: "claude-opus-4-6-thinking",
-    name: "Claude Opus 4.6 (Thinking)",
-    isCustom: false,
-    capabilities: getAntigravityModelCapabilities("claude-opus-4-6-thinking"),
-  },
-  {
-    slug: "gpt-oss-120b-medium",
-    name: "GPT-OSS 120B (Medium)",
-    isCustom: false,
-    capabilities: getAntigravityModelCapabilities("gpt-oss-120b-medium"),
-  },
-];
-
-export function parseAntigravityModels(output: string): ReadonlyArray<ServerProviderModel> {
-  const lines = output.split("\n");
-  const modelsMap = new Map<string, ServerProviderModel>();
-  for (const line of lines) {
-    const cleanLine = line.replace(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\s\w.]+Fetching available models\.\.\./, "").trim();
-    if (!cleanLine) continue;
-    const match =
-      cleanLine.match(/^([a-z0-9_.-]+)\s{2,}(.+)$/i) || cleanLine.match(/^([a-z0-9_.-]+)\s+(.+)$/i);
-    if (match && match[1] && match[2]) {
-      const rawSlug = match[1].trim();
-      const rawName = match[2].trim();
-      const slug = rawSlug.replace(/-(low|medium|high)$/i, "");
-      const name = rawName.replace(/\s*\((Low|Medium|High)\)$/i, "");
-      if (!modelsMap.has(slug)) {
-        modelsMap.set(slug, {
-          slug,
-          name,
-          isCustom: false,
-          capabilities: getAntigravityModelCapabilities(slug),
-        });
-      }
-    }
+function isMissingInstallation(error: EffectAcpErrors.AcpError | ProviderSetupError): boolean {
+  if (error._tag === "AcpSpawnError") {
+    return (
+      isCommandMissingCause(error.cause) ||
+      (Predicate.isObject(error.cause) && error.cause.code === "ENOENT")
+    );
   }
-  const result = Array.from(modelsMap.values());
-  return result.length > 0 ? result : ANTIGRAVITY_BUILT_IN_MODELS;
+  return (
+    error._tag === "ProviderSetupError" &&
+    error.operation === "resolve" &&
+    /not installed|missing|incomplete|does not publish/i.test(error.detail)
+  );
 }
 
-function resolveAntigravityAccount(
-  settings: AntigravitySettings,
-  environment: NodeJS.ProcessEnv = process.env,
-): { readonly email?: string; readonly label?: string; readonly type?: string } {
-  const email =
-    settings.accountEmail?.trim() ||
-    environment.ANTIGRAVITY_ACCOUNT_EMAIL ||
-    environment.GOOGLE_ACCOUNT_EMAIL ||
-    undefined;
-  const label = settings.subscriptionLabel?.trim() || undefined;
-  return {
-    ...(email ? { email } : {}),
-    ...(label ? { label } : {}),
-    type: email ? "oauth" : "antigravity",
-  };
+interface AntigravityProviderState {
+  readonly draft: ServerProviderDraft;
+  readonly authRevision: number;
 }
 
-export function buildInitialAntigravityProviderSnapshot(
+interface AntigravityProviderOptions {
+  readonly stampIdentity: (snapshot: ServerProviderDraft) => Effect.Effect<ServerProvider>;
+  readonly probe: Effect.Effect<
+    EffectAcpSchema.InitializeResponse,
+    EffectAcpErrors.AcpError | ProviderSetupError
+  >;
+  readonly supportsTextGeneration: Effect.Effect<boolean>;
+  readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
+  /** Auth type and label published once a session authenticates. */
+  readonly auth?: { readonly type: string; readonly label: string };
+}
+
+/** Health uses initialize only. Session callbacks supply account-specific metadata. */
+export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(function* (
   settings: AntigravitySettings,
-): Effect.Effect<ServerProviderDraft> {
-  return Effect.gen(function* () {
-    const checkedAt = yield* Effect.map(DateTime.now, DateTime.formatIso);
-    const models = antigravityModelsFromSettings(settings.customModels);
-
-    if (!settings.enabled) {
-      return buildServerProvider({
-        presentation: ANTIGRAVITY_PRESENTATION,
-        enabled: false,
-        checkedAt,
-        models,
-        probe: {
-          installed: false,
-          version: null,
-          status: "warning",
-          auth: { status: "unknown" },
-          message: "Antigravity is disabled in T3 Code settings.",
-        },
-      });
-    }
-
-    return buildServerProvider({
-      presentation: ANTIGRAVITY_PRESENTATION,
-      enabled: true,
+  options: AntigravityProviderOptions,
+) {
+  const checkedAt = DateTime.formatIso(yield* DateTime.now);
+  const initialDraft = {
+    ...buildServerProvider({
+      presentation: { displayName: "Antigravity", showInteractionModeToggle: false },
+      enabled: settings.enabled,
       checkedAt,
-      models,
+      models: [],
       probe: {
-        installed: true,
+        installed: false,
         version: null,
         status: "warning",
         auth: { status: "unknown" },
-        message: "Checking Antigravity CLI availability...",
+        message: settings.enabled
+          ? "Checking Antigravity availability."
+          : "Antigravity is disabled in T3 Code settings.",
       },
-    });
+    }),
+    setup: { canAuthenticate: true, canInstall: true },
+    supportsConversationRollback: false,
+    supportsTextGeneration: false,
+    workspaceSnapshots: [],
+  } satisfies ServerProviderDraft;
+  const metadata = yield* SubscriptionRef.make<AntigravityProviderState>({
+    draft: initialDraft,
+    authRevision: 0,
   });
-}
-
-function antigravityModelsFromSettings(
-  customModels: ReadonlyArray<string> | undefined,
-  builtInModels: ReadonlyArray<ServerProviderModel> = ANTIGRAVITY_BUILT_IN_MODELS,
-): ReadonlyArray<ServerProviderModel> {
-  return providerModelsFromSettings(builtInModels, customModels ?? [], ANTIGRAVITY_CAPABILITIES);
-}
-
-export function resolveAntigravityBinary(
-  configuredPath: string | undefined,
-  env: NodeJS.ProcessEnv = process.env,
-): string {
-  if (configuredPath && configuredPath.trim().length > 0) {
-    return configuredPath.trim();
-  }
-  const localAppData = env.LOCALAPPDATA?.trim();
-  const userProfile = env.USERPROFILE?.trim();
-  const home = env.HOME?.trim();
-  const candidates = [
-    ...(localAppData
-      ? [`${localAppData}\\agy\\bin\\agy.exe`, `${localAppData}\\Programs\\agy\\bin\\agy.exe`]
-      : []),
-    ...(userProfile
-      ? [
-          `${userProfile}\\.local\\bin\\agy`,
-          `${userProfile}\\.local\\bin\\agy.cmd`,
-          `${userProfile}\\.gemini\\antigravity-cli\\bin\\agy.exe`,
-          `${userProfile}\\.gemini\\antigravity-cli\\bin\\agy.cmd`,
-        ]
-      : []),
-    ...(home
-      ? [
-          `${home}/.local/bin/agy`,
-          `${home}/.agy/bin/agy`,
-          `${home}/.gemini/antigravity-cli/bin/agy`,
-        ]
-      : []),
-  ];
-  for (const candidate of candidates) {
-    try {
-      if (NodeFS.statSync(candidate).isFile()) {
-        return candidate;
-      }
-    } catch {}
-  }
-  return "agy";
-}
-
-const runAntigravityProbeCommand = (
-  settings: AntigravitySettings,
-  environment: NodeJS.ProcessEnv = process.env,
-) =>
-  Effect.gen(function* () {
-    const command = resolveAntigravityBinary(settings.binaryPath, environment);
-    const spawnCommand = yield* resolveSpawnCommand(command, ["--help"], {
-      env: environment,
-    });
-    return yield* spawnAndCollect(
-      command,
-      ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-        env: environment,
-        shell: spawnCommand.shell,
-      }),
-    );
-  });
-
-const runAntigravityModelsCommand = (
-  settings: AntigravitySettings,
-  environment: NodeJS.ProcessEnv = process.env,
-) =>
-  Effect.gen(function* () {
-    const command = resolveAntigravityBinary(settings.binaryPath, environment);
-    const spawnCommand = yield* resolveSpawnCommand(command, ["models"], {
-      env: environment,
-    });
-    return yield* spawnAndCollect(
-      command,
-      ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-        env: environment,
-        shell: spawnCommand.shell,
-      }),
-    );
-  });
-
-export const checkAntigravityProviderStatus = Effect.fn("checkAntigravityProviderStatus")(
-  function* (
-    settings: AntigravitySettings,
-    environment: NodeJS.ProcessEnv = process.env,
-  ): Effect.fn.Return<
-    ServerProviderDraft,
-    never,
-    ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto
-  > {
-    const checkedAt = DateTime.formatIso(yield* DateTime.now);
-    const models = antigravityModelsFromSettings(settings.customModels);
-    const account = resolveAntigravityAccount(settings, environment);
-
-    if (!settings.enabled) {
-      return buildServerProvider({
-        presentation: ANTIGRAVITY_PRESENTATION,
-        enabled: false,
-        checkedAt,
-        models,
-        probe: {
-          installed: false,
-          version: null,
-          status: "warning",
-          auth: { status: "unknown" },
-          message: "Antigravity is disabled in T3 Code settings.",
-        },
-      });
-    }
-
-    const probeResult = yield* runAntigravityProbeCommand(settings, environment).pipe(
-      Effect.timeoutOption(VERSION_PROBE_TIMEOUT_MS),
-      Effect.result,
-    );
-
-    if (Result.isFailure(probeResult)) {
-      const error = probeResult.failure;
-      yield* Effect.logWarning("Antigravity CLI health check failed.", {
-        errorTag: error._tag,
-      });
-      return buildServerProvider({
-        presentation: ANTIGRAVITY_PRESENTATION,
-        enabled: settings.enabled,
-        checkedAt,
-        models,
-        probe: {
-          installed: !isCommandMissingCause(error),
-          version: null,
-          status: "error",
-          auth: { status: "unknown" },
-          message: isCommandMissingCause(error)
-            ? "Antigravity CLI (`agy`) is not installed or not on PATH."
-            : "Failed to execute Antigravity CLI health check.",
-        },
-      });
-    }
-
-    if (Option.isNone(probeResult.success)) {
-      const resolved = resolveAntigravityBinary(settings.binaryPath, environment);
-      const binaryExists = resolved !== "agy";
-      return buildServerProvider({
-        presentation: ANTIGRAVITY_PRESENTATION,
-        enabled: settings.enabled,
-        checkedAt,
-        models,
-        probe: {
-          installed: true,
-          version: null,
-          status: binaryExists ? "ready" : "error",
-          auth: account.email
-            ? {
-                status: "authenticated",
-                ...account,
-              }
-            : { status: "unknown" },
-          message: binaryExists
-            ? undefined
-            : "Antigravity CLI is installed but timed out while running `agy --help`.",
-        },
-      });
-    }
-
-    const probeOutput = probeResult.success.value;
-    const version = parseGenericCliVersion(`${probeOutput.stdout}\n${probeOutput.stderr}`);
-
-    if (probeOutput.code !== 0) {
-      return buildServerProvider({
-        presentation: ANTIGRAVITY_PRESENTATION,
-        enabled: settings.enabled,
-        checkedAt,
-        models,
-        probe: {
-          installed: true,
-          version,
-          status: "error",
-          auth: { status: "unknown" },
-          message: "Antigravity CLI is installed but exited with non-zero status.",
-        },
-      });
-    }
-
-    const modelsProbeResult = yield* runAntigravityModelsCommand(settings, environment).pipe(
-      Effect.timeoutOption(VERSION_PROBE_TIMEOUT_MS),
-      Effect.result,
-    );
-    const discoveredModels =
-      Result.isSuccess(modelsProbeResult) &&
-      Option.isSome(modelsProbeResult.success) &&
-      modelsProbeResult.success.value.code === 0
-        ? parseAntigravityModels(
-            `${modelsProbeResult.success.value.stdout}\n${modelsProbeResult.success.value.stderr}`,
-          )
-        : ANTIGRAVITY_BUILT_IN_MODELS;
-    const finalModels = antigravityModelsFromSettings(settings.customModels, discoveredModels);
-
-    return buildServerProvider({
-      presentation: ANTIGRAVITY_PRESENTATION,
-      enabled: settings.enabled,
-      checkedAt,
-      models: finalModels,
-      probe: {
-        installed: true,
-        version,
-        status: "ready",
-        auth: account.email
-          ? {
-              status: "authenticated",
-              ...account,
-            }
-          : { status: "unknown" },
-      },
-    });
-  },
-);
-
-export const enrichAntigravitySnapshot = (input: {
-  readonly snapshot: ServerProvider;
-  readonly maintenanceCapabilities: ProviderMaintenanceCapabilities;
-  readonly enableProviderUpdateChecks?: boolean;
-  readonly publishSnapshot: (snapshot: ServerProvider) => Effect.Effect<void>;
-  readonly httpClient: HttpClient.HttpClient;
-}): Effect.Effect<void> => {
-  const { snapshot, publishSnapshot } = input;
-
-  return enrichProviderSnapshotWithVersionAdvisory(snapshot, input.maintenanceCapabilities, {
-    enableProviderUpdateChecks: input.enableProviderUpdateChecks,
-  }).pipe(
-    Effect.provideService(HttpClient.HttpClient, input.httpClient),
-    Effect.flatMap((enrichedSnapshot) => publishSnapshot(enrichedSnapshot)),
-    Effect.catchCause((cause) =>
-      Effect.logWarning("Antigravity version advisory enrichment failed", {
-        errorTag: causeErrorTag(cause),
-      }),
-    ),
-    Effect.asVoid,
+  // Skills the driver discovered on disk per workspace. Session callbacks
+  // rewrite the workspace entry with native commands and must keep these, or
+  // the registry drops the suggestions and never re-reads the workspace.
+  const discoveredSkills = new Map<string, ServerProvider["skills"]>();
+  const getSnapshot = SubscriptionRef.get(metadata).pipe(
+    Effect.flatMap((state) => options.stampIdentity(state.draft)),
   );
-};
+
+  const checkProvider = Effect.fn("checkAntigravityProvider")(function* () {
+    if (!settings.enabled) return yield* getSnapshot;
+    const before = yield* SubscriptionRef.get(metadata);
+    const result = yield* options.probe.pipe(Effect.timeoutOption("15 seconds"), Effect.result);
+    const initialized =
+      Result.isSuccess(result) && Option.isSome(result.success) ? result.success.value : undefined;
+    const failure = Result.isFailure(result) ? result.failure : undefined;
+    const missingInstallation = failure !== undefined && isMissingInstallation(failure);
+    const errorMessage =
+      initialized !== undefined
+        ? undefined
+        : failure?._tag === "ProviderSetupError"
+          ? failure.detail.trim() || "Antigravity could not complete its local health check."
+          : missingInstallation
+            ? "Antigravity is not installed or its executable could not be found."
+            : failure
+              ? "Antigravity could not complete its local health check."
+              : "Antigravity did not respond to its local health check within 15 seconds.";
+    const supportsTextGeneration =
+      initialized !== undefined ? yield* options.supportsTextGeneration : false;
+    const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    const next = yield* SubscriptionRef.updateAndGet(metadata, (state) => {
+      if (state.authRevision !== before.authRevision) return state;
+      const { message: _previousMessage, ...draft } = state.draft;
+      const authenticated = draft.auth.status === "authenticated";
+      const message =
+        errorMessage ??
+        (authenticated
+          ? undefined
+          : draft.auth.status === "unauthenticated"
+            ? SIGN_IN_MESSAGE
+            : AUTH_UNCHECKED_MESSAGE);
+      return {
+        ...state,
+        draft: {
+          ...draft,
+          installed: !missingInstallation,
+          version: initialized?.agentInfo?.version || draft.version,
+          status: errorMessage ? "error" : authenticated ? "ready" : "warning",
+          checkedAt: updatedAt,
+          ...(missingInstallation
+            ? {
+                models: [],
+                slashCommands: [],
+                skills: [],
+                workspaceSnapshots: [],
+                supportsTextGeneration: false,
+              }
+            : {}),
+          ...(initialized !== undefined
+            ? {
+                supportsTextGeneration:
+                  supportsTextGeneration && draft.auth.status !== "unauthenticated",
+              }
+            : {}),
+          ...(message ? { message } : {}),
+        },
+      } satisfies AntigravityProviderState;
+    });
+    return yield* options.stampIdentity(next.draft);
+  });
+
+  const managed = yield* makeManagedServerProvider({
+    maintenanceCapabilities:
+      options.maintenanceCapabilities ??
+      makeManualOnlyProviderMaintenanceCapabilities({
+        provider: ProviderDriverKind.make("antigravity"),
+        packageName: null,
+      }),
+    getSettings: Effect.succeed(settings),
+    streamSettings: Stream.empty,
+    haveSettingsChanged: () => false,
+    initialSnapshot: () => getSnapshot,
+    checkProvider: checkProvider(),
+    enrichSnapshot: ({ publishSnapshot }) =>
+      SubscriptionRef.changes(metadata).pipe(
+        Stream.runForEach((state) =>
+          options.stampIdentity(state.draft).pipe(Effect.flatMap(publishSnapshot)),
+        ),
+      ),
+  });
+
+  const onSessionStarted = Effect.fn("AntigravityProvider.onSessionStarted")(function* (
+    started: AcpSessionRuntimeStartResult,
+    cwd?: string,
+  ) {
+    const before = yield* SubscriptionRef.get(metadata);
+    const supportsTextGeneration = yield* options.supportsTextGeneration;
+    const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* SubscriptionRef.update(metadata, (state) => {
+      if (
+        state.authRevision !== before.authRevision &&
+        state.draft.auth.status === "unauthenticated"
+      ) {
+        return state;
+      }
+      const { message: _previousMessage, ...draft } = state.draft;
+      const workspaces = draft.workspaceSnapshots ?? [];
+      const workspace = cwd ? workspaces.find((entry) => entry.cwd === cwd) : undefined;
+      return {
+        authRevision: state.authRevision + 1,
+        draft: {
+          ...draft,
+          installed: true,
+          status: settings.enabled ? "ready" : "disabled",
+          version: started.initializeResult.agentInfo?.version || draft.version,
+          auth: {
+            status: "authenticated",
+            type: options.auth?.type ?? "oauth-personal",
+            label: options.auth?.label ?? "Google account",
+          },
+          checkedAt: updatedAt,
+          models: buildAntigravityModelsFromSession(started.sessionSetupResult),
+          supportsTextGeneration,
+          ...(cwd
+            ? {
+                workspaceSnapshots: [
+                  ...workspaces.filter((entry) => entry.cwd !== cwd),
+                  {
+                    cwd,
+                    checkedAt: updatedAt,
+                    slashCommands: workspace?.slashCommands ?? draft.slashCommands,
+                    skills: workspace?.skills ?? discoveredSkills.get(cwd) ?? [],
+                  },
+                ].slice(-MAX_WORKSPACE_SNAPSHOTS),
+              }
+            : {}),
+        },
+      } satisfies AntigravityProviderState;
+    });
+  });
+
+  const onAvailableCommands = Effect.fn("AntigravityProvider.onAvailableCommands")(function* (
+    commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
+    cwd?: string,
+  ) {
+    const slashCommands = nativeCommands(commands);
+    const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* SubscriptionRef.update(metadata, (state) => {
+      if (state.draft.auth.status === "unauthenticated") return state;
+      return {
+        ...state,
+        draft: {
+          ...state.draft,
+          slashCommands,
+          ...(cwd
+            ? {
+                workspaceSnapshots: [
+                  ...(state.draft.workspaceSnapshots ?? []).filter((entry) => entry.cwd !== cwd),
+                  {
+                    cwd,
+                    checkedAt: updatedAt,
+                    slashCommands,
+                    skills:
+                      state.draft.workspaceSnapshots?.find((entry) => entry.cwd === cwd)?.skills ??
+                      discoveredSkills.get(cwd) ??
+                      [],
+                  },
+                ].slice(-MAX_WORKSPACE_SNAPSHOTS),
+              }
+            : {}),
+        },
+      };
+    });
+  });
+
+  const clearAccountMetadata = Effect.fn("AntigravityProvider.clearAccountMetadata")(function* () {
+    const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* SubscriptionRef.update(
+      metadata,
+      (state) =>
+        ({
+          authRevision: state.authRevision + 1,
+          draft: {
+            ...state.draft,
+            auth: { status: "unauthenticated" },
+            status: settings.enabled ? "warning" : "disabled",
+            message: SIGN_IN_MESSAGE,
+            checkedAt: updatedAt,
+            models: [],
+            slashCommands: [],
+            skills: [],
+            workspaceSnapshots: [],
+            supportsTextGeneration: false,
+          },
+        }) satisfies AntigravityProviderState,
+    );
+    discoveredSkills.clear();
+  });
+
+  const snapshotForCwd = Effect.fn("AntigravityProvider.snapshotForCwd")(function* (
+    cwd: string,
+    skills?: ServerProvider["skills"],
+  ) {
+    if (skills) discoveredSkills.set(cwd, skills);
+    const snapshot = yield* getSnapshot;
+    const workspace = snapshot.workspaceSnapshots?.find((entry) => entry.cwd === cwd);
+    const resolvedSkills = skills ?? workspace?.skills ?? discoveredSkills.get(cwd) ?? [];
+    return workspace
+      ? { ...snapshot, slashCommands: workspace.slashCommands, skills: resolvedSkills }
+      : { ...snapshot, skills: resolvedSkills };
+  });
+
+  return {
+    snapshot: { ...managed, getSnapshot },
+    onSessionStarted,
+    onAvailableCommands,
+    onSignedOut: clearAccountMetadata(),
+    onAuthRequired: clearAccountMetadata(),
+    snapshotForCwd,
+  };
+});
