@@ -180,7 +180,10 @@ export function resolveAntigravityProfileDirectory(
   return NodePath.join(stateDir, "providers", "antigravity", directoryName);
 }
 
-function quoteBrowserArgument(value: string): string {
+function quoteBrowserArgument(value: string, platform?: NodeJS.Platform): string {
+  if (platform === "win32") {
+    return `"${value.replaceAll('"', '\\"')}"`;
+  }
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
@@ -231,7 +234,9 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   const helperExecutable =
     platform === "win32" ? runtimeExecutablePath.replaceAll("\\", "/") : runtimeExecutablePath;
   const browserArguments = [helperExecutable, "-e", browserHelperSource, "--", "%s"];
-  const browserCommand = browserArguments.map(quoteBrowserArgument).join(" ");
+  const browserCommand = browserArguments
+    .map((arg) => quoteBrowserArgument(arg, platform))
+    .join(" ");
   if (
     browserCommand.includes(platform === "win32" ? ";" : ":") ||
     helperExecutable.includes("\r") ||

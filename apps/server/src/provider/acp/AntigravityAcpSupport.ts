@@ -19,6 +19,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import {
+  ANTIGRAVITY_AUTH_BROWSER_MARKER,
   drainAntigravityStderr,
   makeAntigravityStdoutTransform,
 } from "../antigravityAuthSupport.ts";
@@ -73,7 +74,16 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
       transformStdout: makeAntigravityStdoutTransform(
         input.onAuthorizationUrl ? { onAuthorizationUrl: input.onAuthorizationUrl } : {},
       ),
-      onStderr: drainAntigravityStderr,
+      onStderr: (text: string) =>
+        Effect.gen(function* () {
+          if (input.onAuthorizationUrl && text.includes(ANTIGRAVITY_AUTH_BROWSER_MARKER)) {
+            const match = text.match(/__T3_ANTIGRAVITY_AUTH_URL__"([^"\r\n]+)"/);
+            if (match?.[1]?.startsWith("http")) {
+              yield* input.onAuthorizationUrl(match[1]).pipe(Effect.ignore);
+            }
+          }
+          return yield* drainAntigravityStderr(text);
+        }),
       transformSessionUpdate: normalizeAntigravitySessionUpdate,
     }).pipe(
       Layer.provide(
