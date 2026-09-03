@@ -7,6 +7,8 @@ import {
   RuntimeRequestId,
   RuntimeTaskId,
   TurnId,
+  ThreadTokenUsageSnapshot,
+  ThreadTokenUsageCategories,
   type AntigravitySettings,
   type ProviderApprovalDecision,
   type ProviderRuntimeEvent,
@@ -84,6 +86,8 @@ import type { EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCP from "node:child_process";
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import {
   checkSubagentTranscriptStatus,
   computeSubagentUsage,
@@ -92,15 +96,85 @@ import {
 } from "../../orchestration/subagentTranscriptQuery.ts";
 
 export const KILLED_SUBAGENT_IDS = new Set<string>();
+export const SUBAGENT_RUNNING_PIDS = new Map<string, Set<number>>();
+export const SUBAGENT_ACTIVE_COMMANDS = new Map<string, string>();
+
+export function findChildPidsOfHarness(): Promise<number[]> {
+  return new Promise((resolve) => {
+    try {
+      if (process.platform === "win32") {
+        const ps =
+          "$h = (Get-Process localharness_external, agy_acp_server -ErrorAction SilentlyContinue).Id; if ($h) { Get-CimInstance Win32_Process | Where-Object { $h -contains $_.ParentProcessId } | Select-Object -ExpandProperty ProcessId }";
+        NodeCP.exec(`powershell -NoProfile -Command "${ps}"`, (err, stdout) => {
+          if (err || !stdout) return resolve([]);
+          const pids = stdout
+            .split(/\r?\n/)
+            .map((s) => parseInt(s.trim(), 10))
+            .filter((n) => Number.isFinite(n) && n > 0);
+          resolve(pids);
+        });
+      } else {
+        NodeCP.exec(
+          'pgrep -P $(pgrep -d, -f "localharness_external|agy_acp_server" 2>/dev/null) 2>/dev/null',
+          (err, stdout) => {
+            if (err || !stdout) return resolve([]);
+            const pids = stdout
+              .split(/\s+/)
+              .map((s) => parseInt(s.trim(), 10))
+              .filter((n) => Number.isFinite(n) && n > 0);
+            resolve(pids);
+          },
+        );
+      }
+    } catch {
+      resolve([]);
+    }
+  });
+}
 
 export function registerKilledSubagent(conversationId: string): void {
   if (!conversationId || typeof conversationId !== "string" || conversationId.length < 5) return;
   KILLED_SUBAGENT_IDS.add(conversationId);
   try {
+    const pids = SUBAGENT_RUNNING_PIDS.get(conversationId);
+    if (pids && pids.size > 0) {
+      for (const pid of pids) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+    }
+    const activeCmd = SUBAGENT_ACTIVE_COMMANDS.get(conversationId);
     if (process.platform === "win32") {
-      const psCmd = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*${conversationId}*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
-      NodeCP.exec(`powershell -NoProfile -Command "${psCmd}"`, () => {});
+      if (pids && pids.size > 0) {
+        const pidList = [...pids].join(",");
+        NodeCP.exec(
+          `powershell -NoProfile -Command "Stop-Process -Id ${pidList} -Force -ErrorAction SilentlyContinue"`,
+          () => {},
+        );
+      }
+      if (activeCmd) {
+        const safeSnippet = activeCmd.replace(/["'`$\\]/g, "").slice(0, 35);
+        if (safeSnippet.length > 3) {
+          const psKill = `$h = (Get-Process localharness_external, agy_acp_server -ErrorAction SilentlyContinue).Id; if ($h) { Get-CimInstance Win32_Process | Where-Object { $h -contains $_.ParentProcessId -and $_.CommandLine -like '*${safeSnippet}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }`;
+          NodeCP.exec(`powershell -NoProfile -Command "${psKill}"`, () => {});
+        }
+      }
+      const safeId = conversationId.replace(/["'`$\\]/g, "");
+      const psIdKill = `Get-CimInstance Win32_Process | Where-Object CommandLine -like "*${safeId}*" | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+      NodeCP.exec(`powershell -NoProfile -Command "${psIdKill}"`, () => {});
     } else {
+      if (pids && pids.size > 0) {
+        for (const pid of pids) {
+          NodeCP.exec(`kill -9 ${pid}`, () => {});
+        }
+      }
+      if (activeCmd) {
+        const safeSnippet = activeCmd.replace(/["'`$\\]/g, "").slice(0, 35);
+        if (safeSnippet.length > 3) {
+          NodeCP.exec(`pkill -9 -f "${safeSnippet}"`, () => {});
+        }
+      }
       NodeCP.exec(`pkill -9 -f "${conversationId}"`, () => {});
     }
   } catch {}
@@ -130,6 +204,21 @@ export interface TrackedSubagent {
   status: "running" | "completed" | "failed" | "cancelled";
   conversationId?: string | undefined;
   readonly stepIndex: number;
+  inputChars: number;
+  outputChars: number;
+  toolUses: number;
+}
+
+export interface TokenTracker {
+  userMessagesChars: number;
+  agentResponsesChars: number;
+  toolCallsChars: number;
+  systemPromptTokens: number;
+  systemToolsTokens: number;
+  skillsTokens: number;
+  checkpointBufferTokens: number;
+  totalLifetimeProcessedTokens: number;
+  toolUses: number;
 }
 
 export interface SubagentListEntry {
@@ -257,9 +346,11 @@ interface SessionContext {
   readonly commands: Map<string, OpenCommand>;
   readonly turns: Array<{ id: TurnId; items: Array<unknown> }>;
   readonly subagents: Map<string, TrackedSubagent>;
+  readonly tokenTracker: TokenTracker;
   antigravityConversationId: string | undefined;
   session: ProviderSession;
   activeTurnId: TurnId | undefined;
+  lastEmittedUsage?: ThreadTokenUsageSnapshot;
   promptFiber: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError> | undefined;
   generation: number;
   stopped: boolean;
@@ -386,6 +477,118 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
     createdAt: nowIso,
   });
   const emit = (event: ProviderRuntimeEvent) => PubSub.publish(events, event).pipe(Effect.asVoid);
+
+  function buildTokenUsageSnapshot(context: SessionContext): ThreadTokenUsageSnapshot {
+    const userMessages = Math.max(1, Math.round(context.tokenTracker.userMessagesChars / 4));
+    const agentResponses = Math.round(context.tokenTracker.agentResponsesChars / 4);
+    const toolCalls = Math.round(context.tokenTracker.toolCallsChars / 4);
+    const systemPrompt = context.tokenTracker.systemPromptTokens;
+    const systemTools = context.tokenTracker.systemToolsTokens;
+    const skills = context.tokenTracker.skillsTokens;
+    const checkpointBuffer = context.tokenTracker.checkpointBufferTokens;
+
+    let subagents = 0;
+    for (const s of context.subagents.values()) {
+      const sTok = Math.round(((s.inputChars ?? 0) + (s.outputChars ?? 0)) / 4);
+      subagents += Math.max(0, sTok);
+    }
+
+    const usedTokens =
+      userMessages +
+      agentResponses +
+      toolCalls +
+      systemPrompt +
+      systemTools +
+      skills +
+      subagents +
+      checkpointBuffer;
+
+    const cachedInputTokens = systemPrompt + systemTools + skills;
+    const inputTokens = userMessages + toolCalls + checkpointBuffer + subagents;
+    const outputTokens = agentResponses;
+    const maxTokens = 1_000_000;
+
+    const totalProcessedTokens = Math.max(
+      usedTokens,
+      context.tokenTracker.totalLifetimeProcessedTokens + cachedInputTokens,
+    );
+
+    return {
+      usedTokens,
+      totalProcessedTokens,
+      maxTokens,
+      inputTokens,
+      cachedInputTokens,
+      outputTokens,
+      toolUses: context.tokenTracker.toolUses,
+      compactsAutomatically: true,
+      categories: {
+        userMessages,
+        agentResponses,
+        toolCalls,
+        systemPrompt,
+        systemTools,
+        skills,
+        subagents,
+        checkpointBuffer,
+      },
+    };
+  }
+
+  const emitTokenUsage = (context: SessionContext, turnId?: TurnId) =>
+    Effect.gen(function* () {
+      const snapshot = buildTokenUsageSnapshot(context);
+      context.lastEmittedUsage = snapshot;
+      yield* emit({
+        type: "thread.token-usage.updated",
+        ...(yield* stamp),
+        provider: PROVIDER,
+        threadId: context.threadId,
+        turnId: turnId ?? context.activeTurnId,
+        payload: {
+          usage: snapshot,
+        },
+      });
+    });
+
+  function writeSubagentTranscriptStep(subagentId: string, toolCall: AcpToolCallState): void {
+    try {
+      const home = NodeOS.homedir();
+      const candidateDirs = [
+        NodePath.join(home, ".t3", "userdata", "providers", "antigravity"),
+        NodePath.join(process.cwd(), ".t3", "userdata", "providers", "antigravity"),
+      ];
+      for (const root of candidateDirs) {
+        if (!NodeFS.existsSync(root)) continue;
+        const hashes = NodeFS.readdirSync(root);
+        for (const h of hashes) {
+          const brainDir = NodePath.join(root, h, "antigravity-acp", "brain", subagentId);
+          if (NodeFS.existsSync(brainDir)) {
+            const logsDir = NodePath.join(brainDir, ".system_generated", "logs");
+            if (!NodeFS.existsSync(logsDir)) {
+              NodeFS.mkdirSync(logsDir, { recursive: true });
+            }
+            const transcriptPath = NodePath.join(logsDir, "transcript.jsonl");
+            const stepIndex = Date.now();
+            const stepObj = {
+              step_index: stepIndex,
+              type: "PLANNER_RESPONSE",
+              tool_calls: [
+                {
+                  name: toolCall.title ?? toolCall.kind ?? "tool",
+                  args: toolCall.data ?? {},
+                },
+              ],
+              content: toolCall.detail ?? toolCall.title,
+              created_at: new Date().toISOString(),
+            };
+            NodeFS.appendFileSync(transcriptPath, JSON.stringify(stepObj) + "\n", "utf8");
+            return;
+          }
+        }
+      }
+    } catch {}
+  }
 
   const withThreadLock = <A, E, R>(threadId: ThreadId, task: Effect.Effect<A, E, R>) =>
     SynchronizedRef.modifyEffect(locks, (current) => {
@@ -673,7 +876,28 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               toolCall.toolCallId,
               context.nativeSessionId,
             );
-            if (subagentId && !KILLED_SUBAGENT_IDS.has(subagentId)) {
+            if (subagentId) {
+              if (KILLED_SUBAGENT_IDS.has(subagentId)) {
+                const tracked = context.subagents.get(subagentId);
+                if (tracked && tracked.status === "running") {
+                  tracked.status = "cancelled";
+                  yield* emit({
+                    type: "task.completed",
+                    ...(yield* stamp),
+                    provider: PROVIDER,
+                    threadId: context.threadId,
+                    turnId: existing?.turnId ?? context.activeTurnId,
+                    payload: {
+                      taskId: tracked.taskId,
+                      status: "cancelled",
+                      taskType: "subagent",
+                      agentKind: "agent",
+                    },
+                  });
+                }
+                return;
+              }
+
               let tracked = context.subagents.get(subagentId);
               if (!tracked) {
                 const taskId = RuntimeTaskId.make(subagentId);
@@ -685,6 +909,9 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                   status: "running",
                   conversationId: subagentId,
                   stepIndex: subIndex,
+                  inputChars: 200,
+                  outputChars: 0,
+                  toolUses: 0,
                 };
                 context.subagents.set(subagentId, tracked);
                 context.subagents.set(String(taskId), tracked);
@@ -706,6 +933,39 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                 });
               }
 
+              const toolData = (toolCall.data ?? {}) as Record<string, unknown>;
+              const cmd = (toolData.CommandLine ||
+                toolData.command ||
+                (toolData.parameters as any)?.CommandLine) as string | undefined;
+              if (typeof cmd === "string" && cmd.trim()) {
+                SUBAGENT_ACTIVE_COMMANDS.set(subagentId, cmd.trim());
+                findChildPidsOfHarness().then((pids) => {
+                  let set = SUBAGENT_RUNNING_PIDS.get(subagentId);
+                  if (!set) {
+                    set = new Set();
+                    SUBAGENT_RUNNING_PIDS.set(subagentId, set);
+                  }
+                  for (const p of pids) set.add(p);
+                });
+              }
+
+              const callChars =
+                (toolCall.title?.length ?? 0) +
+                (toolCall.detail?.length ?? 0) +
+                JSON.stringify(toolData).length;
+              tracked.outputChars += callChars;
+              tracked.toolUses += 1;
+              const subTotalTokens = Math.max(
+                1,
+                Math.round((tracked.inputChars + tracked.outputChars) / 4),
+              );
+              const subUsage = {
+                totalTokens: subTotalTokens,
+                inputTokens: Math.max(1, Math.round(tracked.inputChars / 4)),
+                outputTokens: Math.max(1, Math.round(tracked.outputChars / 4)),
+                toolUses: tracked.toolUses,
+              };
+
               if (toolCall.status === "inProgress" || toolCall.status === "pending") {
                 yield* emit({
                   type: "task.progress",
@@ -721,9 +981,41 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                     summary: toolCall.title ?? toolCall.detail ?? "Running tool",
                     description: toolCall.title ?? toolCall.detail ?? "Running tool",
                     lastToolName: toolCall.title?.split(" ")[0]?.toLowerCase() ?? "tool",
+                    typedUsage: subUsage,
+                  },
+                });
+              } else if (toolCall.status === "completed" || toolCall.status === "failed") {
+                yield* emit({
+                  type: "task.progress",
+                  ...(yield* stamp),
+                  provider: PROVIDER,
+                  threadId: context.threadId,
+                  turnId: existing?.turnId ?? context.activeTurnId,
+                  payload: {
+                    taskId: tracked.taskId,
+                    status: "running",
+                    taskType: "subagent",
+                    agentKind: "agent",
+                    summary: toolCall.title ?? toolCall.detail ?? "Tool finished",
+                    description: toolCall.title ?? toolCall.detail ?? "Tool finished",
+                    lastToolName: toolCall.title?.split(" ")[0]?.toLowerCase() ?? "tool",
+                    typedUsage: subUsage,
                   },
                 });
               }
+
+              writeSubagentTranscriptStep(subagentId, toolCall);
+              yield* emitTokenUsage(context);
+            } else {
+              const toolData = (toolCall.data ?? {}) as Record<string, unknown>;
+              const callChars =
+                (toolCall.title?.length ?? 0) +
+                (toolCall.detail?.length ?? 0) +
+                JSON.stringify(toolData).length;
+              context.tokenTracker.toolUses += 1;
+              context.tokenTracker.toolCallsChars += callChars;
+              context.tokenTracker.totalLifetimeProcessedTokens += Math.round(callChars / 4);
+              yield* emitTokenUsage(context);
             }
 
             const toolTitle = (toolCall.title ?? toolCall.kind ?? "").toLowerCase();
@@ -759,6 +1051,9 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                       model,
                       status: "running",
                       stepIndex: context.subagents.size + 1,
+                      inputChars: (prompt?.length ?? 0) + 100,
+                      outputChars: 0,
+                      toolUses: 0,
                     };
                     context.subagents.set(String(tempId), tracked);
                     yield* emit({
@@ -861,6 +1156,9 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                       status: status === "idle" ? "running" : status,
                       conversationId: cid,
                       stepIndex: context.subagents.size + 1,
+                      inputChars: 200,
+                      outputChars: 0,
+                      toolUses: 0,
                     };
                     context.subagents.set(cid, tracked);
                     context.subagents.set(String(taskId), tracked);
@@ -881,7 +1179,22 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                     });
                   }
 
-                  const usage = computeSubagentUsage(cid, sub.transcript);
+                  const trackedSub = context.subagents.get(cid) ?? existingTracked;
+                  const computedUsage = computeSubagentUsage(cid, sub.transcript);
+                  const fallbackUsage = trackedSub
+                    ? {
+                        totalTokens: Math.max(
+                          1,
+                          Math.round(
+                            ((trackedSub.inputChars ?? 0) + (trackedSub.outputChars ?? 0)) / 4,
+                          ),
+                        ),
+                        inputTokens: Math.max(1, Math.round((trackedSub.inputChars ?? 0) / 4)),
+                        outputTokens: Math.max(1, Math.round((trackedSub.outputChars ?? 0) / 4)),
+                        toolUses: trackedSub.toolUses ?? 0,
+                      }
+                    : undefined;
+                  const usage = computedUsage ?? fallbackUsage;
 
                   if (status === "completed" || status === "failed") {
                     yield* emit({
@@ -999,6 +1312,13 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           });
         }
         const cursor = decodeResumeCursor(input.resumeCursor);
+        if (input.resumeCursor !== undefined && Option.isNone(cursor)) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "The saved Antigravity session is invalid. Start a new thread.",
+          });
+        }
         const previous = sessions.get(input.threadId);
         if (previous) yield* stopContext(previous);
         const cwd = path.resolve(input.cwd);
@@ -1106,6 +1426,17 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                 commands: new Map(),
                 turns: [],
                 subagents: new Map(),
+                tokenTracker: {
+                  userMessagesChars: 0,
+                  agentResponsesChars: 0,
+                  toolCallsChars: 0,
+                  systemPromptTokens: 5200,
+                  systemToolsTokens: 12400,
+                  skillsTokens: 1300,
+                  checkpointBufferTokens: 2500,
+                  totalLifetimeProcessedTokens: 0,
+                  toolUses: 0,
+                },
                 antigravityConversationId: undefined,
                 session,
                 activeTurnId: undefined,
@@ -1271,6 +1602,9 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           intent = turn;
           context.activeTurnId = turnId;
           if (!steering) {
+            context.tokenTracker.userMessagesChars += prompt.length;
+            context.tokenTracker.totalLifetimeProcessedTokens += Math.round(prompt.length / 4);
+            yield* emitTokenUsage(context, turnId);
             yield* emit({
               type: "turn.started",
               ...(yield* stamp),
@@ -1346,7 +1680,17 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             const targetId = tracked.conversationId;
             if (targetId) {
               const subStatus = checkSubagentTranscriptStatus(targetId);
-              const usage = computeSubagentUsage(targetId);
+              const computedUsage = computeSubagentUsage(targetId);
+              const fallbackUsage = {
+                totalTokens: Math.max(
+                  1,
+                  Math.round(((tracked.inputChars ?? 0) + (tracked.outputChars ?? 0)) / 4),
+                ),
+                inputTokens: Math.max(1, Math.round((tracked.inputChars ?? 0) / 4)),
+                outputTokens: Math.max(1, Math.round((tracked.outputChars ?? 0) / 4)),
+                toolUses: tracked.toolUses ?? 0,
+              };
+              const usage = computedUsage ?? fallbackUsage;
               if (subStatus.status === "completed" || subStatus.status === "failed") {
                 tracked.status = subStatus.status;
                 yield* emit({
@@ -1392,6 +1736,41 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           if (stillRunningCount === 0) break;
         }
       }
+
+      for (const tracked of context.subagents.values()) {
+        if (tracked.status === "running") {
+          const isKilled =
+            KILLED_SUBAGENT_IDS.has(String(tracked.taskId)) ||
+            (tracked.conversationId ? KILLED_SUBAGENT_IDS.has(tracked.conversationId) : false);
+          const finalStatus = isKilled ? "cancelled" : "completed";
+          tracked.status = finalStatus;
+          const subUsage = {
+            totalTokens: Math.max(
+              1,
+              Math.round(((tracked.inputChars ?? 0) + (tracked.outputChars ?? 0)) / 4),
+            ),
+            inputTokens: Math.max(1, Math.round((tracked.inputChars ?? 0) / 4)),
+            outputTokens: Math.max(1, Math.round((tracked.outputChars ?? 0) / 4)),
+            toolUses: tracked.toolUses ?? 0,
+          };
+          yield* emit({
+            type: "task.completed",
+            ...(yield* stamp),
+            provider: PROVIDER,
+            threadId: input.threadId,
+            turnId: launch.turn.turnId,
+            payload: {
+              taskId: tracked.taskId,
+              status: finalStatus,
+              taskType: "subagent",
+              agentKind: "agent",
+              typedUsage: subUsage,
+            },
+          });
+        }
+      }
+
+      yield* emitTokenUsage(context, launch.turn.turnId);
 
       yield* context.promptLock.withPermit(
         finishTurn(launch.turn, {

@@ -165,6 +165,20 @@ export const readSubagentTranscript = Effect.fn("orchestration.readSubagentTrans
 
   const transcriptPath = findTranscriptPath(conversationId);
   if (!transcriptPath) {
+    const logItems = extractTranscriptItemsFromLogs(conversationId);
+    if (logItems && logItems.length > 0) {
+      const usage = computeSubagentUsageFromLogs(conversationId);
+      return {
+        conversationId,
+        items: logItems,
+        totalSteps: logItems.length,
+        ...(usage?.totalTokens !== undefined ? { totalTokens: usage.totalTokens } : {}),
+        ...(usage?.inputTokens !== undefined ? { inputTokens: usage.inputTokens } : {}),
+        ...(usage?.outputTokens !== undefined ? { outputTokens: usage.outputTokens } : {}),
+        ...(usage?.toolUses !== undefined ? { toolUses: usage.toolUses } : {}),
+        transcriptPath: "provider-logs",
+      };
+    }
     return yield* new OrchestrationGetSubagentTranscriptError({
       reason: "not-found",
       conversationId,
@@ -272,6 +286,123 @@ export const readSubagentTranscript = Effect.fn("orchestration.readSubagentTrans
   };
 });
 
+export function extractTranscriptItemsFromLogs(
+  conversationId: string,
+): Array<SubagentTranscriptItem> {
+  try {
+    const candidateDirs = [
+      NodePath.join(NodeOS.homedir(), ".t3", "userdata", "logs", "provider"),
+      NodePath.join(process.cwd(), ".t3", "userdata", "logs", "provider"),
+    ];
+    const items: Array<SubagentTranscriptItem> = [];
+    let stepIndex = 1;
+
+    for (const dir of candidateDirs) {
+      if (!NodeFS.existsSync(dir)) continue;
+      const files = NodeFS.readdirSync(dir);
+      for (const f of files) {
+        if (!f.startsWith("events.") || !f.endsWith(".log")) continue;
+        const filePath = NodePath.join(dir, f);
+        const content = NodeFS.readFileSync(filePath, "utf8");
+        if (!content.includes(conversationId)) continue;
+        const lines = content.split("\n");
+        for (const line of lines) {
+          if (!line.includes(conversationId)) continue;
+          const idx = line.indexOf("{");
+          if (idx === -1) continue;
+          try {
+            const obj = JSON.parse(line.slice(idx));
+            const update = obj?.raw?.payload?.update || obj?.payload;
+            if (update?.sessionUpdate === "tool_call_update") {
+              const rawOutput = update.rawOutput;
+              let detail: string | null = null;
+              let output: string | null = null;
+              if (typeof rawOutput === "string") {
+                detail = rawOutput;
+              } else if (rawOutput && typeof rawOutput === "object") {
+                detail = rawOutput.commandLine || JSON.stringify(rawOutput);
+                if (rawOutput.combinedOutput !== undefined) {
+                  output = String(rawOutput.combinedOutput);
+                }
+              }
+              const toolName = detail?.split(/\s+/)[0] || "tool";
+              items.push({
+                stepIndex: stepIndex++,
+                type: "TOOL_CALL",
+                toolName,
+                summary: detail || "Tool execution",
+                detail,
+                output,
+                timestamp: obj.timestamp || null,
+              });
+            }
+          } catch {}
+        }
+      }
+    }
+    return items;
+  } catch {
+    return [];
+  }
+}
+
+export function computeSubagentUsageFromLogs(conversationId: string):
+  | {
+      readonly totalTokens: number;
+      readonly inputTokens?: number;
+      readonly outputTokens?: number;
+      readonly toolUses?: number;
+    }
+  | undefined {
+  try {
+    const candidateDirs = [
+      NodePath.join(NodeOS.homedir(), ".t3", "userdata", "logs", "provider"),
+      NodePath.join(process.cwd(), ".t3", "userdata", "logs", "provider"),
+    ];
+    let toolUses = 0;
+    const inputChars = 200;
+    let outputChars = 0;
+    let found = false;
+
+    for (const dir of candidateDirs) {
+      if (!NodeFS.existsSync(dir)) continue;
+      const files = NodeFS.readdirSync(dir);
+      for (const f of files) {
+        if (!f.startsWith("events.") || !f.endsWith(".log")) continue;
+        const filePath = NodePath.join(dir, f);
+        const content = NodeFS.readFileSync(filePath, "utf8");
+        if (!content.includes(conversationId)) continue;
+        found = true;
+        const lines = content.split("\n");
+        for (const line of lines) {
+          if (!line.includes(conversationId)) continue;
+          const idx = line.indexOf("{");
+          if (idx === -1) continue;
+          try {
+            const obj = JSON.parse(line.slice(idx));
+            outputChars += line.length;
+            const update = obj?.raw?.payload?.update || obj?.payload;
+            if (update?.sessionUpdate === "tool_call_update") {
+              toolUses += 1;
+            }
+          } catch {}
+        }
+      }
+    }
+    if (!found) return undefined;
+    const inputTokens = Math.max(1, Math.round(inputChars / 3.8));
+    const outputTokens = Math.max(1, Math.round(outputChars / 3.8));
+    return {
+      totalTokens: inputTokens + outputTokens,
+      inputTokens,
+      outputTokens,
+      toolUses,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 export function computeSubagentUsage(
   conversationId: string,
   customPath?: string,
@@ -286,7 +417,7 @@ export function computeSubagentUsage(
   try {
     const transcriptPath = customPath || findTranscriptPath(conversationId);
     if (!transcriptPath || !NodeFS.existsSync(transcriptPath)) {
-      return undefined;
+      return computeSubagentUsageFromLogs(conversationId);
     }
     const rawContent = NodeFS.readFileSync(transcriptPath, "utf8");
     const lines = rawContent
