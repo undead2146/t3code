@@ -3738,27 +3738,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         />
       ),
     },
-    ...(activeContextWindow
-      ? [
-          {
-            id: "contextWindow",
-            content: (
-              <>
-                <ComposerControlSeparator size={composerControlsInStrip ? "xs" : "sm"} />
-                <ContextWindowMeter
-                  usage={activeContextWindow}
-                  modelDisplayName={activeThreadModelDisplayName}
-                  onCompact={selectedProvider === "claudeAgent" ? compactThreadContext : undefined}
-                  compactDisabled={
-                    compactDisabled || noProviderAvailable || isSendBusy || isConnecting
-                  }
-                  compactDisabledReason={resolvedCompactDisabledReason}
-                />
-              </>
-            ),
-          },
-        ]
-      : []),
   ];
   const hiddenRestingBlockIds = restingBlockDefs
     .slice(restingBlockDefs.length - restingHiddenBlockCount)
