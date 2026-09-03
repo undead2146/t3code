@@ -2500,7 +2500,7 @@ function ChatViewContent(props: ChatViewProps) {
       durationMs: null,
       compactsAutomatically: true,
       autoCompactThreshold: null,
-      updatedAt: null,
+      updatedAt: new Date().toISOString(),
       categories: {
         userMessages: 0,
         agentResponses: 0,
@@ -7538,6 +7538,7 @@ function ChatViewContent(props: ChatViewProps) {
         model={agentPanelModel}
         environmentId={activeThreadRef?.environmentId ?? null}
         threadId={activeThreadRef?.threadId ?? null}
+        activeContextWindow={activeContextWindow}
       />
     ) : (renderedRightPanelSurface?.kind === "files" ||
         renderedRightPanelSurface?.kind === "file") &&

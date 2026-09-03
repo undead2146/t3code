@@ -3738,6 +3738,27 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         />
       ),
     },
+    ...(activeContextWindow
+      ? [
+          {
+            id: "contextWindow",
+            content: (
+              <>
+                <ComposerControlSeparator size={composerControlsInStrip ? "xs" : "sm"} />
+                <ContextWindowMeter
+                  usage={activeContextWindow}
+                  modelDisplayName={activeThreadModelDisplayName}
+                  onCompact={selectedProvider === "claudeAgent" ? compactThreadContext : undefined}
+                  compactDisabled={
+                    compactDisabled || noProviderAvailable || isSendBusy || isConnecting
+                  }
+                  compactDisabledReason={resolvedCompactDisabledReason}
+                />
+              </>
+            ),
+          },
+        ]
+      : []),
   ];
   const hiddenRestingBlockIds = restingBlockDefs
     .slice(restingBlockDefs.length - restingHiddenBlockCount)
@@ -5378,9 +5399,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   ) : null}
                   <ComposerFooterPrimaryActions
                     compact={isComposerResting || isComposerPrimaryActionsCompact}
-                    activeContextWindow={
-                      (settings.contextWindowMeterEnabled ?? true) ? activeContextWindow : null
-                    }
+                    activeContextWindow={activeContextWindow}
                     activeThreadModelDisplayName={activeThreadModelDisplayName}
                     pendingAction={pendingPrimaryAction}
                     isRunning={phase === "running"}

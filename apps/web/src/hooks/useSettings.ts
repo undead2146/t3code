@@ -126,7 +126,11 @@ async function hydrateClientSettings(): Promise<void> {
         return;
       }
       if (persistedSettings) {
-        replaceClientSettingsSnapshot({ ...DEFAULT_CLIENT_SETTINGS, ...persistedSettings });
+        const merged = { ...DEFAULT_CLIENT_SETTINGS, ...persistedSettings };
+        if (persistedSettings.contextWindowMeterEnabled === undefined) {
+          merged.contextWindowMeterEnabled = true;
+        }
+        replaceClientSettingsSnapshot(merged);
       }
     } catch (error) {
       console.error(`${CLIENT_SETTINGS_PERSISTENCE_ERROR_SCOPE} hydrate failed`, {

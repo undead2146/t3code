@@ -19,14 +19,14 @@ type NullableContextWindowUsage = {
 };
 
 export type ContextWindowCategories = {
-  readonly userMessages?: number | null;
-  readonly agentResponses?: number | null;
-  readonly toolCalls?: number | null;
-  readonly systemPrompt?: number | null;
-  readonly systemTools?: number | null;
-  readonly skills?: number | null;
-  readonly subagents?: number | null;
-  readonly checkpointBuffer?: number | null;
+  readonly userMessages?: number;
+  readonly agentResponses?: number;
+  readonly toolCalls?: number;
+  readonly systemPrompt?: number;
+  readonly systemTools?: number;
+  readonly skills?: number;
+  readonly subagents?: number;
+  readonly checkpointBuffer?: number;
 };
 
 export type ContextWindowSnapshot = NullableContextWindowUsage & {
@@ -58,18 +58,33 @@ export function deriveLatestContextWindowSnapshot(
     const remainingTokens =
       maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
     const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
-
     const categoriesPayload = asRecord(payload?.categories);
     const categories: ContextWindowCategories | null = categoriesPayload
       ? {
-          userMessages: asFiniteNumber(categoriesPayload.userMessages),
-          agentResponses: asFiniteNumber(categoriesPayload.agentResponses),
-          toolCalls: asFiniteNumber(categoriesPayload.toolCalls),
-          systemPrompt: asFiniteNumber(categoriesPayload.systemPrompt),
-          systemTools: asFiniteNumber(categoriesPayload.systemTools),
-          skills: asFiniteNumber(categoriesPayload.skills),
-          subagents: asFiniteNumber(categoriesPayload.subagents),
-          checkpointBuffer: asFiniteNumber(categoriesPayload.checkpointBuffer),
+          ...(asFiniteNumber(categoriesPayload.userMessages) !== null
+            ? { userMessages: asFiniteNumber(categoriesPayload.userMessages)! }
+            : {}),
+          ...(asFiniteNumber(categoriesPayload.agentResponses) !== null
+            ? { agentResponses: asFiniteNumber(categoriesPayload.agentResponses)! }
+            : {}),
+          ...(asFiniteNumber(categoriesPayload.toolCalls) !== null
+            ? { toolCalls: asFiniteNumber(categoriesPayload.toolCalls)! }
+            : {}),
+          ...(asFiniteNumber(categoriesPayload.systemPrompt) !== null
+            ? { systemPrompt: asFiniteNumber(categoriesPayload.systemPrompt)! }
+            : {}),
+          ...(asFiniteNumber(categoriesPayload.systemTools) !== null
+            ? { systemTools: asFiniteNumber(categoriesPayload.systemTools)! }
+            : {}),
+          ...(asFiniteNumber(categoriesPayload.skills) !== null
+            ? { skills: asFiniteNumber(categoriesPayload.skills)! }
+            : {}),
+          ...(asFiniteNumber(categoriesPayload.subagents) !== null
+            ? { subagents: asFiniteNumber(categoriesPayload.subagents)! }
+            : {}),
+          ...(asFiniteNumber(categoriesPayload.checkpointBuffer) !== null
+            ? { checkpointBuffer: asFiniteNumber(categoriesPayload.checkpointBuffer)! }
+            : {}),
         }
       : null;
 

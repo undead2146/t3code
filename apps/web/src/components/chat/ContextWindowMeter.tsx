@@ -4,6 +4,7 @@ import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic";
 import { Minimize2Icon } from "lucide-react";
 import { composerFloatingLayerProps } from "./composerEventScope";
+import { cn } from "~/lib/utils";
 
 function formatPercentage(value: number | null): string | null {
   if (value === null || !Number.isFinite(value)) {
@@ -21,19 +22,25 @@ export function ContextWindowMeter(props: {
   onCompact?: (() => void) | undefined;
   compactDisabled?: boolean | undefined;
   compactDisabledReason?: string | null | undefined;
+  className?: string;
 }) {
-  const { usage, modelDisplayName, onCompact, compactDisabled, compactDisabledReason } = props;
+  const { usage, modelDisplayName, onCompact, compactDisabled, compactDisabledReason, className } =
+    props;
   const usedPercentage = formatPercentage(usage.usedPercentage);
   const normalizedPercentage = Math.max(0, Math.min(100, usage.usedPercentage ?? 0));
   const radius = 9.75;
   const circumference = 2 * Math.PI * radius;
-  const dashOffset = circumference * (1 - normalizedPercentage / 100);
+  const visiblePercentage = usage.usedTokens > 0 ? Math.max(2.5, normalizedPercentage) : 0;
+  const dashOffset = circumference * (1 - visiblePercentage / 100);
   const totalProcessedTokens = usage.totalProcessedTokens ?? null;
   const showTotalProcessed = totalProcessedTokens !== null && totalProcessedTokens > 0;
   const isOverloaded = normalizedPercentage > 90;
+  const isWarning = normalizedPercentage > 75;
   const usageColor = isOverloaded
     ? "var(--color-error)"
-    : "color-mix(in oklab, var(--color-muted-foreground) 72%, transparent)";
+    : isWarning
+      ? "var(--color-warning)"
+      : "var(--color-primary, #7c3aed)";
 
   return (
     <Popover>
@@ -45,7 +52,11 @@ export function ContextWindowMeter(props: {
           <Button
             size="icon-sm"
             variant="ghost-muted"
-            className="size-7 rounded-full hover:text-muted-foreground data-pressed:text-muted-foreground"
+            data-context-window-meter="true"
+            className={cn(
+              "size-7 rounded-full text-foreground/80 hover:bg-accent hover:text-foreground data-pressed:text-foreground",
+              className,
+            )}
             aria-label={
               usage.maxTokens !== null && usedPercentage
                 ? `Context window ${usedPercentage} used`
@@ -63,7 +74,7 @@ export function ContextWindowMeter(props: {
                   cy="12"
                   r={radius}
                   fill="none"
-                  stroke="color-mix(in oklab, var(--color-muted-foreground) 24%, transparent)"
+                  stroke="color-mix(in oklab, var(--color-muted-foreground) 40%, transparent)"
                   strokeWidth="3"
                 />
                 <circle

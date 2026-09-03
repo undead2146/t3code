@@ -31,6 +31,7 @@ import { orchestrationEnvironment } from "~/state/orchestration";
 import { EMPTY_ASYNC_RESULT_ATOM } from "~/state/query";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { Button } from "~/components/ui/button";
+import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
 
 /**
  * In-flight states all present as Working (one steady state, per the
@@ -173,7 +174,10 @@ function SubagentTranscriptView({
     setOpenOutputs((prev) => ({ ...prev, [idx]: !prev[idx] }));
   };
 
-  if (result._tag === "Initial" || result._tag === "Loading") {
+  if (
+    (result as { _tag: string })._tag === "Initial" ||
+    (result as { _tag: string })._tag === "Loading"
+  ) {
     return (
       <div className="flex items-center gap-1.5 py-1 text-xs text-muted-foreground">
         <span className="animate-spin">◷</span> Loading execution transcript…
@@ -830,57 +834,187 @@ function WorkflowSection({
   );
 }
 
+function ContextWindowPanelSection({ usage }: { usage: ContextWindowSnapshot }) {
+  const [expanded, setExpanded] = useState(true);
+  const usedPercentage = usage.usedPercentage != null ? usage.usedPercentage.toFixed(1) : "0";
+  const normalizedPercentage = Math.max(0, Math.min(100, usage.usedPercentage ?? 0));
+  const isOverloaded = normalizedPercentage > 90;
+  const isWarning = normalizedPercentage > 75;
+  const usageColor = isOverloaded
+    ? "var(--color-error)"
+    : isWarning
+      ? "var(--color-warning)"
+      : "var(--color-primary, #7c3aed)";
+
+  const categoryEntries = [
+    {
+      key: "userMessages",
+      label: "User messages",
+      count: usage.categories?.userMessages,
+      color: "bg-sky-500",
+    },
+    {
+      key: "agentResponses",
+      label: "Agent responses",
+      count: usage.categories?.agentResponses,
+      color: "bg-emerald-500",
+    },
+    {
+      key: "toolCalls",
+      label: "Tool calls & data",
+      count: usage.categories?.toolCalls,
+      color: "bg-amber-500",
+    },
+    {
+      key: "systemPrompt",
+      label: "System instructions",
+      count: usage.categories?.systemPrompt,
+      color: "bg-purple-500",
+    },
+    {
+      key: "systemTools",
+      label: "System tools",
+      count: usage.categories?.systemTools,
+      color: "bg-indigo-500",
+    },
+    { key: "skills", label: "Skills & MCP", count: usage.categories?.skills, color: "bg-cyan-500" },
+    {
+      key: "subagents",
+      label: "Subagent tokens",
+      count: usage.categories?.subagents,
+      color: "bg-pink-500",
+    },
+    {
+      key: "checkpointBuffer",
+      label: "Checkpoint buffer",
+      count: usage.categories?.checkpointBuffer,
+      color: "bg-rose-500",
+    },
+  ].filter((entry) => entry.count != null && entry.count > 0);
+
+  return (
+    <div className="border-b border-border/60 bg-muted/15 p-3">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full cursor-pointer items-center justify-between text-left"
+      >
+        <div className="flex items-center gap-1.5">
+          {expanded ? (
+            <ChevronDown className="size-3.5 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="size-3.5 text-muted-foreground" />
+          )}
+          <span className="text-xs font-semibold text-foreground">Context Window</span>
+          <span className="text-[11px] tabular-nums font-medium text-muted-foreground">
+            {usedPercentage}%
+          </span>
+        </div>
+        <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+          {formatContextWindowTokens(usage.usedTokens)} /{" "}
+          {formatContextWindowTokens(usage.maxTokens ?? 1_000_000)}
+        </span>
+      </button>
+
+      <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted/60">
+        <div
+          className="h-full rounded-full transition-all duration-300"
+          style={{
+            width: `${Math.min(100, Math.max(usage.usedTokens > 0 ? 2 : 0, normalizedPercentage))}%`,
+            backgroundColor: usageColor,
+          }}
+        />
+      </div>
+
+      {expanded && categoryEntries.length > 0 && (
+        <div className="mt-2.5 flex flex-col gap-1 border-t border-border/30 pt-2 text-[11px]">
+          <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+            Usage by category
+          </div>
+          <div className="grid grid-cols-1 gap-1">
+            {categoryEntries.map((cat) => (
+              <div
+                key={cat.key}
+                className="flex items-center justify-between text-muted-foreground"
+              >
+                <span className="flex items-center gap-1.5">
+                  <span className={cn("size-1.5 rounded-full", cat.color)} />
+                  {cat.label}
+                </span>
+                <span className="font-mono tabular-nums text-foreground/80">
+                  {formatContextWindowTokens(cat.count ?? 0)}
+                  {usage.maxTokens
+                    ? ` (${(((cat.count ?? 0) / usage.maxTokens) * 100).toFixed(1)}%)`
+                    : ""}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function AgentsPanel({
   model,
   environmentId = null,
   threadId = null,
+  activeContextWindow = null,
 }: {
   model: AgentPanelModel;
   environmentId?: EnvironmentId | null;
   threadId?: ThreadId | null;
+  activeContextWindow?: ContextWindowSnapshot | null;
 }) {
-  if (!model.hasAgents) {
-    return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
-        <Bot aria-hidden className="size-6 text-muted-foreground/60" />
-        <p className="text-sm font-medium">No agents yet</p>
-        <p className="max-w-56 text-xs text-muted-foreground">
-          When this thread spawns subagents or runs a workflow, they show up here with live status,
-          activity, and token usage.
-        </p>
-      </div>
-    );
-  }
+  const computedSubagentTokens = Math.max(
+    model.totalTokens,
+    activeContextWindow?.categories?.subagents ?? 0,
+  );
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="flex flex-col gap-2 p-2">
-          {model.workflows.map((group) => (
-            <WorkflowSection
-              key={group.workflow.id}
-              group={group}
-              environmentId={environmentId}
-              threadId={threadId}
-            />
-          ))}
-          {model.directAgents.length > 0 ? (
-            <section>
-              <div className="px-1.5 pt-1 text-[.65rem] font-medium uppercase tracking-wider text-muted-foreground">
-                Direct spawns
-              </div>
-              {model.directAgents.map((agent) => (
-                <AgentRow
-                  key={agent.id}
-                  agent={agent}
-                  environmentId={environmentId}
-                  threadId={threadId}
-                />
-              ))}
-            </section>
-          ) : null}
+      {activeContextWindow ? <ContextWindowPanelSection usage={activeContextWindow} /> : null}
+
+      {!model.hasAgents ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+          <Bot aria-hidden className="size-6 text-muted-foreground/60" />
+          <p className="text-sm font-medium">No subagents yet</p>
+          <p className="max-w-56 text-xs text-muted-foreground">
+            When this thread spawns subagents or runs a workflow, they show up here with live
+            status, activity, and token usage.
+          </p>
         </div>
-      </ScrollArea>
+      ) : (
+        <ScrollArea className="min-h-0 flex-1">
+          <div className="flex flex-col gap-2 p-2">
+            {model.workflows.map((group) => (
+              <WorkflowSection
+                key={group.workflow.id}
+                group={group}
+                environmentId={environmentId}
+                threadId={threadId}
+              />
+            ))}
+            {model.directAgents.length > 0 ? (
+              <section>
+                <div className="px-1.5 pt-1 text-[.65rem] font-medium uppercase tracking-wider text-muted-foreground">
+                  Direct spawns
+                </div>
+                {model.directAgents.map((agent) => (
+                  <AgentRow
+                    key={agent.id}
+                    agent={agent}
+                    environmentId={environmentId}
+                    threadId={threadId}
+                  />
+                ))}
+              </section>
+            ) : null}
+          </div>
+        </ScrollArea>
+      )}
+
       <footer className="flex items-center justify-between border-t border-border/60 px-3 py-1.5 font-mono text-[.7rem] text-muted-foreground">
         <span className="flex items-center gap-2">
           {model.runningCount + model.waitingCount > 0 ? (
@@ -891,7 +1025,9 @@ export function AgentsPanel({
           {model.idleCount > 0 ? <span>{model.idleCount} idle</span> : null}
           {model.settledCount > 0 ? <span>{model.settledCount} settled</span> : null}
         </span>
-        <span className="tabular-nums">Σ {formatSubagentTokenCount(model.totalTokens)} tok</span>
+        <span className="tabular-nums">
+          Σ {formatSubagentTokenCount(computedSubagentTokens)} tok
+        </span>
       </footer>
     </div>
   );
