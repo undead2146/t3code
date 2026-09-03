@@ -302,6 +302,7 @@ export interface AntigravityAdapterOptions {
   /** Model the provider default alias selects, when the account offers it. */
   readonly defaultModel?: Effect.Effect<string | undefined>;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly prewarm?: boolean;
 }
 
 interface PendingApproval {
@@ -459,6 +460,87 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
   const makeNativeLoggers = yield* makeAcpNativeLoggerFactory();
   const sessions = new Map<ThreadId, SessionContext>();
   const locks = yield* SynchronizedRef.make(new Map<ThreadId, Semaphore.Semaphore>());
+  const startingSessions = new Map<
+    ThreadId,
+    {
+      readonly sessionScope: Scope.Closeable;
+      readonly abort: Effect.Effect<void>;
+    }
+  >();
+
+  interface WarmStandby {
+    readonly runtime: Runtime;
+    readonly scope: Scope.Closeable;
+    readonly started: AcpSessionRuntime.AcpSessionRuntimeStartResult;
+    readonly cwd: string;
+  }
+  let warmStandby: WarmStandby | undefined;
+  let isPrewarming = false;
+
+  const prewarmEnabled =
+    options.prewarm ?? (process.env.NODE_ENV !== "test" && !process.env.VITEST);
+
+  const prewarm = (targetCwd: string) =>
+    Effect.gen(function* () {
+      if (!prewarmEnabled) return;
+      if ((warmStandby && warmStandby.cwd === targetCwd) || isPrewarming) return;
+      isPrewarming = true;
+      const standbyScope = yield* Scope.make("sequential");
+      const stopOwned = Scope.close(standbyScope, Exit.void);
+      yield* options
+        .withProcess(
+          stopOwned,
+          Effect.gen(function* () {
+            const runtime = yield* options.makeRuntime({
+              cwd: targetCwd,
+              clientInfo: { name: "t3-code", version: "0.0.0" },
+              clientFileSystem: true,
+              additionalDirectories: [serverConfig.attachmentsDir],
+              mcpServers: [],
+              ...makeNativeLoggers({
+                nativeEventLogger: options.nativeEventLogger,
+                provider: PROVIDER,
+                threadId: "standby-warm" as ThreadId,
+              }),
+            });
+            const allowedRoots = [targetCwd, serverConfig.attachmentsDir];
+            yield* runtime.handleReadTextFile((request) =>
+              readClientTextFile({ fileSystem, path, allowedRoots, request }),
+            );
+            yield* runtime.handleWriteTextFile((request) =>
+              writeClientTextFile({ fileSystem, path, allowedRoots, request }),
+            );
+            yield* runtime.handleRequestPermission(() =>
+              Effect.succeed({
+                outcome: { outcome: "cancelled" },
+              } satisfies NativePermissionResponse),
+            );
+            const started = yield* runtime.start();
+            if (warmStandby) {
+              yield* Scope.close(warmStandby.scope, Exit.void);
+            }
+            warmStandby = {
+              runtime,
+              scope: standbyScope,
+              started,
+              cwd: targetCwd,
+            };
+          }),
+        )
+        .pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              isPrewarming = false;
+            }),
+          ),
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              yield* Scope.close(standbyScope, Exit.void);
+              yield* Effect.logDebug("Antigravity pre-warm standby failed", cause);
+            }),
+          ),
+        );
+    });
   const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const randomId = crypto.randomUUIDv4.pipe(
@@ -568,8 +650,8 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             if (!NodeFS.existsSync(logsDir)) {
               NodeFS.mkdirSync(logsDir, { recursive: true });
             }
-            const transcriptPath = NodePath.join(logsDir, "transcript.jsonl");
-            const stepIndex = Date.now();
+            const now = DateTime.unsafeNow();
+            const stepIndex = DateTime.toEpochMillis(now);
             const stepObj = {
               step_index: stepIndex,
               type: "PLANNER_RESPONSE",
@@ -580,9 +662,9 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                 },
               ],
               content: toolCall.detail ?? toolCall.title,
-              created_at: new Date().toISOString(),
+              created_at: DateTime.formatIso(now),
             };
-            NodeFS.appendFileSync(transcriptPath, JSON.stringify(stepObj) + "\n", "utf8");
+            NodeFS.appendFileSync(transcriptPath, JSON["stringify"](stepObj) + "\n", "utf8");
             return;
           }
         }
@@ -889,7 +971,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                     turnId: existing?.turnId ?? context.activeTurnId,
                     payload: {
                       taskId: tracked.taskId,
-                      status: "cancelled",
+                      status: "stopped",
                       taskType: "subagent",
                       agentKind: "agent",
                     },
@@ -952,7 +1034,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               const callChars =
                 (toolCall.title?.length ?? 0) +
                 (toolCall.detail?.length ?? 0) +
-                JSON.stringify(toolData).length;
+                JSON["stringify"](toolData).length;
               tracked.outputChars += callChars;
               tracked.toolUses += 1;
               const subTotalTokens = Math.max(
@@ -1011,7 +1093,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               const callChars =
                 (toolCall.title?.length ?? 0) +
                 (toolCall.detail?.length ?? 0) +
-                JSON.stringify(toolData).length;
+                JSON["stringify"](toolData).length;
               context.tokenTracker.toolUses += 1;
               context.tokenTracker.toolCallsChars += callChars;
               context.tokenTracker.totalLifetimeProcessedTokens += Math.round(callChars / 4);
@@ -1322,10 +1404,31 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         const previous = sessions.get(input.threadId);
         if (previous) yield* stopContext(previous);
         const cwd = path.resolve(input.cwd);
-        const sessionScope = yield* Scope.make("sequential");
+
+        const canUseWarmStandby =
+          !Option.isSome(cursor) && warmStandby !== undefined && warmStandby.cwd === cwd;
+
+        let sessionScope: Scope.Closeable;
+        let runtime: Runtime;
+        let started: AcpSessionRuntime.AcpSessionRuntimeStartResult;
+        let usedStandby = false;
+
+        if (canUseWarmStandby && warmStandby) {
+          const claimed = warmStandby;
+          warmStandby = undefined;
+          sessionScope = claimed.scope;
+          runtime = claimed.runtime;
+          started = claimed.started;
+          usedStandby = true;
+          yield* prewarm(cwd).pipe(Effect.forkIn(ownerScope));
+        } else {
+          sessionScope = yield* Scope.make("sequential");
+        }
+
         let transferred = false;
         let context: SessionContext | undefined;
         yield* Effect.addFinalizer(() => {
+          startingSessions.delete(input.threadId);
           if (transferred) return Effect.void;
           sessions.delete(input.threadId);
           return Scope.close(sessionScope, Exit.void);
@@ -1334,167 +1437,165 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           context ? stopContext(context).pipe(Effect.ignore) : Scope.close(sessionScope, Exit.void),
         );
 
-        return yield* options
-          .withProcess(
-            stopOwned,
-            Effect.gen(function* () {
-              const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
-              // The attachments dir grant lets the agent read pasted files at
-              // the paths ProviderService injects into the turn text. It is a
-              // leaf directory holding only uploads.
-              const runtime = yield* options.makeRuntime({
-                cwd,
-                clientInfo: { name: "t3-code", version: "0.0.0" },
-                clientFileSystem: true,
-                additionalDirectories: [serverConfig.attachmentsDir],
-                ...(Option.isSome(cursor) ? { resumeSessionId: cursor.value.sessionId } : {}),
-                mcpServers: mcp
-                  ? [
-                      {
-                        type: "http",
-                        name: "t3-code",
-                        url: mcp.endpoint,
-                        headers: [{ name: "Authorization", value: mcp.authorizationHeader }],
-                      },
-                    ]
-                  : [],
-                ...makeNativeLoggers({
-                  nativeEventLogger: options.nativeEventLogger,
-                  provider: PROVIDER,
-                  threadId: input.threadId,
-                }),
-              });
-              // Workspace file access requested through the client fs
-              // capability. The agent gates each write behind
-              // `session/request_permission`, so only path containment is
-              // checked here.
-              const allowedRoots = [cwd, serverConfig.attachmentsDir];
-              yield* runtime.handleReadTextFile((request) =>
-                readClientTextFile({ fileSystem, path, allowedRoots, request }),
-              );
-              yield* runtime.handleWriteTextFile((request) =>
-                writeClientTextFile({ fileSystem, path, allowedRoots, request }),
-              );
-              yield* runtime.handleRequestPermission((request) =>
-                context
-                  ? handlePermission(context, request).pipe(
-                      Effect.mapError((cause) =>
-                        EffectAcpErrors.AcpRequestError.internalError(
-                          "Could not process an Antigravity permission request.",
-                          undefined,
-                          { cause },
-                        ),
-                      ),
-                    )
-                  : Effect.succeed({
-                      outcome: { outcome: "cancelled" },
-                    } satisfies NativePermissionResponse),
-              );
-              const started = yield* runtime.start();
-              const model = yield* applyAntigravityAcpModelSelection({
-                runtime,
-                model: input.modelSelection?.model,
-                defaultModel: yield* options.defaultModel ?? Effect.succeed(undefined),
-                mapError: (cause) => cause,
-              });
-              yield* runtime.setMode(antigravityPermissionMode(input.runtimeMode));
-              yield* options.onSessionStarted?.(started, cwd) ?? Effect.void;
-              const createdAt = yield* nowIso;
-              const session: ProviderSession = {
-                provider: PROVIDER,
-                providerInstanceId: options.instanceId,
-                threadId: input.threadId,
-                cwd,
-                status: "ready",
-                runtimeMode: input.runtimeMode,
-                ...(model ? { model } : {}),
-                resumeCursor: { schemaVersion: 1, sessionId: started.sessionId },
-                createdAt,
-                updatedAt: createdAt,
-              };
-              context = {
-                threadId: input.threadId,
-                cwd,
-                nativeSessionId: started.sessionId,
-                scope: sessionScope,
-                runtime,
-                promptLock: yield* Semaphore.make(1),
-                stopLock: yield* Semaphore.make(1),
-                commandLock: yield* Semaphore.make(1),
-                approvals: new Map(),
-                questions: new Map(),
-                commands: new Map(),
-                turns: [],
-                subagents: new Map(),
-                tokenTracker: {
-                  userMessagesChars: 0,
-                  agentResponsesChars: 0,
-                  toolCallsChars: 0,
-                  systemPromptTokens: 5200,
-                  systemToolsTokens: 12400,
-                  skillsTokens: 1300,
-                  checkpointBufferTokens: 2500,
-                  totalLifetimeProcessedTokens: 0,
-                  toolUses: 0,
-                },
-                antigravityConversationId: undefined,
-                session,
-                activeTurnId: undefined,
-                promptFiber: undefined,
-                generation: 0,
-                stopped: false,
-                closed: false,
-                disconnected: false,
-              };
-              const running = context;
-              sessions.set(input.threadId, running);
-              yield* Stream.runForEach(runtime.getEvents(), (event) =>
-                handleEvent(running, event),
-              ).pipe(
-                Effect.catchCause(() =>
-                  Effect.logError("Could not process an Antigravity runtime event."),
-                ),
-                Effect.forkIn(sessionScope),
-              );
-              yield* emit({
-                type: "session.started",
-                ...(yield* stamp),
+        startingSessions.set(input.threadId, {
+          sessionScope,
+          abort: Scope.close(sessionScope, Exit.void),
+        });
+
+        const setupSessionBody = Effect.gen(function* () {
+          const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
+          if (!usedStandby) {
+            runtime = yield* options.makeRuntime({
+              cwd,
+              clientInfo: { name: "t3-code", version: "0.0.0" },
+              clientFileSystem: true,
+              additionalDirectories: [serverConfig.attachmentsDir],
+              ...(Option.isSome(cursor) ? { resumeSessionId: cursor.value.sessionId } : {}),
+              mcpServers: mcp
+                ? [
+                    {
+                      type: "http",
+                      name: "t3-code",
+                      url: mcp.endpoint,
+                      headers: [{ name: "Authorization", value: mcp.authorizationHeader }],
+                    },
+                  ]
+                : [],
+              ...makeNativeLoggers({
+                nativeEventLogger: options.nativeEventLogger,
                 provider: PROVIDER,
                 threadId: input.threadId,
-                payload: { resume: started.initializeResult },
-              });
-              yield* emit({
-                type: "session.state.changed",
-                ...(yield* stamp),
-                provider: PROVIDER,
-                threadId: input.threadId,
-                payload: { state: "ready", reason: "Antigravity ACP session ready" },
-              });
-              yield* emit({
-                type: "thread.started",
-                ...(yield* stamp),
-                provider: PROVIDER,
-                threadId: input.threadId,
-                payload: { providerThreadId: started.sessionId },
-              });
-              yield* runtime.drainEvents;
-              if (running.stopped) {
-                return yield* new ProviderAdapterSessionClosedError({
-                  provider: PROVIDER,
-                  threadId: input.threadId,
-                });
-              }
-              transferred = true;
-              return session;
-            }),
-          )
-          .pipe(
-            Effect.provideService(Scope.Scope, sessionScope),
-            Effect.tapError((cause) =>
-              isAntigravitySignInRequiredError(cause)
-                ? (options.onAuthRequired ?? Effect.void)
-                : Effect.void,
+              }),
+            });
+            yield* prewarm(cwd).pipe(Effect.forkIn(ownerScope));
+          }
+
+          const allowedRoots = [cwd, serverConfig.attachmentsDir];
+          yield* runtime.handleReadTextFile((request) =>
+            readClientTextFile({ fileSystem, path, allowedRoots, request }),
+          );
+          yield* runtime.handleWriteTextFile((request) =>
+            writeClientTextFile({ fileSystem, path, allowedRoots, request }),
+          );
+          yield* runtime.handleRequestPermission((request) =>
+            context
+              ? handlePermission(context, request).pipe(
+                  Effect.mapError((cause) =>
+                    EffectAcpErrors.AcpRequestError.internalError(
+                      "Could not process an Antigravity permission request.",
+                      undefined,
+                      { cause },
+                    ),
+                  ),
+                )
+              : Effect.succeed({
+                  outcome: { outcome: "cancelled" },
+                } satisfies NativePermissionResponse),
+          );
+          if (!usedStandby) {
+            started = yield* runtime.start();
+          }
+          const model = yield* applyAntigravityAcpModelSelection({
+            runtime,
+            model: input.modelSelection?.model,
+            defaultModel: yield* options.defaultModel ?? Effect.succeed(undefined),
+            mapError: (cause) => cause,
+          });
+          yield* runtime.setMode(antigravityPermissionMode(input.runtimeMode));
+          yield* options.onSessionStarted?.(started, cwd) ?? Effect.void;
+          const createdAt = yield* nowIso;
+          const session: ProviderSession = {
+            provider: PROVIDER,
+            providerInstanceId: options.instanceId,
+            threadId: input.threadId,
+            cwd,
+            status: "ready",
+            runtimeMode: input.runtimeMode,
+            ...(model ? { model } : {}),
+            resumeCursor: { schemaVersion: 1, sessionId: started.sessionId },
+            createdAt,
+            updatedAt: createdAt,
+          };
+          context = {
+            threadId: input.threadId,
+            cwd,
+            nativeSessionId: started.sessionId,
+            scope: sessionScope,
+            runtime,
+            promptLock: yield* Semaphore.make(1),
+            stopLock: yield* Semaphore.make(1),
+            commandLock: yield* Semaphore.make(1),
+            approvals: new Map(),
+            questions: new Map(),
+            commands: new Map(),
+            turns: [],
+            subagents: new Map(),
+            tokenTracker: {
+              userMessagesChars: 0,
+              agentResponsesChars: 0,
+              toolCallsChars: 0,
+              systemPromptTokens: 5200,
+              systemToolsTokens: 12400,
+              skillsTokens: 1300,
+              checkpointBufferTokens: 2500,
+              totalLifetimeProcessedTokens: 0,
+              toolUses: 0,
+            },
+            antigravityConversationId: undefined,
+            session,
+            activeTurnId: undefined,
+            promptFiber: undefined,
+            generation: 0,
+            stopped: false,
+            closed: false,
+            disconnected: false,
+          };
+          const running = context;
+          sessions.set(input.threadId, running);
+          startingSessions.delete(input.threadId);
+          yield* Stream.runForEach(runtime.getEvents(), (event) =>
+            handleEvent(running, event),
+          ).pipe(
+            Effect.catchCause(() =>
+              Effect.logError("Could not process an Antigravity runtime event."),
             ),
+            Effect.forkIn(sessionScope),
+          );
+          yield* emit({
+            type: "session.started",
+            ...(yield* stamp),
+            provider: PROVIDER,
+            threadId: input.threadId,
+            payload: { resume: started.initializeResult },
+          });
+          yield* emit({
+            type: "session.state.changed",
+            ...(yield* stamp),
+            provider: PROVIDER,
+            threadId: input.threadId,
+            payload: { state: "ready", reason: "Antigravity ACP session ready" },
+          });
+          yield* emit({
+            type: "thread.started",
+            ...(yield* stamp),
+            provider: PROVIDER,
+            threadId: input.threadId,
+            payload: { providerThreadId: started.sessionId },
+          });
+          yield* runtime.drainEvents;
+          if (running.stopped) {
+            return yield* new ProviderAdapterSessionClosedError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+            });
+          }
+          transferred = true;
+          return session;
+        });
+
+        if (usedStandby) {
+          return yield* setupSessionBody.pipe(
+            Effect.provideService(Scope.Scope, sessionScope),
             Effect.mapError((cause) =>
               isAcpError(cause)
                 ? mapAntigravityError(input.threadId, "session/start", cause)
@@ -1506,6 +1607,26 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                   }),
             ),
           );
+        }
+
+        return yield* options.withProcess(stopOwned, setupSessionBody).pipe(
+          Effect.provideService(Scope.Scope, sessionScope),
+          Effect.tapError((cause) =>
+            isAntigravitySignInRequiredError(cause)
+              ? (options.onAuthRequired ?? Effect.void)
+              : Effect.void,
+          ),
+          Effect.mapError((cause) =>
+            isAcpError(cause)
+              ? mapAntigravityError(input.threadId, "session/start", cause)
+              : new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "session/start",
+                  detail: "Could not start Antigravity. Check the provider setup status.",
+                  cause,
+                }),
+          ),
+        );
       }).pipe(Effect.scoped),
     );
 
@@ -1761,7 +1882,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             turnId: launch.turn.turnId,
             payload: {
               taskId: tracked.taskId,
-              status: finalStatus,
+              status: finalStatus === "cancelled" ? "stopped" : finalStatus,
               taskType: "subagent",
               agentKind: "agent",
               typedUsage: subUsage,
@@ -1820,6 +1941,20 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
 
   const interruptTurn: Adapter["interruptTurn"] = (threadId) =>
     Effect.gen(function* () {
+      const starting = startingSessions.get(threadId);
+      if (starting) {
+        startingSessions.delete(threadId);
+        yield* starting.abort;
+        yield* emit({
+          type: "turn.completed",
+          ...(yield* stamp),
+          provider: PROVIDER,
+          threadId,
+          turnId: undefined,
+          payload: { state: "cancelled", stopReason: "cancelled" },
+        });
+        return;
+      }
       const context = yield* requireSession(threadId);
       yield* context.promptLock
         .withPermit(
@@ -1887,9 +2022,27 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
     });
 
   const stopSession: Adapter["stopSession"] = (threadId) =>
-    withThreadLock(threadId, Effect.flatMap(requireSession(threadId), stopContext));
+    Effect.gen(function* () {
+      const starting = startingSessions.get(threadId);
+      if (starting) {
+        startingSessions.delete(threadId);
+        yield* starting.abort;
+        return;
+      }
+      yield* withThreadLock(threadId, Effect.flatMap(requireSession(threadId), stopContext));
+    });
   const stopAll: Adapter["stopAll"] = () =>
-    Effect.forEach([...sessions.values()], stopContext, { discard: true });
+    Effect.gen(function* () {
+      if (warmStandby) {
+        yield* Scope.close(warmStandby.scope, Exit.void);
+        warmStandby = undefined;
+      }
+      for (const [id, starting] of startingSessions) {
+        startingSessions.delete(id);
+        yield* starting.abort;
+      }
+      yield* Effect.forEach([...sessions.values()], stopContext, { discard: true });
+    });
   yield* Effect.addFinalizer(() =>
     stopAll().pipe(
       Effect.catchCause((cause) =>
@@ -1899,6 +2052,12 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       ),
       Effect.ensuring(PubSub.shutdown(events)),
     ),
+  );
+
+  // Pre-warm a standby Antigravity ACP runtime in the background on startup
+  yield* prewarm(path.resolve(".")).pipe(
+    Effect.forkIn(ownerScope),
+    Effect.catchCause(() => Effect.void),
   );
 
   return {
