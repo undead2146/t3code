@@ -4,6 +4,7 @@ import type {
   OrchestrationThreadDetailSnapshot,
 } from "@t3tools/contracts";
 import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
+import { computeSubagentUsage } from "./subagentTranscriptQuery.ts";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -360,6 +361,28 @@ export function projectActivityPayload(
   activity: OrchestrationThreadActivity,
 ): OrchestrationThreadActivity {
   const payload = asRecord(activity.payload);
+  if (
+    (activity.kind === "task.progress" ||
+      activity.kind === "task.completed" ||
+      activity.kind === "task.started") &&
+    payload
+  ) {
+    const taskId = asTrimmedString(payload.taskId);
+    if (taskId && !payload.typedUsage && !payload.usage) {
+      const usage = computeSubagentUsage(taskId);
+      if (usage) {
+        return {
+          ...activity,
+          payload: {
+            ...payload,
+            typedUsage: usage,
+          },
+        };
+      }
+    }
+    return activity;
+  }
+
   const data = asRecord(payload?.data);
   if (!payload || !data) {
     return activity;

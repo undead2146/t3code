@@ -27,7 +27,7 @@ const clientSettings: ClientSettings = {
   confirmThreadDelete: false,
   confirmThreadUnpin: false,
   continueThreadsAfterServerUpdate: true,
-  contextWindowMeterEnabled: false,
+  contextWindowMeterEnabled: true,
   dismissedProviderUpdateNotificationKeys: [],
   diffIgnoreWhitespace: true,
   diffLayout: "stacked",
