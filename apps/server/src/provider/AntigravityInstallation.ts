@@ -313,7 +313,7 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
         "The managed runtime record is invalid. Reinstall Antigravity.",
       );
     }
-    const contents = yield* fs.readFileString(filePath);
+    const contents = (yield* fs.readFileString(filePath)).replace(/^\uFEFF/, "");
     return yield* Schema.decodeUnknownEffect(Schema.fromJsonString(schema))(contents);
   });
 
