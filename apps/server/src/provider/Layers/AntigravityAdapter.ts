@@ -106,6 +106,21 @@ export function registerKilledSubagent(conversationId: string): void {
   } catch {}
 }
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function extractSubagentConversationId(
+  toolCallId: string,
+  nativeSessionId?: string,
+): string | undefined {
+  if (!toolCallId) return undefined;
+  const parts = toolCallId.split(":");
+  const candidate = parts[0];
+  if (candidate && UUID_REGEX.test(candidate) && candidate !== nativeSessionId) {
+    return candidate;
+  }
+  return undefined;
+}
+
 export interface TrackedSubagent {
   readonly taskId: RuntimeTaskId;
   readonly role?: string | undefined;
@@ -653,10 +668,73 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               }
             }
 
+            // Check if this toolCall belongs to a multiplexed subagent
+            const subagentId = extractSubagentConversationId(
+              toolCall.toolCallId,
+              context.nativeSessionId,
+            );
+            if (subagentId && !KILLED_SUBAGENT_IDS.has(subagentId)) {
+              let tracked = context.subagents.get(subagentId);
+              if (!tracked) {
+                const taskId = RuntimeTaskId.make(subagentId);
+                const subIndex = context.subagents.size + 1;
+                const role = `Subagent #${subIndex}`;
+                tracked = {
+                  taskId,
+                  role,
+                  status: "running",
+                  conversationId: subagentId,
+                  stepIndex: subIndex,
+                };
+                context.subagents.set(subagentId, tracked);
+                context.subagents.set(String(taskId), tracked);
+                yield* emit({
+                  type: "task.started",
+                  ...(yield* stamp),
+                  provider: PROVIDER,
+                  threadId: context.threadId,
+                  turnId: existing?.turnId ?? context.activeTurnId,
+                  payload: {
+                    taskId,
+                    taskType: "subagent",
+                    agentKind: "agent",
+                    title: role,
+                    description: toolCall.title ?? toolCall.detail ?? role,
+                    role,
+                    model: context.session.model ?? "gemini-3.8-flash-high",
+                  },
+                });
+              }
+
+              if (toolCall.status === "inProgress" || toolCall.status === "pending") {
+                yield* emit({
+                  type: "task.progress",
+                  ...(yield* stamp),
+                  provider: PROVIDER,
+                  threadId: context.threadId,
+                  turnId: existing?.turnId ?? context.activeTurnId,
+                  payload: {
+                    taskId: tracked.taskId,
+                    status: "running",
+                    taskType: "subagent",
+                    agentKind: "agent",
+                    summary: toolCall.title ?? toolCall.detail ?? "Running tool",
+                    description: toolCall.title ?? toolCall.detail ?? "Running tool",
+                    lastToolName: toolCall.title?.split(" ")[0]?.toLowerCase() ?? "tool",
+                  },
+                });
+              }
+            }
+
             const toolTitle = (toolCall.title ?? toolCall.kind ?? "").toLowerCase();
             const toolData = (toolCall.data ?? {}) as Record<string, unknown>;
 
-            if (toolTitle.includes("invoke_subagent")) {
+            if (
+              (toolTitle.includes("subagent") ||
+                toolTitle.includes("invoke_subagent") ||
+                toolTitle.includes("start_subagent")) &&
+              !toolTitle.includes("manage_subagents")
+            ) {
               const subagentsArg = (toolData.Subagents || toolData.subagents) as unknown;
               if (Array.isArray(subagentsArg)) {
                 for (const sub of subagentsArg) {

@@ -59,6 +59,42 @@ export function findTranscriptPath(conversationId: string): string | null {
     ),
   ];
 
+  const providerRoots = [
+    NodePath.join(home, ".t3", "userdata", "providers", "antigravity"),
+    NodePath.join(process.cwd(), ".t3", "userdata", "providers", "antigravity"),
+  ];
+  for (const root of providerRoots) {
+    try {
+      if (NodeFS.existsSync(root)) {
+        const hashes = NodeFS.readdirSync(root);
+        for (const h of hashes) {
+          candidates.push(
+            NodePath.join(
+              root,
+              h,
+              "antigravity-acp",
+              "brain",
+              conversationId,
+              ".system_generated",
+              "logs",
+              "transcript.jsonl",
+            ),
+            NodePath.join(
+              root,
+              h,
+              "antigravity-acp",
+              "brain",
+              conversationId,
+              ".system_generated",
+              "logs",
+              "transcript_full.jsonl",
+            ),
+          );
+        }
+      }
+    } catch {}
+  }
+
   for (const candidate of candidates) {
     try {
       if (NodeFS.existsSync(candidate)) {
