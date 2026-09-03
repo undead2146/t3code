@@ -2477,10 +2477,42 @@ function ChatViewContent(props: ChatViewProps) {
       ? null
       : JSON.stringify([activityId, latestCheckpointCompletedAt]);
   }, [latestCheckpointCompletedAt, threadActivities]);
-  const activeContextWindow = useMemo(
-    () => deriveLatestContextWindowSnapshot(threadActivities),
-    [threadActivities],
-  );
+  const activeContextWindow = useMemo(() => {
+    const latest = deriveLatestContextWindowSnapshot(threadActivities);
+    if (latest) return latest;
+    return {
+      usedTokens: 0,
+      totalProcessedTokens: 0,
+      maxTokens: 1_000_000,
+      remainingTokens: 1_000_000,
+      usedPercentage: 0,
+      remainingPercentage: 100,
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningOutputTokens: null,
+      lastUsedTokens: null,
+      lastInputTokens: null,
+      lastCachedInputTokens: null,
+      lastOutputTokens: null,
+      lastReasoningOutputTokens: null,
+      toolUses: 0,
+      durationMs: null,
+      compactsAutomatically: true,
+      autoCompactThreshold: null,
+      updatedAt: null,
+      categories: {
+        userMessages: 0,
+        agentResponses: 0,
+        toolCalls: 0,
+        systemPrompt: 0,
+        systemTools: 0,
+        skills: 0,
+        subagents: 0,
+        checkpointBuffer: 0,
+      },
+    };
+  }, [threadActivities]);
   const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
   // Native subagent fold: memoized by activity-list identity, shared by the
   // Agents surface, live strip, and workflow cards. v2Projection is null

@@ -28,6 +28,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { cn } from "~/lib/utils";
 import { orchestrationEnvironment } from "~/state/orchestration";
+import { EMPTY_ASYNC_RESULT_ATOM } from "~/state/query";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { Button } from "~/components/ui/button";
 
@@ -160,10 +161,12 @@ function SubagentTranscriptView({
   const [openOutputs, setOpenOutputs] = useState<Record<number, boolean>>({});
 
   const result = useAtomValue(
-    orchestrationEnvironment.subagentTranscript({
-      environmentId,
-      input: { conversationId, limit: showAll ? undefined : 20 },
-    }),
+    environmentId && conversationId
+      ? orchestrationEnvironment.subagentTranscript({
+          environmentId,
+          input: { conversationId, limit: showAll ? undefined : 20 },
+        })
+      : EMPTY_ASYNC_RESULT_ATOM,
   );
 
   const toggleOutput = (idx: number) => {
@@ -299,10 +302,7 @@ function AgentRow({
           environmentId,
           input: { conversationId, limit: 1 },
         })
-      : orchestrationEnvironment.subagentTranscript({
-          environmentId: "" as EnvironmentId,
-          input: { conversationId: "" },
-        }),
+      : EMPTY_ASYNC_RESULT_ATOM,
   );
 
   const effectiveUsage =

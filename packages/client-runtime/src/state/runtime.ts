@@ -452,8 +452,12 @@ function parseEnvironmentRpcKey<Input>(key: string): {
   readonly input: Input;
 } {
   const decoded = JSON.parse(key) as [EnvironmentIdType, Input];
+  const envId =
+    typeof decoded[0] === "string" && decoded[0].trim().length > 0
+      ? EnvironmentId.make(decoded[0])
+      : decoded[0];
   return {
-    environmentId: EnvironmentId.make(decoded[0]),
+    environmentId: envId,
     input: decoded[1],
   };
 }
