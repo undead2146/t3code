@@ -1233,6 +1233,10 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       yield* Fiber.await(sendTurnFiber);
 
       assert.equal(yield* adapter.hasSession(threadId), true);
+      const sessionList = yield* adapter.listSessions();
+      const s = sessionList.find((entry) => entry.threadId === threadId);
+      assert.equal(s?.status, "ready");
+      assert.equal(s?.activeTurnId, undefined);
       yield* adapter.stopSession(threadId);
     }),
   );

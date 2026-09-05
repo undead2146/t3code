@@ -2057,7 +2057,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     if (activePendingProgress) {
       return `pending:${activePendingProgress.questionIndex}:${activePendingProgress.isLastQuestion}:${activePendingIsResponding}`;
     }
-    if (phase === "running") {
+    if (phase === "running" || phase === "connecting") {
       return "running";
     }
     if (showPlanFollowUpPrompt) {
@@ -5614,7 +5614,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     activeContextWindow={activeContextWindow}
                     activeThreadModelDisplayName={activeThreadModelDisplayName}
                     pendingAction={pendingPrimaryAction}
-                    isRunning={phase === "running"}
+                    isRunning={phase === "running" || phase === "connecting"}
                     showPlanFollowUpPrompt={
                       pendingUserInputs.length === 0 && showPlanFollowUpPrompt
                     }

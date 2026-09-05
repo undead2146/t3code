@@ -651,6 +651,7 @@ interface SessionContext {
   antigravityConversationId: string | undefined;
   session: ProviderSession;
   activeTurnId: TurnId | undefined;
+  activeTurnIntent?: TurnIntent | undefined;
   lastEmittedUsage?: ThreadTokenUsageSnapshot;
   promptFiber: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError> | undefined;
   generation: number;
@@ -2082,6 +2083,46 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       }),
     );
 
+  const finishSessionTurn = (
+    context: SessionContext,
+    turn: TurnIntent,
+    payload: TurnCompletedPayload,
+  ) =>
+    Effect.gen(function* () {
+      if (turn.settled || context.stopped || context.generation !== turn.generation) return;
+      turn.settled = true;
+      context.activeTurnIntent = undefined;
+      yield* promoteBackgroundCommands(context);
+      yield* finishSubagents(
+        context,
+        payload.state === "cancelled"
+          ? "cancelled"
+          : payload.state === "failed"
+            ? "failed"
+            : "idle",
+        payload.errorMessage,
+      );
+      syncTokenTrackerFromDb(context);
+      yield* emitTokenUsage(context, turn.turnId);
+      context.activeTurnId = undefined;
+      context.promptFiber = undefined;
+      context.session = {
+        ...context.session,
+        status: payload.state === "failed" ? "error" : "ready",
+        activeTurnId: undefined,
+        updatedAt: yield* nowIso,
+        ...(payload.errorMessage ? { lastError: payload.errorMessage } : { lastError: undefined }),
+      };
+      yield* emit({
+        type: "turn.completed",
+        ...(yield* stamp),
+        provider: PROVIDER,
+        threadId: context.threadId,
+        turnId: turn.turnId,
+        payload,
+      });
+    }).pipe(Effect.uninterruptible);
+
   const sendTurn: Adapter["sendTurn"] = Effect.fn("AntigravityAdapter.sendTurn")(function* (input) {
     const context = yield* requireSession(input.threadId);
     if (input.modelSelection && input.modelSelection.instanceId !== options.instanceId) {
@@ -2103,41 +2144,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
     let intent: TurnIntent | undefined;
     // The caller holds promptLock while it changes or settles the active turn.
     const finishTurn = (turn: TurnIntent, payload: TurnCompletedPayload) =>
-      Effect.gen(function* () {
-        if (turn.settled || context.stopped || context.generation !== turn.generation) return;
-        turn.settled = true;
-        yield* promoteBackgroundCommands(context);
-        yield* finishSubagents(
-          context,
-          payload.state === "cancelled"
-            ? "cancelled"
-            : payload.state === "failed"
-              ? "failed"
-              : "idle",
-          payload.errorMessage,
-        );
-        syncTokenTrackerFromDb(context);
-        yield* emitTokenUsage(context, turn.turnId);
-        context.activeTurnId = undefined;
-        context.promptFiber = undefined;
-        context.session = {
-          ...context.session,
-          status: payload.state === "failed" ? "error" : "ready",
-          activeTurnId: undefined,
-          updatedAt: yield* nowIso,
-          ...(payload.errorMessage
-            ? { lastError: payload.errorMessage }
-            : { lastError: undefined }),
-        };
-        yield* emit({
-          type: "turn.completed",
-          ...(yield* stamp),
-          provider: PROVIDER,
-          threadId: input.threadId,
-          turnId: turn.turnId,
-          payload,
-        });
-      }).pipe(Effect.uninterruptible);
+      finishSessionTurn(context, turn, payload);
 
     return yield* Effect.gen(function* () {
       const launch = yield* context.promptLock.withPermit(
@@ -2160,6 +2167,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           const steering = context.activeTurnId !== undefined;
           const turn: TurnIntent = { turnId, generation: ++context.generation, settled: false };
           intent = turn;
+          context.activeTurnIntent = turn;
           context.activeTurnId = turnId;
           if (!steering) {
             context.tokenTracker.userMessagesChars += prompt.length;
@@ -2243,7 +2251,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         let iter = 0;
         const maxIter = 120;
         while (iter < maxIter) {
-          if (context.stopped) break;
+          if (context.stopped || intent?.settled) break;
           yield* Effect.sleep("1500 millis");
           iter++;
           let stillRunningCount = 0;
@@ -2410,17 +2418,21 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       if (!context) {
         return;
       }
-      yield* context.promptLock
-        .withPermit(
-          Effect.gen(function* () {
-            yield* cancelRequests(context);
-            yield* Effect.ignore(context.runtime.cancel);
-          }),
-        )
-        .pipe(
-          Effect.mapError((cause) => mapAntigravityError(threadId, "session/cancel", cause)),
-          Effect.ignore,
-        );
+      yield* cancelRequests(context);
+      yield* Effect.ignore(context.runtime.cancel);
+      const promptFiber = context.promptFiber;
+      context.promptFiber = undefined;
+      if (promptFiber) {
+        yield* Fiber.interrupt(promptFiber);
+      }
+      yield* finishSubagents(context, "cancelled");
+      const turn = context.activeTurnIntent;
+      if (turn && !turn.settled) {
+        yield* finishSessionTurn(context, turn, {
+          state: "cancelled",
+          stopReason: "cancelled",
+        });
+      }
     });
 
   const respondToRequest: Adapter["respondToRequest"] = (threadId, requestId, decision) =>

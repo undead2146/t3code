@@ -21,6 +21,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -347,6 +348,7 @@ const make = Effect.gen(function* () {
   const threadModelSelections = new Map<string, ModelSelection>();
   const compactingThreadIds = new Set<ThreadId>();
   const stoppingThreadIds = new Set<ThreadId>();
+  const startingTurnFibers = new Map<ThreadId, Fiber.Fiber<void, unknown>>();
 
   const appendProviderFailureActivity = (input: {
     readonly threadId: ThreadId;
@@ -1421,27 +1423,48 @@ const make = Effect.gen(function* () {
         "Wait for context compaction to finish before sending another message.",
       );
     }
-    const sendTurnRequest = yield* buildSendTurnRequestForThread({
-      threadId: event.payload.threadId,
-      messageText: message.text,
-      ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
-      ...(event.payload.modelSelection !== undefined
-        ? { modelSelection: event.payload.modelSelection }
-        : {}),
-      interactionMode: event.payload.interactionMode,
-      createdAt: event.payload.createdAt,
+    const startFiber = yield* Effect.gen(function* () {
+      const sendTurnRequest = yield* buildSendTurnRequestForThread({
+        threadId: event.payload.threadId,
+        messageText: message.text,
+        ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
+        ...(event.payload.modelSelection !== undefined
+          ? { modelSelection: event.payload.modelSelection }
+          : {}),
+        interactionMode: event.payload.interactionMode,
+        createdAt: event.payload.createdAt,
+      }).pipe(
+        Effect.map(Option.some),
+        Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
+      );
+
+      if (Option.isNone(sendTurnRequest)) {
+        return;
+      }
+
+      yield* providerService
+        .sendTurn(sendTurnRequest.value)
+        .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
     }).pipe(
-      Effect.map(Option.some),
-      Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
+      Effect.catchCause((cause) => {
+        if (Cause.hasInterruptsOnly(cause)) {
+          return Effect.void;
+        }
+        return recoverTurnStartFailure(cause);
+      }),
+      Effect.forkScoped,
     );
 
-    if (Option.isNone(sendTurnRequest)) {
-      return;
-    }
-
-    yield* providerService
-      .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure), Effect.forkScoped);
+    startingTurnFibers.set(event.payload.threadId, startFiber);
+    yield* Fiber.await(startFiber).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (startingTurnFibers.get(event.payload.threadId) === startFiber) {
+            startingTurnFibers.delete(event.payload.threadId);
+          }
+        }),
+      ),
+    );
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (
@@ -1783,6 +1806,16 @@ const make = Effect.gen(function* () {
       }),
     );
     const processEvent = Effect.fn("processEvent")(function* (event: OrchestrationEvent) {
+      if (
+        event.type === "thread.turn-interrupt-requested" ||
+        event.type === "thread.session-stop-requested"
+      ) {
+        const inFlight = startingTurnFibers.get(event.payload.threadId);
+        if (inFlight) {
+          startingTurnFibers.delete(event.payload.threadId);
+          yield* Fiber.interrupt(inFlight);
+        }
+      }
       if (
         (event.type === "thread.meta-updated" && event.payload.regenerateTitle === true) ||
         event.type === "thread.runtime-mode-set" ||

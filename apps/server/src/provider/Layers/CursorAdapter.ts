@@ -140,6 +140,7 @@ interface CursorSessionContext {
   lastPlanFingerprint: string | undefined;
   activeTurnId: TurnId | undefined;
   cursorSkillNames: ReadonlySet<string> | undefined;
+  readonly interruptedTurnIds: Set<TurnId>;
   /** Number of sendTurn prompts currently in flight or being prepared.
    * >0 means a turn is actively running, so a new sendTurn is a steer that
    * continues it, and only the last remaining prompt settles the turn. */
@@ -340,6 +341,13 @@ export function makeCursorAdapter(
     const makeAcpNativeLoggers = yield* makeAcpNativeLoggerFactory();
 
     const sessions = new Map<ThreadId, CursorSessionContext>();
+    const startingSessions = new Map<
+      ThreadId,
+      {
+        readonly sessionScope: Scope.Closeable;
+        readonly abort: Effect.Effect<void>;
+      }
+    >();
     const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
     const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
@@ -514,9 +522,14 @@ export function makeCursorAdapter(
           const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
           const sessionScope = yield* Scope.make("sequential");
           let sessionScopeTransferred = false;
-          yield* Effect.addFinalizer(() =>
-            sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void),
-          );
+          yield* Effect.addFinalizer(() => {
+            startingSessions.delete(input.threadId);
+            return sessionScopeTransferred ? Effect.void : Scope.close(sessionScope, Exit.void);
+          });
+          startingSessions.set(input.threadId, {
+            sessionScope,
+            abort: Scope.close(sessionScope, Exit.void),
+          });
           let ctx!: CursorSessionContext;
 
           const resumeSessionId = parseCursorResume(input.resumeCursor)?.sessionId;
@@ -787,6 +800,7 @@ export function makeCursorAdapter(
             lastPlanFingerprint: undefined,
             activeTurnId: undefined,
             cursorSkillNames: undefined,
+            interruptedTurnIds: new Set<TurnId>(),
             promptsInFlight: 0,
             stopped: false,
           };
@@ -1074,6 +1088,15 @@ export function makeCursorAdapter(
             model: resolvedModel,
           };
 
+          if (ctx.interruptedTurnIds.has(turnId)) {
+            ctx.interruptedTurnIds.delete(turnId);
+            return {
+              threadId: input.threadId,
+              turnId,
+              resumeCursor: ctx.session.resumeCursor,
+            };
+          }
+
           // Only the last remaining prompt settles the turn — a steer-
           // superseded prompt resolving (usually cancelled) while another is
           // in flight or pending must leave the merged turn running.
@@ -1105,9 +1128,28 @@ export function makeCursorAdapter(
         );
       });
 
-    const interruptTurn: CursorAdapterShape["interruptTurn"] = (threadId) =>
+    const interruptTurn: CursorAdapterShape["interruptTurn"] = (threadId, turnId) =>
       Effect.gen(function* () {
+        const starting = startingSessions.get(threadId);
+        if (starting) {
+          startingSessions.delete(threadId);
+          yield* starting.abort;
+          yield* offerRuntimeEvent({
+            type: "turn.completed",
+            ...(yield* makeEventStamp()),
+            provider: PROVIDER,
+            threadId,
+            turnId: undefined,
+            payload: { state: "cancelled", stopReason: "cancelled" },
+          });
+          return;
+        }
+
         const ctx = yield* requireSession(threadId);
+        const interruptedTurnId = turnId ?? ctx.activeTurnId ?? ctx.session.activeTurnId;
+        if (interruptedTurnId) {
+          ctx.interruptedTurnIds.add(interruptedTurnId);
+        }
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsEmptyAnswers(ctx.pendingUserInputs);
         yield* Effect.ignore(
@@ -1117,6 +1159,35 @@ export function makeCursorAdapter(
             ),
           ),
         );
+        if (
+          interruptedTurnId ||
+          ctx.promptsInFlight > 0 ||
+          ctx.session.status === "running" ||
+          ctx.session.status === "connecting"
+        ) {
+          const updatedAt = yield* nowIso;
+          ctx.promptsInFlight = 0;
+          ctx.activeTurnId = undefined;
+          const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
+          ctx.session = {
+            ...readySession,
+            status: "ready",
+            updatedAt,
+          };
+          if (interruptedTurnId) {
+            yield* offerRuntimeEvent({
+              type: "turn.completed",
+              ...(yield* makeEventStamp()),
+              provider: PROVIDER,
+              threadId,
+              turnId: interruptedTurnId,
+              payload: {
+                state: "cancelled",
+                stopReason: "cancelled",
+              },
+            });
+          }
+        }
       });
 
     const respondToRequest: CursorAdapterShape["respondToRequest"] = (
