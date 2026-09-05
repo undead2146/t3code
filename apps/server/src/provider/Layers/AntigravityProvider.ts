@@ -34,6 +34,7 @@ import {
 
 const EMPTY_MODEL_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
 const MAX_WORKSPACE_SNAPSHOTS = 32;
+const HEALTH_CHECK_TIMEOUT = "90 seconds";
 const SIGN_IN_MESSAGE = "Sign in with Google to use Antigravity.";
 const AUTH_UNCHECKED_MESSAGE =
   "Antigravity is installed. Google account access is not checked yet.";
@@ -59,7 +60,10 @@ function writeCachedModels(
   } catch {}
 }
 
-type SessionSetupResult = AcpSessionRuntimeStartResult["sessionSetupResult"];
+type SessionSetupResult = Pick<
+  AcpSessionRuntimeStartResult["sessionSetupResult"],
+  "configOptions" | "models"
+>;
 
 /** Keep the native model IDs, including model-specific thinking levels. */
 export function buildAntigravityModelsFromSession(
@@ -192,7 +196,10 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   const checkProvider = Effect.fn("checkAntigravityProvider")(function* () {
     if (!settings.enabled) return yield* getSnapshot;
     const before = yield* SubscriptionRef.get(metadata);
-    const result = yield* options.probe.pipe(Effect.timeoutOption("60 seconds"), Effect.result);
+    const result = yield* options.probe.pipe(
+      Effect.timeoutOption(HEALTH_CHECK_TIMEOUT),
+      Effect.result,
+    );
     const initialized =
       Result.isSuccess(result) && Option.isSome(result.success) ? result.success.value : undefined;
     const failure = Result.isFailure(result) ? result.failure : undefined;
@@ -206,7 +213,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             ? "Antigravity is not installed or its executable could not be found."
             : failure
               ? "Antigravity could not complete its local health check."
-              : "Antigravity did not respond to its local health check within 60 seconds.";
+              : `Antigravity did not respond to its local health check within ${HEALTH_CHECK_TIMEOUT}.`;
     const supportsTextGeneration =
       initialized !== undefined ? yield* options.supportsTextGeneration : false;
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
@@ -259,13 +266,14 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     return yield* options.stampIdentity(next.draft);
   });
 
+  const maintenanceCapabilities =
+    options.maintenanceCapabilities ??
+    makeManualOnlyProviderMaintenanceCapabilities({
+      provider: ProviderDriverKind.make("antigravity"),
+      packageName: null,
+    });
   const managed = yield* makeManagedServerProvider({
-    maintenanceCapabilities:
-      options.maintenanceCapabilities ??
-      makeManualOnlyProviderMaintenanceCapabilities({
-        provider: ProviderDriverKind.make("antigravity"),
-        packageName: null,
-      }),
+    resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
     getSettings: Effect.succeed(settings),
     streamSettings: Stream.empty,
     haveSettingsChanged: () => false,
@@ -328,6 +336,16 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             : {}),
         },
       } satisfies AntigravityProviderState;
+    });
+  });
+
+  const onConfigOptionsUpdated = Effect.fn("AntigravityProvider.onConfigOptionsUpdated")(function* (
+    configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
+  ) {
+    const models = buildAntigravityModelsFromSession({ configOptions });
+    yield* SubscriptionRef.update(metadata, (state) => {
+      if (state.draft.auth.status !== "authenticated") return state;
+      return { ...state, draft: { ...state.draft, models } };
     });
   });
 
@@ -405,6 +423,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   return {
     snapshot: { ...managed, getSnapshot },
     onSessionStarted,
+    onConfigOptionsUpdated,
     onAvailableCommands,
     onSignedOut: clearAccountMetadata(),
     onAuthRequired: clearAccountMetadata(),

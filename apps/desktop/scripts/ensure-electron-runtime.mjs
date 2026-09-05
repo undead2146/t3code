@@ -2,8 +2,8 @@ import * as NodeFS from "node:fs";
 import * as NodeModule from "node:module";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import * as NodeChildProcess from "node:child_process";
 import * as NodeURL from "node:url";
+import * as NodeChildProcess from "node:child_process";
 
 const require = NodeModule.createRequire(import.meta.url);
 // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone repair script has no Effect runtime.
@@ -211,6 +211,7 @@ export function ensureElectronRuntime() {
   return electronPath;
 }
 
+// `file://${argv[1]}` never matches on Windows (drive letters need `file:///C:/`).
 if (
   process.argv[1] &&
   NodeURL.pathToFileURL(NodePath.resolve(process.argv[1])).href === import.meta.url
