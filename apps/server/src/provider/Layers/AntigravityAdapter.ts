@@ -232,9 +232,10 @@ export function findConversationDb(sessionId: string): string | null {
   try {
     const home = NodeOS.homedir();
     const candidateDirs = [
+      NodePath.join(home, ".antigravity", "conversations"),
+      NodePath.join(home, ".gemini", "antigravity-cli", "conversations"),
       NodePath.join(home, ".t3", "userdata", "providers", "antigravity"),
       NodePath.join(process.cwd(), ".t3", "userdata", "providers", "antigravity"),
-      NodePath.join(home, ".gemini", "antigravity-cli", "conversations"),
     ];
     for (const root of candidateDirs) {
       if (!NodeFS.existsSync(root)) continue;
@@ -404,55 +405,62 @@ export function syncTokenTrackerFromDb(context: {
     const db = new sqliteModule.DatabaseSync(dbPath, { readOnly: true });
     try {
       const latestGen = db
-        .prepare("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1")
+        .prepare(
+          "SELECT data FROM gen_metadata WHERE length(data) > 1000 ORDER BY idx DESC LIMIT 1",
+        )
         .get() as { data?: Uint8Array } | undefined;
 
       const protoTokens = latestGen?.data ? parseProtoTokens(latestGen.data) : null;
 
       const latestCp = db
-        .prepare("SELECT idx FROM steps WHERE step_type = 23 ORDER BY idx DESC LIMIT 1")
-        .get() as { idx?: number | bigint } | undefined;
+        .prepare(
+          "SELECT idx, length(step_payload) as cplen FROM steps WHERE step_type = 23 ORDER BY idx DESC LIMIT 1",
+        )
+        .get() as { idx?: number | bigint; cplen?: number } | undefined;
       const activeCpIdx = latestCp?.idx != null ? Number(latestCp.idx) : -1;
+      if (latestCp?.cplen != null) {
+        context.tokenTracker.checkpointBufferTokens = Math.round(Number(latestCp.cplen) / 4);
+      }
 
       if (protoTokens) {
         context.tokenTracker.userMessagesChars = Math.round(protoTokens.userTokens * 4.2);
         context.tokenTracker.agentResponsesChars = Math.round(protoTokens.agentTokens * 4.2);
         context.tokenTracker.toolCallsChars = Math.round(protoTokens.toolTokens * 4.2);
       } else {
-        const userSteps = db
-          .prepare(
-            "SELECT length(step_payload) as plen FROM steps WHERE step_type = 14 AND idx >= ?",
-          )
-          .all(activeCpIdx) as Array<{ plen: number }>;
-
-        let userChars = 0;
-        let agentChars = 0;
-        let toolChars = 0;
-
-        for (const s of userSteps) {
-          const plen = Number(s.plen ?? 0);
-          if (plen < 100_000) {
-            userChars += plen;
-          }
-        }
-
         const activeSteps = db
           .prepare(
             "SELECT idx, step_type, length(step_payload) as plen FROM steps WHERE idx >= ? ORDER BY idx",
           )
           .all(activeCpIdx) as Array<{ idx: number; step_type: number; plen: number }>;
 
+        let userChars = 0;
+        let agentChars = 0;
+        let toolChars = 0;
+
         for (const s of activeSteps) {
           const plen = Number(s.plen ?? 0);
-          if (s.step_type === 15 || s.step_type === 23) {
+          if (s.step_type === 14) {
+            userChars += plen;
+          } else if (s.step_type === 15) {
             agentChars += plen;
-          } else if ([7, 9, 21, 25, 103].includes(s.step_type)) {
+          } else if (s.step_type === 23) {
+            // Checkpoint buffer, do not count into agent responses
+          } else if ([7, 9, 21, 25, 101, 103].includes(s.step_type)) {
             toolChars += plen;
           }
         }
 
         if (userChars > 0) {
           context.tokenTracker.userMessagesChars = userChars;
+        } else {
+          const lastUser = db
+            .prepare(
+              "SELECT length(step_payload) as plen FROM steps WHERE step_type = 14 ORDER BY idx DESC LIMIT 1",
+            )
+            .get() as { plen?: number } | undefined;
+          if (lastUser?.plen) {
+            context.tokenTracker.userMessagesChars = Number(lastUser.plen);
+          }
         }
         if (agentChars > 0) {
           context.tokenTracker.agentResponsesChars = agentChars;
@@ -869,14 +877,14 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       toolUses: context.tokenTracker.toolUses,
       compactsAutomatically: true,
       categories: {
-        ...(userMessages > 0 ? { userMessages } : {}),
-        ...(agentResponses > 0 ? { agentResponses } : {}),
-        ...(toolCalls > 0 ? { toolCalls } : {}),
+        userMessages,
+        agentResponses,
+        toolCalls,
         systemPrompt,
         systemTools,
         skills,
         ...(subagents > 0 ? { subagents } : {}),
-        checkpointBuffer,
+        ...(checkpointBuffer > 0 ? { checkpointBuffer } : {}),
       },
     };
   }
