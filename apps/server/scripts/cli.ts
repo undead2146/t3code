@@ -165,12 +165,14 @@ const buildCmd = Command.make(
       const webDist = path.join(repoRoot, "apps/web/dist");
       const clientTarget = path.join(serverDir, "dist/client");
 
-      if (yield* fs.exists(webDist)) {
+      if (yield* fs.exists(path.join(webDist, "index.html"))) {
         yield* fs.copy(webDist, clientTarget);
         yield* applyDevelopmentIconOverrides(repoRoot, serverDir);
         yield* Effect.log("[cli] Bundled web app into dist/client");
       } else {
-        yield* Effect.logWarning("[cli] Web dist not found — skipping client bundle.");
+        yield* Effect.logWarning(
+          "[cli] Web client bundle not found (apps/web/dist/index.html) — skipping client bundle.",
+        );
       }
     }),
 ).pipe(Command.withDescription("Build the server package (tsdown + bundle web client)."));
