@@ -35,6 +35,7 @@ interface ElectronAppCalls {
   readonly setAboutPanelOptions: Array<Electron.AboutPanelOptionsOptions>;
   readonly setDockIcon: string[];
   readonly setName: string[];
+  readonly setUserTasks: Array<ReadonlyArray<Electron.Task>>;
 }
 
 const makeElectronAppLayer = (calls: ElectronAppCalls) =>
@@ -60,6 +61,11 @@ const makeElectronAppLayer = (calls: ElectronAppCalls) =>
     isDefaultProtocolClient: () => Effect.succeed(false),
     setAsDefaultProtocolClient: () => Effect.succeed(true),
     setDesktopName: () => Effect.void,
+    setUserTasks: (tasks) =>
+      Effect.sync(() => {
+        calls.setUserTasks.push(tasks);
+        return true;
+      }),
     setDockIcon: (iconPath) =>
       Effect.sync(() => {
         calls.setDockIcon.push(iconPath);
@@ -120,6 +126,7 @@ const withIdentity = <A, E, R>(
     setAboutPanelOptions: [],
     setDockIcon: [],
     setName: [],
+    setUserTasks: [],
   };
 
   return effect.pipe(
@@ -146,6 +153,29 @@ const withIdentity = <A, E, R>(
 };
 
 describe("DesktopAppIdentity", () => {
+  it.effect("registers pull requests user task in JumpList on win32", () => {
+    const calls: ElectronAppCalls = {
+      setAboutPanelOptions: [],
+      setDockIcon: [],
+      setName: [],
+      setUserTasks: [],
+    };
+
+    return withIdentity(
+      Effect.gen(function* () {
+        const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+        yield* identity.configure;
+
+        assert.equal(calls.setUserTasks.length, 1);
+        const tasks = calls.setUserTasks[0]!;
+        assert.equal(tasks.length, 1);
+        assert.equal(tasks[0]?.title, "Pull Requests");
+        assert.equal(tasks[0]?.arguments, "--pull-requests");
+      }),
+      { calls, environment: { platform: "win32" } },
+    );
+  });
+
   it.effect("keeps using the legacy userData path when it already exists", () =>
     withIdentity(
       Effect.gen(function* () {
@@ -190,6 +220,7 @@ describe("DesktopAppIdentity", () => {
       setAboutPanelOptions: [],
       setDockIcon: [],
       setName: [],
+      setUserTasks: [],
     };
 
     return withIdentity(
@@ -222,6 +253,7 @@ describe("DesktopAppIdentity", () => {
       setAboutPanelOptions: [],
       setDockIcon: [],
       setName: [],
+      setUserTasks: [],
     };
 
     return withIdentity(

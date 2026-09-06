@@ -1228,7 +1228,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       {row.kind === "assistant-meta" ? <AssistantMetaTimelineRow row={row} /> : null}
       {row.kind === "proposed-plan" ? <ProposedPlanTimelineRow row={row} /> : null}
       {row.kind === "working" ? <WorkingTimelineRow row={row} /> : null}
-      {row.kind === "thinking" ? <ThinkingTimelineRow /> : null}
+      {row.kind === "thinking" ? <ThinkingTimelineRow row={row} /> : null}
     </div>
   );
 });
@@ -1737,13 +1737,19 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
   );
 }
 
-function ThinkingTimelineRow() {
+function ThinkingTimelineRow({ row }: { row?: Extract<TimelineRow, { kind: "thinking" }> }) {
   const { isCompacting, isPreparingWorktree } = use(TimelineRowActivityCtx);
   // Reserve the activity row during setup so the handoff keeps the same height.
   return (
     <div className="min-h-7">
       {isPreparingWorktree || isCompacting ? null : (
-        <LiveActivityRow label="Thinking" iconName="brain" active shimmer />
+        <LiveActivityRow
+          label="Thinking"
+          iconName="brain"
+          active
+          shimmer
+          createdAt={row?.createdAt ?? undefined}
+        />
       )}
     </div>
   );
@@ -1764,7 +1770,13 @@ function CompactingLabel() {
 // ---------------------------------------------------------------------------
 
 /** Live elapsed time for the "Working for" label. */
-function WorkingTimer({ createdAt }: { createdAt: string }) {
+function WorkingTimer({
+  createdAt,
+  highlightThresholdSeconds,
+}: {
+  createdAt: string;
+  highlightThresholdSeconds?: number;
+}) {
   const textRef = useRef<HTMLSpanElement>(null);
   const initialText = formatWorkingTimerNow(createdAt);
 
@@ -1772,12 +1784,23 @@ function WorkingTimer({ createdAt }: { createdAt: string }) {
     const updateText = () => {
       if (textRef.current) {
         textRef.current.textContent = formatWorkingTimerNow(createdAt);
+        if (highlightThresholdSeconds !== undefined) {
+          const startedAtMs = Date.parse(createdAt);
+          if (Number.isFinite(startedAtMs)) {
+            const elapsedSeconds = Math.floor((Date.now() - startedAtMs) / 1000);
+            if (elapsedSeconds >= highlightThresholdSeconds) {
+              textRef.current.classList.add("text-warning", "font-medium");
+            } else {
+              textRef.current.classList.remove("text-warning", "font-medium");
+            }
+          }
+        }
       }
     };
     updateText();
     const id = setInterval(updateText, 1000);
     return () => clearInterval(id);
-  }, [createdAt]);
+  }, [createdAt, highlightThresholdSeconds]);
 
   return (
     <span ref={textRef} className="tabular-nums">
@@ -2016,6 +2039,7 @@ function LiveActivityRow({
   failed = false,
   active = false,
   shimmer = false,
+  createdAt,
 }: {
   label: string;
   iconName?: WorkEntryIconName;
@@ -2023,6 +2047,7 @@ function LiveActivityRow({
   failed?: boolean;
   active?: boolean;
   shimmer?: boolean;
+  createdAt?: string | undefined;
 }) {
   const animated = active && !failed;
   const showShimmer = animated && shimmer;
@@ -2038,10 +2063,17 @@ function LiveActivityRow({
         failed={failed}
         announceFailure={failed}
         active={animated && !shimmer}
+        createdAt={animated ? createdAt : undefined}
       />
       {showShimmer ? (
         <ActivityShimmerOverlay>
-          <LiveActivityContent label={label} iconName={iconName} toolIcon={toolIcon} highlighted />
+          <LiveActivityContent
+            label={label}
+            iconName={iconName}
+            toolIcon={toolIcon}
+            highlighted
+            createdAt={animated ? createdAt : undefined}
+          />
         </ActivityShimmerOverlay>
       ) : null}
     </div>
@@ -2056,6 +2088,7 @@ function LiveActivityContent({
   announceFailure = false,
   active = false,
   highlighted = false,
+  createdAt,
 }: {
   label: string;
   iconName: WorkEntryIconName | undefined;
@@ -2064,6 +2097,7 @@ function LiveActivityContent({
   announceFailure?: boolean;
   active?: boolean;
   highlighted?: boolean;
+  createdAt?: string | undefined;
 }) {
   const showTrailingFailureMark =
     failed && iconName !== undefined && !toolIconAcceptsTint(iconName, toolIcon);
@@ -2094,6 +2128,11 @@ function LiveActivityContent({
         </span>
       ) : null}
       <span className={cn("min-w-0 flex-1 truncate", active && "live-tool-shine")}>{label}</span>
+      {active && createdAt ? (
+        <span className="shrink-0 text-xs text-muted-foreground/80 tabular-nums">
+          • <WorkingTimer createdAt={createdAt} highlightThresholdSeconds={120} />
+        </span>
+      ) : null}
       {showTrailingFailureMark ? (
         <XIcon aria-hidden className={cn("size-3 shrink-0", failedToolIconClassName)} />
       ) : null}
@@ -2120,6 +2159,7 @@ function LiveWorkEntryTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "
         toolIcon={row.entry.toolIcon ?? row.entry.toolSource?.icon}
         failed={failed}
         active={row.active}
+        createdAt={row.entry.createdAt}
       />
     </button>
   );

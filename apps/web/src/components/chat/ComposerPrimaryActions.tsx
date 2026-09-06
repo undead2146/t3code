@@ -32,6 +32,7 @@ interface ComposerPrimaryActionsProps {
   /** Enter-to-send is disabled on mobile viewports, where stop would otherwise
    * be the only primary action and a running turn could not be steered. */
   showSendWhileRunning?: boolean;
+  isBtwCommand?: boolean | undefined;
   onPreviousPendingQuestion: () => void;
   onInterrupt: () => void;
   onImplementPlanInNewThread: () => void;
@@ -73,6 +74,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   hasSendableContent,
   preserveComposerFocusOnPointerDown = false,
   showSendWhileRunning = false,
+  isBtwCommand = false,
   onPreviousPendingQuestion,
   onInterrupt,
   onImplementPlanInNewThread,
@@ -230,7 +232,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
       )}
       {...pointerFocusProps}
       disabled={
-        isSendBusy ||
+        (isSendBusy && !isBtwCommand) ||
         isSendDisabled ||
         isConnecting ||
         isEnvironmentUnavailable ||
@@ -245,9 +247,11 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
               ? "Connecting"
               : isPreparingWorktree
                 ? "Preparing worktree"
-                : isSendBusy
-                  ? "Sending"
-                  : "Send message"
+                : isBtwCommand
+                  ? "Ask side question"
+                  : isSendBusy
+                    ? "Sending"
+                    : "Send message"
       }
     >
       {stageBackdropVariant ? (
@@ -255,7 +259,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
           <StageBackdropButtonArt variant={stageBackdropVariant} />
         </span>
       ) : null}
-      {isConnecting || isSendBusy ? (
+      {isConnecting || (isSendBusy && !isBtwCommand) ? (
         <Spinner className="size-3.5" aria-hidden="true" />
       ) : (
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">

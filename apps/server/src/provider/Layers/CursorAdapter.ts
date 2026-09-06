@@ -1262,7 +1262,10 @@ export function makeCursorAdapter(
     const hasSession: CursorAdapterShape["hasSession"] = (threadId) =>
       Effect.sync(() => {
         const c = sessions.get(threadId);
-        return c !== undefined && !c.stopped;
+        return (
+          (c !== undefined && !c.stopped && c.session.status !== "error") ||
+          startingSessions.has(threadId)
+        );
       });
 
     const stopAll: CursorAdapterShape["stopAll"] = () =>

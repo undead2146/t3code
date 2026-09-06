@@ -1040,3 +1040,31 @@ export function hasServerAcknowledgedLocalDispatch(input: {
     input.localDispatch.sessionUpdatedAt !== (session?.updatedAt ?? null)
   );
 }
+
+export const STALLED_ACTIVITY_THRESHOLD_MS = 120_000;
+
+export interface StalledActivityAdvisory {
+  readonly isStalled: boolean;
+  readonly elapsedMs: number;
+}
+
+export function deriveStalledActivityAdvisory(input: {
+  readonly phase: SessionPhase;
+  readonly latestActivityCreatedAt: string | null | undefined;
+  readonly nowMs: number;
+  readonly thresholdMs?: number;
+}): StalledActivityAdvisory {
+  if (input.phase !== "running" || !input.latestActivityCreatedAt) {
+    return { isStalled: false, elapsedMs: 0 };
+  }
+  const startedAtMs = Date.parse(input.latestActivityCreatedAt);
+  if (!Number.isFinite(startedAtMs)) {
+    return { isStalled: false, elapsedMs: 0 };
+  }
+  const elapsedMs = Math.max(0, input.nowMs - startedAtMs);
+  const thresholdMs = input.thresholdMs ?? STALLED_ACTIVITY_THRESHOLD_MS;
+  return {
+    isStalled: elapsedMs >= thresholdMs,
+    elapsedMs,
+  };
+}

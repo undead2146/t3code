@@ -20,6 +20,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { AcpSessionRuntimeStartResult } from "../acp/AcpSessionRuntime.ts";
+import { BTW_SLASH_COMMAND } from "../providerSnapshot.ts";
 import {
   buildAntigravityModelsFromSession,
   makeAntigravityProvider,
@@ -100,6 +101,8 @@ const commands = [
   { name: "plan", description: "Create a plan", input: { hint: "What to plan" } },
   { name: "logout", description: "Sign out of Google" },
 ] satisfies ReadonlyArray<EffectAcpSchema.AvailableCommand>;
+
+const expectedCommands = [BTW_SLASH_COMMAND, ...commands];
 
 const testLayer = Layer.merge(
   Layer.mock(BackgroundPolicy.BackgroundPolicy)({
@@ -257,7 +260,7 @@ it.layer(testLayer)("Antigravity provider snapshots", (it) => {
           workspaceSnapshots: [],
         });
         expect(snapshot.models).toEqual(buildAntigravityModelsFromSession(sessionSetupResult));
-        expect(snapshot.slashCommands).toEqual(commands);
+        expect(snapshot.slashCommands).toEqual(expectedCommands);
         expect((yield* harness.provider.snapshot.refresh).models).toEqual(snapshot.models);
         expect(yield* Ref.get(harness.probeCalls)).toBe(0);
       }),
@@ -310,9 +313,9 @@ it.layer(testLayer)("Antigravity provider snapshots", (it) => {
           supportsTextGeneration: true,
         });
         expect(snapshot.models).toEqual(buildAntigravityModelsFromSession(sessionSetupResult));
-        expect(snapshot.slashCommands).toEqual(commands);
+        expect(snapshot.slashCommands).toEqual(expectedCommands);
         expect((yield* harness.provider.snapshotForCwd("/workspace")).slashCommands).toEqual(
-          commands,
+          expectedCommands,
         );
         expect(yield* Ref.get(harness.probeCalls)).toBe(1);
       }),
@@ -328,7 +331,7 @@ it.layer(testLayer)("Antigravity provider snapshots", (it) => {
         yield* harness.provider.onAvailableCommands(commands);
         const snapshot = yield* harness.provider.snapshot.getSnapshot;
         expect(snapshot.models).toHaveLength(11);
-        expect(snapshot.slashCommands).toEqual(commands);
+        expect(snapshot.slashCommands).toEqual(expectedCommands);
         expect(snapshot.workspaceSnapshots).toEqual([]);
       }),
     ),
@@ -390,7 +393,7 @@ it.layer(testLayer)("Antigravity provider snapshots", (it) => {
           models: buildAntigravityModelsFromSession({ configOptions }),
           auth: before.auth,
           workspaceSnapshots: before.workspaceSnapshots,
-          slashCommands: commands,
+          slashCommands: expectedCommands,
         });
         yield* harness.provider.onConfigOptionsUpdated([]);
         expect((yield* harness.provider.snapshot.getSnapshot).models).toEqual([]);
@@ -439,7 +442,7 @@ it.layer(testLayer)("Antigravity provider snapshots", (it) => {
           auth: { status: "authenticated" },
         });
         expect(snapshot.models).toEqual(buildAntigravityModelsFromSession(sessionSetupResult));
-        expect(snapshot.slashCommands).toEqual(commands);
+        expect(snapshot.slashCommands).toEqual(expectedCommands);
         expect(snapshot.workspaceSnapshots?.[0]?.cwd).toBe("/workspace");
       }),
     ),
@@ -531,7 +534,7 @@ it.layer(testLayer)("Antigravity provider snapshots", (it) => {
             auth: { status: "authenticated" },
           });
           expect(snapshot.models).toHaveLength(installed ? 11 : 0);
-          expect(snapshot.slashCommands).toHaveLength(installed ? 2 : 0);
+          expect(snapshot.slashCommands).toHaveLength(installed ? expectedCommands.length : 0);
           expect(snapshot.workspaceSnapshots).toHaveLength(installed ? 1 : 0);
           expect(snapshot.supportsTextGeneration).toBe(installed);
         }
@@ -619,9 +622,30 @@ it.layer(testLayer)("Antigravity provider snapshots", (it) => {
         const snapshot = yield* harness.provider.snapshotForCwd("/workspace-34");
         expect(snapshot.workspaceSnapshots).toHaveLength(32);
         expect(snapshot.workspaceSnapshots?.[0]?.cwd).toBe("/workspace-3");
-        expect(snapshot.slashCommands).toEqual(commands);
+        expect(snapshot.slashCommands).toEqual(expectedCommands);
         expect(yield* Ref.get(harness.probeCalls)).toBe(1);
       }),
     ),
+  );
+
+  it.effect(
+    "seeds ready status immediately on initial draft when installation and auth are already present",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const provider = yield* makeAntigravityProvider(decodeSettings({ enabled: true }), {
+            stampIdentity: (snapshot) => Effect.succeed({ ...snapshot, instanceId, driver }),
+            probe: Effect.never,
+            supportsTextGeneration: Effect.succeed(false),
+            checkInstallation: Effect.succeed({ version: "1.2.3" }),
+            checkAuthenticated: Effect.succeed(true),
+          });
+          const snapshot = yield* provider.snapshot.getSnapshot;
+          expect(snapshot.installed).toBe(true);
+          expect(snapshot.version).toBe("1.2.3");
+          expect(snapshot.status).toBe("ready");
+          expect(snapshot.auth.status).toBe("authenticated");
+        }),
+      ),
   );
 });

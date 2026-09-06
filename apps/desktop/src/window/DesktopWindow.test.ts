@@ -214,6 +214,15 @@ function makeTestLayer(input: {
   const desktopAppSettingsLayer = Layer.succeed(DesktopAppSettings.DesktopAppSettings, {
     get: Effect.sync(() => desktopSettings),
     load: Effect.sync(() => desktopSettings),
+    setPullRequestsWindowBounds: (bounds, isMaximized) =>
+      Effect.sync(() => {
+        desktopSettings = {
+          ...desktopSettings,
+          pullRequestsWindowBounds: bounds,
+          pullRequestsWindowMaximized: isMaximized,
+        };
+        return { settings: desktopSettings, changed: true };
+      }),
     setMainWindowBounds: (bounds, isMaximized) =>
       Effect.gen(function* () {
         if (input.beforeMainWindowBoundsUpdate) {
@@ -417,6 +426,73 @@ describe("DesktopWindow", () => {
     fakeWindow.isDestroyed.mockReturnValue(true);
     DesktopWindow.concealPendingQuitWindow(fakeWindow.window);
     assert.equal(fakeWindow.setOpacity.mock.calls.length, 0);
+  });
+
+  describe("pull requests window", () => {
+    it("recognizes pull requests command line flags", () => {
+      assert.isTrue(DesktopWindow.hasPullRequestsFlag(["--pull-requests"]));
+      assert.isTrue(DesktopWindow.hasPullRequestsFlag(["app", "--pr"]));
+      assert.isTrue(DesktopWindow.hasPullRequestsFlag(["--other", "--pull-requests"]));
+      assert.isFalse(DesktopWindow.hasPullRequestsFlag([]));
+      assert.isFalse(DesktopWindow.hasPullRequestsFlag(["--help", "foo"]));
+    });
+
+    it("restores PR bounds when within a connected display", () => {
+      const persistedBounds = { x: 1950, y: 100, width: 1200, height: 800 };
+      const displays = [
+        { x: 0, y: 0, width: 1920, height: 1080 },
+        { x: 1920, y: 0, width: 1920, height: 1080 },
+      ];
+
+      assert.deepEqual(
+        DesktopWindow.resolveInitialPullRequestsWindowBounds(persistedBounds, displays),
+        persistedBounds,
+      );
+    });
+
+    it("positions PR window on monitor 2 by default in multi-monitor setup", () => {
+      const displays = [
+        { x: 0, y: 0, width: 1920, height: 1080 },
+        { x: 1920, y: 0, width: 1920, height: 1080 },
+      ];
+
+      const bounds = DesktopWindow.resolveInitialPullRequestsWindowBounds(null, displays);
+      assert.deepEqual(bounds, {
+        x: 1920 + Math.round((1920 - 1100) / 2),
+        y: 0 + Math.round((1080 - 780) / 2),
+        width: 1100,
+        height: 780,
+      });
+    });
+
+    it("falls back to default size on single monitor setup without persisted bounds", () => {
+      const displays = [{ x: 0, y: 0, width: 1920, height: 1080 }];
+      const bounds = DesktopWindow.resolveInitialPullRequestsWindowBounds(null, displays);
+      assert.deepEqual(bounds, DesktopAppSettings.DEFAULT_MAIN_WINDOW_SIZE);
+    });
+
+    it.effect("opens and returns pull requests window", () =>
+      Effect.gen(function* () {
+        const fakeWindow = makeFakeBrowserWindow();
+        const createCount = yield* Ref.make(0);
+        const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+        const createdWindowOptions: Electron.BrowserWindowConstructorOptions[] = [];
+        const layer = makeTestLayer({
+          window: fakeWindow.window,
+          createCount,
+          mainWindow,
+          createdWindowOptions,
+        });
+
+        yield* Effect.gen(function* () {
+          const desktopWindow = yield* DesktopWindow.DesktopWindow;
+          const prWindow = yield* desktopWindow.openPullRequests;
+          assert.strictEqual(prWindow, fakeWindow.window);
+          assert.equal(createdWindowOptions.length, 1);
+          assert.include(createdWindowOptions[0]?.title ?? "", "Pull Requests");
+        }).pipe(Effect.provide(layer));
+      }),
+    );
   });
 
   it("restores bounds only when the window fits within a connected display", () => {

@@ -64,6 +64,28 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
     }),
   );
 
+  it.effect("discovers user global skills when userHome is provided", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const input = yield* makeWorkspace();
+      const mockHome = path.join(input.profileDirectory, "mock-user-home");
+      const skillPath = yield* writeSkill(
+        path.join(mockHome, ".agents", "skills", "postplan-global"),
+        "---\nname: postplan-global\ndescription: Global postplan skill.\n---\n",
+      );
+
+      assert.deepEqual(yield* discoverAntigravitySkills({ ...input, userHome: mockHome }), [
+        {
+          name: "postplan-global",
+          description: "Global postplan skill.",
+          path: skillPath,
+          scope: "user",
+          enabled: true,
+        },
+      ]);
+    }),
+  );
+
   it.effect("discovers skills from the legacy workspace root", () =>
     Effect.gen(function* () {
       const path = yield* Path.Path;

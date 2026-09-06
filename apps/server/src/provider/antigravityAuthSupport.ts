@@ -1,5 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
-// @effect-diagnostics-next-line nodeBuiltinImport:off - resolveAntigravityProfileDirectory is a pure sync helper, so it cannot use the Path service.
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import type { AntigravityAuthMethod, ProviderInstanceId } from "@t3tools/contracts";
@@ -222,6 +224,96 @@ function antigravityEnvironment(
   };
 }
 
+/** Returns candidate roots on disk that hold user-global agent skills. */
+export function getAntigravityGlobalSkillRoots(
+  userHome: string | undefined,
+): ReadonlyArray<string> {
+  if (!userHome) return [];
+  const candidateRoots = [
+    NodePath.join(userHome, ".antigravity", "skills"),
+    NodePath.join(userHome, ".agents", "skills"),
+    NodePath.join(userHome, ".gemini", "config", "skills"),
+    NodePath.join(userHome, ".gemini", "skills"),
+    NodePath.join(userHome, ".t3", "skills"),
+    NodePath.join(userHome, ".claude", "skills"),
+    NodePath.join(userHome, ".cursor", "skills"),
+    NodePath.join(userHome, ".codex", "skills"),
+    NodePath.join(userHome, ".ai-tools", "skills"),
+  ];
+  return candidateRoots.filter((root) => {
+    try {
+      return NodeFS.existsSync(root) && NodeFS.statSync(root).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** Synchronizes user-global agent skills into the Antigravity profile config/skills directory. */
+export function syncAntigravityGlobalSkills(
+  configSkillsDirectory: string,
+  userHome: string | undefined,
+  platform: NodeJS.Platform,
+): void {
+  if (!userHome) return;
+  try {
+    NodeFS.mkdirSync(configSkillsDirectory, { recursive: true, mode: 0o700 });
+  } catch {
+    return;
+  }
+
+  const candidateRoots = getAntigravityGlobalSkillRoots(userHome);
+
+  for (const root of candidateRoots) {
+    let entries: NodeFS.Dirent[] = [];
+    try {
+      entries = NodeFS.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const skillName = entry.name;
+      const sourcePath = NodePath.join(root, skillName);
+      const destPath = NodePath.join(configSkillsDirectory, skillName);
+
+      const skillFile = NodePath.join(sourcePath, "SKILL.md");
+      try {
+        if (!NodeFS.existsSync(skillFile)) continue;
+      } catch {
+        continue;
+      }
+
+      try {
+        const lstat = NodeFS.lstatSync(destPath);
+        if (lstat.isSymbolicLink()) {
+          try {
+            NodeFS.statSync(destPath);
+            continue;
+          } catch {
+            NodeFS.unlinkSync(destPath);
+          }
+        } else {
+          continue;
+        }
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") continue;
+      }
+
+      try {
+        NodeFS.symlinkSync(sourcePath, destPath, platform === "win32" ? "junction" : "dir");
+      } catch {
+        try {
+          NodeFS.cpSync(sourcePath, destPath, { recursive: true, dereference: true, force: true });
+        } catch {
+          // Continue if a symlink couldn't be created
+        }
+      }
+    }
+  }
+}
+
 /** Prepares a private profile without reading or copying Google credentials. */
 export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(function* (input: {
   readonly profileDirectory: string;
@@ -229,6 +321,8 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   readonly runtimeExecutablePath?: string;
   readonly platform?: NodeJS.Platform;
   readonly auth?: AntigravityAuthConfig;
+  readonly userHome?: string;
+  readonly skipBrowserPreflight?: boolean;
 }) {
   const auth = input.auth ?? ANTIGRAVITY_PERSONAL_AUTH;
   const fs = yield* FileSystem.FileSystem;
@@ -256,6 +350,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
 
   const geminiHome = path.resolve(input.profileDirectory);
   const acpDirectory = path.join(geminiHome, "antigravity-acp");
+  const configSkillsDirectory = path.join(geminiHome, "config", "skills");
   const profile: AntigravityProfile = {
     platform,
     geminiHome,
@@ -264,46 +359,52 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
     browserCommand,
   };
   const environment = antigravityEnvironment(profile, input.baseEnv ?? process.env, auth);
-  yield* Effect.gen(function* () {
-    const child = yield* spawner.spawn(
-      ChildProcess.make(helperExecutable, ["-e", browserHelperSource, "--", browserPreflightUrl], {
-        env: environment,
-        extendEnv: false,
-        shell: false,
+  if (input.skipBrowserPreflight !== true) {
+    yield* Effect.gen(function* () {
+      const child = yield* spawner.spawn(
+        ChildProcess.make(
+          helperExecutable,
+          ["-e", browserHelperSource, "--", browserPreflightUrl],
+          {
+            env: environment,
+            extendEnv: false,
+            shell: false,
+          },
+        ),
+      );
+      const [stdout, stderr, exitCode] = yield* Effect.all(
+        [
+          collectUint8StreamText({ stream: child.stdout, maxBytes: 4_096 }),
+          collectUint8StreamText({ stream: child.stderr, maxBytes: 4_096 }),
+          child.exitCode,
+        ],
+        { concurrency: "unbounded" },
+      );
+      if (
+        Number(exitCode) !== 0 ||
+        stdout.bytes !== 0 ||
+        stdout.truncated ||
+        stderr.truncated ||
+        stderr.text !== `${ANTIGRAVITY_AUTH_BROWSER_MARKER}"${browserPreflightUrl}"\n`
+      ) {
+        return yield* authSupportError("Antigravity browser suppression could not be verified.");
+      }
+    }).pipe(
+      Effect.scoped,
+      Effect.timeoutOrElse({
+        duration: "5 seconds",
+        orElse: () =>
+          Effect.fail(authSupportError("Antigravity browser suppression verification timed out.")),
       }),
+      Effect.mapError((error) =>
+        error._tag === "AcpTransportError"
+          ? error
+          : authSupportError("Antigravity browser suppression could not be verified."),
+      ),
     );
-    const [stdout, stderr, exitCode] = yield* Effect.all(
-      [
-        collectUint8StreamText({ stream: child.stdout, maxBytes: 4_096 }),
-        collectUint8StreamText({ stream: child.stderr, maxBytes: 4_096 }),
-        child.exitCode,
-      ],
-      { concurrency: "unbounded" },
-    );
-    if (
-      Number(exitCode) !== 0 ||
-      stdout.bytes !== 0 ||
-      stdout.truncated ||
-      stderr.truncated ||
-      stderr.text !== `${ANTIGRAVITY_AUTH_BROWSER_MARKER}"${browserPreflightUrl}"\n`
-    ) {
-      return yield* authSupportError("Antigravity browser suppression could not be verified.");
-    }
-  }).pipe(
-    Effect.scoped,
-    Effect.timeoutOrElse({
-      duration: "5 seconds",
-      orElse: () =>
-        Effect.fail(authSupportError("Antigravity browser suppression verification timed out.")),
-    }),
-    Effect.mapError((error) =>
-      error._tag === "AcpTransportError"
-        ? error
-        : authSupportError("Antigravity browser suppression could not be verified."),
-    ),
-  );
+  }
 
-  for (const directory of [geminiHome, acpDirectory]) {
+  for (const directory of [geminiHome, acpDirectory, configSkillsDirectory]) {
     yield* fs
       .makeDirectory(directory, { recursive: true, mode: 0o700 })
       .pipe(
@@ -321,6 +422,14 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
         );
     }
   }
+
+  const userHome =
+    input.userHome ??
+    input.baseEnv?.HOME?.trim() ??
+    input.baseEnv?.USERPROFILE?.trim() ??
+    NodeOS.homedir();
+  syncAntigravityGlobalSkills(configSkillsDirectory, userHome, platform);
+
   // Rewriting on every launch keeps a method, project, or location edit in
   // Settings effective. The agent also records auth.type here after a
   // sign-in, which matches the value written below.

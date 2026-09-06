@@ -48,6 +48,7 @@ import {
   ProjectSearchContentsError,
   ProjectSearchEntriesError,
   ProjectWriteFileError,
+  ProviderEphemeralQueryError,
   ProviderUploadFeedbackError,
   ProviderSetupError,
   RelayClientInstallFailedError,
@@ -1870,6 +1871,25 @@ const makeWsRpcLayer = (
               return { providers };
             }),
             { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.providerEphemeralQuery]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.providerEphemeralQuery,
+            providerService.queryEphemeral(input).pipe(
+              Effect.mapError((cause) =>
+                Schema.is(ProviderEphemeralQueryError)(cause)
+                  ? cause
+                  : new ProviderEphemeralQueryError({
+                      threadId: input.threadId,
+                      detail:
+                        typeof cause === "object" && cause !== null && "message" in cause
+                          ? String(cause.message)
+                          : "Ephemeral query failed",
+                      cause,
+                    }),
+              ),
+            ),
+            { "rpc.aggregate": "provider" },
           ),
         [WS_METHODS.providerUploadFeedback]: (input) =>
           observeRpcEffect(

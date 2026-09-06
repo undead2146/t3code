@@ -290,7 +290,11 @@ it.layer(testLayer)("AntigravityDriver", (it) => {
         // The mock catalog is not in the manifest's current list, so it folds
         // under the legacy section like an old Codex model would.
         expect(snapshot.models.every((model) => model.isLegacy === true)).toBe(true);
-        expect(snapshot.slashCommands.map((command) => command.name)).toEqual(["plan", "logout"]);
+        expect(snapshot.slashCommands.map((command) => command.name)).toEqual([
+          "btw",
+          "plan",
+          "logout",
+        ]);
         expect(snapshot.supportsTextGeneration).toBe(true);
         h.controls.selected = h.second;
         yield* h.refresh();

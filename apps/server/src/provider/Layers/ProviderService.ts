@@ -22,6 +22,9 @@ import {
   ProviderSessionStartInput,
   ProviderStopSessionInput,
   ProviderUploadFeedbackInput,
+  ProviderEphemeralQueryInput,
+  ProviderEphemeralQueryResult,
+  ProviderEphemeralQueryError,
   ThreadId,
   TurnId,
   type ProviderInstanceId,
@@ -1027,6 +1030,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
       yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
+      const now = DateTime.formatIso(yield* DateTime.now);
+      yield* directory.upsert({
+        ...input.binding,
+        providerInstanceId: bindingInstanceId,
+        status: "starting",
+        lastSeenAt: now,
+      });
       const resumed = yield* adapter
         .startSession({
           threadId: input.binding.threadId,
@@ -1082,6 +1092,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     const instanceId = yield* requireBindingInstanceId(input.operation, binding);
     const adapter = yield* registry.getByInstance(instanceId);
 
+    const isStarting = binding.status === "starting";
     const hasRequestedSession = yield* adapter.hasSession(input.threadId);
     if (hasRequestedSession) {
       return {
@@ -1090,6 +1101,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         threadId: input.threadId,
         runtimeMode: binding.runtimeMode,
         isActive: true,
+        isStarting,
       } as const;
     }
 
@@ -1100,6 +1112,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         threadId: input.threadId,
         runtimeMode: binding.runtimeMode,
         isActive: false,
+        isStarting,
       } as const;
     }
 
@@ -1113,6 +1126,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       threadId: input.threadId,
       runtimeMode: recovered.session.runtimeMode,
       isActive: true,
+      isStarting: false,
     } as const;
   });
 
@@ -1258,6 +1272,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
         yield* clearTurnAnalyticsSession(resolvedInstanceId, threadId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
+        const now = DateTime.formatIso(yield* DateTime.now);
+        yield* directory.upsert({
+          threadId,
+          provider: resolvedProvider,
+          providerInstanceId: resolvedInstanceId,
+          runtimeMode: input.runtimeMode,
+          status: "starting",
+          lastSeenAt: now,
+          ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
+          runtimePayload: persistedBinding?.runtimePayload ?? null,
+        });
         const session = yield* adapter
           .startSession({
             ...input,
@@ -1753,7 +1778,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }
         timedOutNativeCompactions.delete(input.threadId);
         yield* clearTurnAnalyticsSession(routed.instanceId, input.threadId);
-        yield* clearMcpSession(input.threadId);
+        if (routed.isActive || routed.isStarting) {
+          yield* clearMcpSession(input.threadId);
+        }
         yield* directory.upsert({
           threadId: input.threadId,
           provider: routed.adapter.provider,
@@ -1930,6 +1957,59 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
+  const queryEphemeral: ProviderServiceMethod<"queryEphemeral"> = Effect.fn("queryEphemeral")(
+    function* (rawInput) {
+      const input = yield* decodeInputOrValidationError({
+        operation: "ProviderService.queryEphemeral",
+        schema: ProviderEphemeralQueryInput,
+        payload: rawInput,
+      });
+      let routed = yield* resolveRoutableSession({
+        threadId: input.threadId,
+        operation: "ProviderService.queryEphemeral",
+        allowRecovery: false,
+      });
+      if (routed.adapter.queryEphemeral === undefined) {
+        return yield* toValidationError(
+          "ProviderService.queryEphemeral",
+          `Provider '${routed.adapter.provider}' does not support ephemeral queries.`,
+        );
+      }
+      if (!routed.isActive) {
+        routed = yield* resolveRoutableSession({
+          threadId: input.threadId,
+          operation: "ProviderService.queryEphemeral",
+          allowRecovery: true,
+        });
+      }
+      const runQuery = routed.adapter.queryEphemeral;
+      if (runQuery === undefined) {
+        return yield* toValidationError(
+          "ProviderService.queryEphemeral",
+          `Provider '${routed.adapter.provider}' does not support ephemeral queries.`,
+        );
+      }
+      yield* Effect.annotateCurrentSpan({
+        "provider.operation": "ephemeral-query",
+        "provider.kind": routed.adapter.provider,
+        "provider.thread_id": input.threadId,
+      });
+      return yield* runQuery(input).pipe(
+        Effect.mapError((cause) => {
+          if (Schema.is(ProviderEphemeralQueryError)(cause)) return cause;
+          return new ProviderEphemeralQueryError({
+            threadId: input.threadId,
+            detail:
+              typeof cause === "object" && cause !== null && "message" in cause
+                ? String(cause.message)
+                : "Ephemeral query failed",
+            cause,
+          });
+        }),
+      );
+    },
+  );
+
   const uploadFeedback: ProviderServiceMethod<"uploadFeedback"> = Effect.fn("uploadFeedback")(
     function* (rawInput) {
       const input = yield* decodeInputOrValidationError({
@@ -2064,6 +2144,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     assertConversationRollbackSupported,
     rollbackConversation,
     uploadFeedback,
+    queryEphemeral,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each
     // independently receive all runtime events.

@@ -204,6 +204,12 @@ export function createThreadEnvironmentAtoms<R, E>(
       scheduler,
       concurrency,
     }),
+    queryEphemeral: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:thread:query-ephemeral",
+      tag: WS_METHODS.providerEphemeralQuery,
+      scheduler,
+      concurrency,
+    }),
     uploadFeedback: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:commands:thread:upload-feedback",
       tag: WS_METHODS.providerUploadFeedback,

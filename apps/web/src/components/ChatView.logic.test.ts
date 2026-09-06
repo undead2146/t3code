@@ -57,6 +57,8 @@ import {
   shouldShowPlanFollowUpPrompt,
   shouldWriteThreadErrorToCurrentServerThread,
   toolGroupConsumesUpwardNavigation,
+  deriveStalledActivityAdvisory,
+  STALLED_ACTIVITY_THRESHOLD_MS,
 } from "./ChatView.logic";
 
 describe("agent browser close confirmation", () => {
@@ -1735,5 +1737,79 @@ describe("hasServerAcknowledgedLocalDispatch", () => {
         latestTurnStartFailureId: "turn-start-failure-new",
       }),
     ).toBe(true);
+  });
+});
+
+describe("deriveStalledActivityAdvisory", () => {
+  const baseTimeMs = 1_000_000_000;
+  const createdAt = new Date(baseTimeMs).toISOString();
+
+  it("does not report stalled when session is not running", () => {
+    expect(
+      deriveStalledActivityAdvisory({
+        phase: "ready",
+        latestActivityCreatedAt: createdAt,
+        nowMs: baseTimeMs + 200_000,
+      }),
+    ).toEqual({ isStalled: false, elapsedMs: 0 });
+
+    expect(
+      deriveStalledActivityAdvisory({
+        phase: "connecting",
+        latestActivityCreatedAt: createdAt,
+        nowMs: baseTimeMs + 200_000,
+      }),
+    ).toEqual({ isStalled: false, elapsedMs: 0 });
+  });
+
+  it("does not report stalled when latestActivityCreatedAt is missing or invalid", () => {
+    expect(
+      deriveStalledActivityAdvisory({
+        phase: "running",
+        latestActivityCreatedAt: null,
+        nowMs: baseTimeMs + 200_000,
+      }),
+    ).toEqual({ isStalled: false, elapsedMs: 0 });
+
+    expect(
+      deriveStalledActivityAdvisory({
+        phase: "running",
+        latestActivityCreatedAt: "invalid-date",
+        nowMs: baseTimeMs + 200_000,
+      }),
+    ).toEqual({ isStalled: false, elapsedMs: 0 });
+  });
+
+  it("does not report stalled when running time is below threshold", () => {
+    const elapsedMs = STALLED_ACTIVITY_THRESHOLD_MS - 1_000;
+    expect(
+      deriveStalledActivityAdvisory({
+        phase: "running",
+        latestActivityCreatedAt: createdAt,
+        nowMs: baseTimeMs + elapsedMs,
+      }),
+    ).toEqual({ isStalled: false, elapsedMs });
+  });
+
+  it("reports stalled when running time equals or exceeds threshold", () => {
+    const elapsedMs = STALLED_ACTIVITY_THRESHOLD_MS + 5_000;
+    expect(
+      deriveStalledActivityAdvisory({
+        phase: "running",
+        latestActivityCreatedAt: createdAt,
+        nowMs: baseTimeMs + elapsedMs,
+      }),
+    ).toEqual({ isStalled: true, elapsedMs });
+  });
+
+  it("respects custom thresholdMs", () => {
+    expect(
+      deriveStalledActivityAdvisory({
+        phase: "running",
+        latestActivityCreatedAt: createdAt,
+        nowMs: baseTimeMs + 30_000,
+        thresholdMs: 25_000,
+      }),
+    ).toEqual({ isStalled: true, elapsedMs: 30_000 });
   });
 });

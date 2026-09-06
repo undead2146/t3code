@@ -1127,6 +1127,10 @@ export interface DesktopBridge {
   ) => Promise<T | null>;
   openExternal: (url: string) => Promise<boolean>;
   /**
+   * Open or focus a dedicated Pull Requests window. Optional: older desktop builds lack it.
+   */
+  openPullRequestsWindow?: () => Promise<void>;
+  /**
    * Open a System Settings pane by identifier. Optional: older desktop builds
    * lack it, and callers no-op when it is missing.
    */

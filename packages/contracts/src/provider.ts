@@ -124,6 +124,30 @@ export const ProviderUploadFeedbackResult = Schema.Struct({
 });
 export type ProviderUploadFeedbackResult = typeof ProviderUploadFeedbackResult.Type;
 
+export const ProviderEphemeralQueryInput = Schema.Struct({
+  threadId: ThreadId,
+  query: TrimmedNonEmptyString,
+});
+export type ProviderEphemeralQueryInput = typeof ProviderEphemeralQueryInput.Type;
+
+export const ProviderEphemeralQueryResult = Schema.Struct({
+  text: Schema.String,
+});
+export type ProviderEphemeralQueryResult = typeof ProviderEphemeralQueryResult.Type;
+
+export class ProviderEphemeralQueryError extends Schema.TaggedErrorClass<ProviderEphemeralQueryError>()(
+  "ProviderEphemeralQueryError",
+  {
+    threadId: ThreadId,
+    detail: TrimmedNonEmptyString,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return `Ephemeral query failed for thread ${this.threadId}: ${this.detail}`;
+  }
+}
+
 export class ProviderUploadFeedbackError extends Schema.TaggedErrorClass<ProviderUploadFeedbackError>()(
   "ProviderUploadFeedbackError",
   {

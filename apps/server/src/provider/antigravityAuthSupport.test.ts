@@ -611,4 +611,38 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
       }
     }),
   );
+
+  it.effect(
+    "synchronizes user-global agent skills into config/skills during profile preparation",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+        const mockHome = path.join(temporaryDirectory, "mock-home");
+        const mockSkillDir = path.join(mockHome, ".agents", "skills", "postplan-helper");
+        yield* fs.makeDirectory(mockSkillDir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(mockSkillDir, "SKILL.md"),
+          "---\nname: postplan-helper\ndescription: Postplan helper.\n---\n",
+        );
+
+        const profileDirectory = path.join(temporaryDirectory, "profile");
+        yield* prepareAntigravityProfile({
+          profileDirectory,
+          userHome: mockHome,
+        });
+
+        const linkedSkill = path.join(
+          profileDirectory,
+          "config",
+          "skills",
+          "postplan-helper",
+          "SKILL.md",
+        );
+        expect(yield* fs.exists(linkedSkill)).toBe(true);
+        const content = yield* fs.readFileString(linkedSkill);
+        expect(content).toContain("name: postplan-helper");
+      }),
+  );
 });

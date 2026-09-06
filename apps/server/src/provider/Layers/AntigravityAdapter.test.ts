@@ -8,9 +8,11 @@ import {
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as TestClock from "effect/testing/TestClock";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -74,6 +76,12 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
   readonly holdCancel?: boolean;
   readonly holdClose?: boolean;
   readonly holdDispatch?: boolean;
+  readonly turnInactivityTimeoutMs?: number;
+  readonly activeToolInactivityTimeoutMs?: number;
+  readonly customRuntime?: (
+    input: Parameters<AntigravityAdapterOptions["makeRuntime"]>[0],
+    defaultRuntime: Runtime,
+  ) => Effect.Effect<Runtime>;
 }) {
   const runtimeEvents = yield* Queue.unbounded<AcpSessionRuntimeEvent>();
   const canonicalEvents = yield* Queue.unbounded<ProviderRuntimeEvent>();
@@ -218,6 +226,8 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
     decodeSettings({ enabled: options?.enabled ?? true }),
     {
       instanceId,
+      turnInactivityTimeoutMs: options?.turnInactivityTimeoutMs,
+      activeToolInactivityTimeoutMs: options?.activeToolInactivityTimeoutMs,
       makeRuntime: (input) =>
         Effect.gen(function* () {
           launches.push(input);
@@ -228,6 +238,9 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
               controls.closed += 1;
             }),
           );
+          if (options?.customRuntime) {
+            return yield* options.customRuntime(input, runtime);
+          }
           return runtime;
         }),
       withProcess: (stop, task) =>
@@ -294,6 +307,7 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
     nextCancellation: Queue.take(cancellations),
     drainEvents,
     hasActivePrompt: () => active !== undefined,
+    runtime,
   };
 });
 
@@ -1209,6 +1223,33 @@ it.layer(layer)("AntigravityAdapter", (it) => {
     }),
   );
 
+  it.effect(
+    "handles fatal agent execution error by stopping session and rejecting stale session use",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        yield* h.adapter.startSession({
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+        });
+        const sending = yield* h.adapter
+          .sendTurn({ threadId, input: "Hello" })
+          .pipe(Effect.forkChild);
+        yield* h.nextPrompt;
+        yield* h.emitNative({
+          _tag: "ContentDelta",
+          text: 'Agent execution error: MCP load failed for t3-code: calling "initialize": sending "initialize": Unauthorized',
+          rawPayload: null,
+        });
+        const turnExit = yield* Fiber.await(sending);
+        expect(Exit.isFailure(turnExit)).toBe(true);
+        const exited = yield* h.waitForEvent((event) => event.type === "session.exited");
+        expect(exited.payload.exitKind).toBe("error");
+        expect(yield* h.adapter.hasSession(threadId)).toBe(false);
+      }),
+  );
+
   it.effect("reports hidden login requests as sign-in required and clears account metadata", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness();
@@ -1290,6 +1331,199 @@ it.layer(layer)("AntigravityAdapter", (it) => {
         .pipe(Effect.exit);
       expect(Exit.isFailure(stale)).toBe(true);
       expect(active.launches).toHaveLength(0);
+    }),
+  );
+  it.effect(
+    "executes queryEphemeral using conversation's active model concurrently without disturbing turns",
+    () =>
+      Effect.gen(function* () {
+        const ephemeralPrompts = yield* Queue.unbounded<NativePrompt>();
+        const ephemeralEvents = yield* Queue.unbounded<AcpSessionRuntimeEvent>();
+        let ephemeralModel = nativeDefault;
+        const ephemeralCalls: string[] = [];
+
+        const ephemeralRuntime: Runtime = {
+          handleRequestPermission: () => Effect.void,
+          handleReadTextFile: () => Effect.void,
+          handleWriteTextFile: () => Effect.void,
+          start: () =>
+            Effect.succeed({
+              sessionId: "ephemeral-session-id",
+              initializeResult: {
+                protocolVersion: 1,
+                agentCapabilities: { sessionCapabilities: { resume: {} } },
+              },
+              sessionSetupResult: {
+                sessionId: "ephemeral-session-id",
+                configOptions: [
+                  {
+                    id: "model",
+                    name: "Model",
+                    type: "select",
+                    category: "model",
+                    currentValue: ephemeralModel,
+                    options: [
+                      { value: nativeDefault, name: "Gemini test low" },
+                      { value: nativeAlternative, name: "Gemini test high" },
+                    ],
+                  },
+                ],
+              },
+              modelConfigId: "model",
+            }),
+          getConfigOptions: Effect.sync(() => [
+            {
+              id: "model",
+              name: "Model",
+              type: "select",
+              category: "model",
+              currentValue: ephemeralModel,
+              options: [
+                { value: nativeDefault, name: "Gemini test low" },
+                { value: nativeAlternative, name: "Gemini test high" },
+              ],
+            },
+          ]),
+          setModel: (model) =>
+            Effect.sync(() => {
+              ephemeralCalls.push(`model:${model}`);
+              ephemeralModel = model;
+            }),
+          setMode: (mode) =>
+            Effect.sync(() => {
+              ephemeralCalls.push(`mode:${mode}`);
+              return {};
+            }),
+          getEvents: () => Stream.fromQueue(ephemeralEvents),
+          drainEvents: Effect.gen(function* () {
+            const acknowledge = yield* Deferred.make<void>();
+            yield* Queue.offer(ephemeralEvents, { _tag: "EventStreamBarrier", acknowledge });
+            yield* Deferred.await(acknowledge);
+          }),
+          prompt: (payload) =>
+            Effect.gen(function* () {
+              const prompt: NativePrompt = {
+                index: 1,
+                content: payload.prompt,
+                result: yield* Deferred.make<AcpSchema.PromptResponse, AcpErrors.AcpError>(),
+              };
+              yield* Queue.offer(ephemeralPrompts, prompt);
+              return yield* Deferred.await(prompt.result);
+            }),
+          cancel: Effect.void,
+        };
+
+        const h = yield* makeHarness({
+          customRuntime: (input, defaultRuntime) =>
+            Effect.sync(() => {
+              if (input.clientInfo?.name === "t3-code-btw") {
+                return ephemeralRuntime;
+              }
+              return defaultRuntime;
+            }),
+        });
+
+        yield* h.adapter.startSession({
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+          modelSelection: { instanceId, model: nativeAlternative },
+        });
+
+        // Start an active turn running on the main session
+        const sending = yield* h.adapter
+          .sendTurn({ threadId, input: "Active turn prompt" })
+          .pipe(Effect.forkChild);
+        const activePrompt = yield* h.nextPrompt;
+
+        // Now issue queryEphemeral concurrently
+        const ephemeralFiber = yield* h.adapter.queryEphemeral!({
+          threadId,
+          query: "What is this file?",
+        }).pipe(Effect.forkChild);
+
+        const ephPrompt = yield* Queue.take(ephemeralPrompts);
+        expect(ephPrompt.content).toEqual([
+          {
+            type: "text",
+            text:
+              "You are answering a quick side-question (/btw) from the user.\n" +
+              "Answer concisely and directly. Do not attempt to use tools, write files, run commands, or ask for confirmation.\n\n" +
+              "What is this file?",
+          },
+        ]);
+
+        // Emit content delta on ephemeral events
+        yield* Queue.offer(ephemeralEvents, {
+          _tag: "ContentDelta",
+          text: "This is a configuration file.",
+          rawPayload: {},
+        });
+        yield* Deferred.succeed(ephPrompt.result, { stopReason: "end_turn" });
+
+        const ephemeralResult = yield* Fiber.join(ephemeralFiber);
+        expect(ephemeralResult.text).toBe("This is a configuration file.");
+
+        // Verify the active turn on the main session is undisturbed
+        expect(h.hasActivePrompt()).toBe(true);
+        yield* Deferred.succeed(activePrompt.result, { stopReason: "end_turn" });
+        const turnResult = yield* Fiber.join(sending);
+        expect(turnResult.turnId).toBeDefined();
+        const completed = yield* h.waitForEvent((event) => event.type === "turn.completed");
+        expect(completed.payload.state).toBe("completed");
+
+        // Verify ephemeral runtime applied the active conversation model
+        expect(ephemeralCalls).toContain(`model:${nativeAlternative}`);
+      }),
+  );
+
+  it.effect("fails queryEphemeral if thread has no session or model cannot be resolved", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const result = yield* h.adapter.queryEphemeral!({
+        threadId: ThreadId.make("non-existent-thread"),
+        query: "Hello?",
+      }).pipe(Effect.exit);
+
+      expect(Exit.isFailure(result)).toBe(true);
+    }),
+  );
+
+  it.effect("times out an inactive turn when the model stalls without stream progress", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({
+        turnInactivityTimeoutMs: 50,
+      });
+      yield* h.adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const sendFiber = yield* h.adapter
+        .sendTurn({ threadId, input: "Hello stall test", attachments: [] })
+        .pipe(Effect.forkChild);
+
+      // Prompt is dispatched to the runtime, but nothing returns or streams
+      const activePrompt = yield* h.nextPrompt;
+      expect(activePrompt).toBeDefined();
+
+      // Advance TestClock past the inactivity timeout
+      yield* TestClock.adjust(Duration.millis(100));
+
+      // Wait for turn.completed event
+      const completed = yield* h.waitForEvent((event) => event.type === "turn.completed");
+      expect(completed.payload.state).toBe("failed");
+      expect(completed.payload.errorMessage).toMatch(/timed out/i);
+
+      // sendTurn fiber should fail
+      const sendResult = yield* Fiber.await(sendFiber);
+      expect(Exit.isFailure(sendResult)).toBe(true);
+
+      // Session status should be error
+      const sessions = yield* h.adapter.listSessions();
+      const session = sessions.find((s) => s.threadId === threadId);
+      expect(session?.status).toBe("error");
     }),
   );
 });

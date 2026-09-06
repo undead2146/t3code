@@ -119,6 +119,7 @@ const readSkill = Effect.fn("readAntigravitySkill")(function* (
 export const discoverAntigravitySkills = Effect.fn("discoverAntigravitySkills")(function* (input: {
   readonly cwd: string;
   readonly profileDirectory: string;
+  readonly userHome?: string;
 }): Effect.fn.Return<
   ReadonlyArray<ServerProviderSkill>,
   AntigravitySkillsProbeError,
@@ -135,6 +136,28 @@ export const discoverAntigravitySkills = Effect.fn("discoverAntigravitySkills")(
     },
     { directory: path.resolve(input.cwd, ".agents", "skills"), scope: "project" },
     { directory: path.resolve(input.cwd, ".agent", "skills"), scope: "project" },
+    ...(input.userHome
+      ? [
+          {
+            directory: path.resolve(input.userHome, ".antigravity", "skills"),
+            scope: "user" as const,
+          },
+          { directory: path.resolve(input.userHome, ".agents", "skills"), scope: "user" as const },
+          {
+            directory: path.resolve(input.userHome, ".gemini", "config", "skills"),
+            scope: "user" as const,
+          },
+          { directory: path.resolve(input.userHome, ".gemini", "skills"), scope: "user" as const },
+          { directory: path.resolve(input.userHome, ".t3", "skills"), scope: "user" as const },
+          { directory: path.resolve(input.userHome, ".claude", "skills"), scope: "user" as const },
+          { directory: path.resolve(input.userHome, ".cursor", "skills"), scope: "user" as const },
+          { directory: path.resolve(input.userHome, ".codex", "skills"), scope: "user" as const },
+          {
+            directory: path.resolve(input.userHome, ".ai-tools", "skills"),
+            scope: "user" as const,
+          },
+        ]
+      : []),
   ];
   const budget: ScanBudget = {
     remainingBytes: MAX_SCAN_BYTES,

@@ -23,6 +23,8 @@ import type {
   ProviderStopSessionInput,
   ProviderUploadFeedbackInput,
   ProviderUploadFeedbackResult,
+  ProviderEphemeralQueryInput,
+  ProviderEphemeralQueryResult,
   MessageId,
   ThreadId,
   ProviderTurnStartResult,
@@ -124,6 +126,10 @@ export interface ProviderServiceShape {
   /**
    * Upload a thread and return the provider's shareable feedback identifier.
    */
+  readonly queryEphemeral: (
+    input: ProviderEphemeralQueryInput,
+  ) => Effect.Effect<ProviderEphemeralQueryResult, ProviderServiceError>;
+
   readonly uploadFeedback: (
     input: ProviderUploadFeedbackInput,
   ) => Effect.Effect<ProviderUploadFeedbackResult, ProviderServiceError>;

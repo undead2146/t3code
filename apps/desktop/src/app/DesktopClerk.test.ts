@@ -1,3 +1,4 @@
+import * as Option from "effect/Option";
 import { assert, describe, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -28,6 +29,7 @@ import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopClerk from "./DesktopClerk.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopWindow from "../window/DesktopWindow.ts";
 
 const makeDesktopClerkLayer = (isDevelopment = true, events: string[] = []) => {
   const environment = DesktopEnvironment.DesktopEnvironment.of({
@@ -165,7 +167,13 @@ describe("DesktopClerk", () => {
           registeredEvents.push(eventName);
         }),
     } as unknown as ElectronApp.ElectronApp["Service"];
-    const electronWindow = {} as ElectronWindow.ElectronWindow["Service"];
+    const electronWindow = {
+      reveal: vi.fn(() => Effect.void),
+      currentMainOrFirst: Effect.succeed(Option.some({} as Electron.BrowserWindow)),
+    } as unknown as ElectronWindow.ElectronWindow["Service"];
+    const desktopWindow = {
+      openPullRequests: Effect.void,
+    } as unknown as DesktopWindow.DesktopWindow["Service"];
 
     return Effect.gen(function* () {
       const clerk = yield* DesktopClerk.DesktopClerk;
@@ -178,6 +186,61 @@ describe("DesktopClerk", () => {
       Effect.provide(makeDesktopClerkLayer()),
       Effect.provideService(ElectronApp.ElectronApp, electronApp),
       Effect.provideService(ElectronWindow.ElectronWindow, electronWindow),
+      Effect.provideService(DesktopWindow.DesktopWindow, desktopWindow),
+      Effect.provideService(DesktopWindow.DesktopWindow, desktopWindow),
+    );
+  });
+
+  it.effect("handles second-instance with --pull-requests by opening PR window", () => {
+    storageMock.mockReturnValue(storageAdapter);
+    createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
+    let secondInstanceListener: ((event: unknown, argv: readonly string[]) => void) | undefined;
+    const electronApp = {
+      quit: Effect.void,
+      on: (eventName: string, listener: any) =>
+        Effect.sync(() => {
+          if (eventName === "second-instance") {
+            secondInstanceListener = listener;
+          }
+        }),
+    } as unknown as ElectronApp.ElectronApp["Service"];
+    let prWindowOpened = false;
+    let mainWindowRevealed = false;
+    const electronWindow = {
+      currentMainOrFirst: Effect.succeed(Option.some({} as Electron.BrowserWindow)),
+      reveal: () =>
+        Effect.sync(() => {
+          mainWindowRevealed = true;
+        }),
+    } as unknown as ElectronWindow.ElectronWindow["Service"];
+    const desktopWindow = {
+      openPullRequests: Effect.sync(() => {
+        prWindowOpened = true;
+        return {} as Electron.BrowserWindow;
+      }),
+    } as unknown as DesktopWindow.DesktopWindow["Service"];
+
+    return Effect.gen(function* () {
+      const clerk = yield* DesktopClerk.DesktopClerk;
+      yield* clerk.configure;
+
+      assert.isFunction(secondInstanceListener);
+      secondInstanceListener?.({}, ["app", "--pull-requests"]);
+      // Yield small time for promise in second-instance to resolve
+      yield* Effect.yieldNow;
+      assert.isTrue(prWindowOpened);
+      assert.isFalse(mainWindowRevealed);
+
+      // Now fire with standard args
+      secondInstanceListener?.({}, ["app"]);
+      yield* Effect.yieldNow;
+      assert.isTrue(mainWindowRevealed);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(makeDesktopClerkLayer()),
+      Effect.provideService(ElectronApp.ElectronApp, electronApp),
+      Effect.provideService(ElectronWindow.ElectronWindow, electronWindow),
+      Effect.provideService(DesktopWindow.DesktopWindow, desktopWindow),
     );
   });
 
@@ -194,6 +257,9 @@ describe("DesktopClerk", () => {
         }),
     } as unknown as ElectronApp.ElectronApp["Service"];
     const electronWindow = {} as ElectronWindow.ElectronWindow["Service"];
+    const desktopWindow = {
+      openPullRequests: Effect.void,
+    } as unknown as DesktopWindow.DesktopWindow["Service"];
 
     return Effect.gen(function* () {
       const clerk = yield* DesktopClerk.DesktopClerk;
@@ -206,6 +272,7 @@ describe("DesktopClerk", () => {
       Effect.provide(makeDesktopClerkLayer()),
       Effect.provideService(ElectronApp.ElectronApp, electronApp),
       Effect.provideService(ElectronWindow.ElectronWindow, electronWindow),
+      Effect.provideService(DesktopWindow.DesktopWindow, desktopWindow),
     );
   });
 

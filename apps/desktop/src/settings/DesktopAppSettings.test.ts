@@ -25,6 +25,17 @@ const DesktopSettingsPatch = Schema.Struct({
     ),
   ),
   mainWindowMaximized: Schema.optionalKey(Schema.Boolean),
+  pullRequestsWindowBounds: Schema.optionalKey(
+    Schema.NullOr(
+      Schema.Struct({
+        x: Schema.Number,
+        y: Schema.Number,
+        width: Schema.Number,
+        height: Schema.Number,
+      }),
+    ),
+  ),
+  pullRequestsWindowMaximized: Schema.optionalKey(Schema.Boolean),
   serverExposureMode: Schema.optionalKey(Schema.Literals(["local-only", "network-accessible"])),
   tailscaleServeEnabled: Schema.optionalKey(Schema.Boolean),
   tailscaleServePort: Schema.optionalKey(Schema.Number),
@@ -108,6 +119,8 @@ describe("DesktopSettings", () => {
         linuxPasswordStore: "auto",
         mainWindowBounds: null,
         mainWindowMaximized: false,
+        pullRequestsWindowBounds: null,
+        pullRequestsWindowMaximized: false,
         serverExposureMode: "local-only",
         tailscaleServeEnabled: false,
         tailscaleServePort: 443,
@@ -137,6 +150,8 @@ describe("DesktopSettings", () => {
           linuxPasswordStore: "gnome-libsecret",
           mainWindowBounds: null,
           mainWindowMaximized: false,
+          pullRequestsWindowBounds: null,
+          pullRequestsWindowMaximized: false,
           serverExposureMode: "network-accessible",
           tailscaleServeEnabled: true,
           tailscaleServePort: 8443,
@@ -244,6 +259,8 @@ describe("DesktopSettings", () => {
           linuxPasswordStore: "auto",
           mainWindowBounds: { x: 120, y: 80, width: 1280, height: 900 },
           mainWindowMaximized: false,
+          pullRequestsWindowBounds: null,
+          pullRequestsWindowMaximized: false,
           serverExposureMode: "network-accessible",
           tailscaleServeEnabled: true,
           tailscaleServePort: 8443,
@@ -253,6 +270,47 @@ describe("DesktopSettings", () => {
           wslOnly: false,
           wslDistro: null,
         } satisfies DesktopAppSettings.DesktopSettings);
+      }),
+    ),
+  );
+
+  it.effect("persists pull requests window bounds and tracks changes", () =>
+    withSettings(
+      Effect.gen(function* () {
+        const settings = yield* DesktopAppSettings.DesktopAppSettings;
+        const initialBounds = { x: 200, y: 150, width: 1200, height: 800 };
+
+        const firstChange = yield* settings.setPullRequestsWindowBounds(initialBounds, false);
+        assert.isTrue(firstChange.changed);
+        assert.deepEqual(firstChange.settings.pullRequestsWindowBounds, initialBounds);
+        assert.isFalse(firstChange.settings.pullRequestsWindowMaximized);
+
+        const unchanged = yield* settings.setPullRequestsWindowBounds(initialBounds, false);
+        assert.isFalse(unchanged.changed);
+
+        const maximizedChange = yield* settings.setPullRequestsWindowBounds(initialBounds, true);
+        assert.isTrue(maximizedChange.changed);
+        assert.isTrue(maximizedChange.settings.pullRequestsWindowMaximized);
+
+        const reloaded = yield* settings.load;
+        assert.deepEqual(reloaded.pullRequestsWindowBounds, initialBounds);
+        assert.isTrue(reloaded.pullRequestsWindowMaximized);
+      }),
+    ),
+  );
+
+  it.effect("rejects pull requests window bounds that do not satisfy schema", () =>
+    withSettings(
+      Effect.gen(function* () {
+        const settings = yield* DesktopAppSettings.DesktopAppSettings;
+        yield* writeSettingsPatch({
+          pullRequestsWindowBounds: { x: 10, y: 20, width: 500, height: 300 },
+          pullRequestsWindowMaximized: true,
+        });
+
+        const loaded = yield* settings.load;
+        assert.isNull(loaded.pullRequestsWindowBounds);
+        assert.isFalse(loaded.pullRequestsWindowMaximized);
       }),
     ),
   );
@@ -300,6 +358,8 @@ describe("DesktopSettings", () => {
             linuxPasswordStore: "auto",
             mainWindowBounds: null,
             mainWindowMaximized: false,
+            pullRequestsWindowBounds: null,
+            pullRequestsWindowMaximized: false,
             serverExposureMode: "network-accessible",
             tailscaleServeEnabled: true,
             tailscaleServePort: 8443,
@@ -348,6 +408,8 @@ describe("DesktopSettings", () => {
           linuxPasswordStore: "auto",
           mainWindowBounds: null,
           mainWindowMaximized: false,
+          pullRequestsWindowBounds: null,
+          pullRequestsWindowMaximized: false,
           serverExposureMode: "local-only",
           tailscaleServeEnabled: false,
           tailscaleServePort: 443,
@@ -376,6 +438,8 @@ describe("DesktopSettings", () => {
           linuxPasswordStore: "auto",
           mainWindowBounds: null,
           mainWindowMaximized: false,
+          pullRequestsWindowBounds: null,
+          pullRequestsWindowMaximized: false,
           serverExposureMode: "local-only",
           tailscaleServeEnabled: false,
           tailscaleServePort: 443,
@@ -403,6 +467,8 @@ describe("DesktopSettings", () => {
           linuxPasswordStore: "auto",
           mainWindowBounds: null,
           mainWindowMaximized: false,
+          pullRequestsWindowBounds: null,
+          pullRequestsWindowMaximized: false,
           serverExposureMode: "local-only",
           tailscaleServeEnabled: true,
           tailscaleServePort: 443,

@@ -37,6 +37,7 @@ import {
   getLocalEnvironmentBearerToken,
   getSystemLocale,
   getWindowFullscreenState,
+  openPullRequestsWindow,
   openExternal,
   openSystemSettings,
   probeRemoteEditors,
@@ -94,6 +95,7 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(pickThemeFiles);
   yield* ipc.handle(setTheme);
   yield* ipc.handle(showContextMenu);
+  yield* ipc.handle(openPullRequestsWindow);
   yield* ipc.handle(openExternal);
   yield* ipc.handle(openSystemSettings);
   yield* ipc.handle(probeRemoteEditors);

@@ -26,7 +26,10 @@ import {
   makeManualOnlyProviderMaintenanceCapabilities,
   type ProviderMaintenanceCapabilities,
 } from "../providerMaintenance.ts";
+import { makeAntigravityUsageLimits } from "./antigravityUsageLimits.ts";
+import { makeUnavailableUsageLimits } from "../providerUsageLimits.ts";
 import {
+  BTW_SLASH_COMMAND,
   buildServerProvider,
   isCommandMissingCause,
   type ServerProviderDraft,
@@ -150,6 +153,7 @@ interface AntigravityProviderOptions {
   /** Auth type and label published once a session authenticates. */
   readonly auth?: { readonly type: string; readonly label: string };
   readonly checkAuthenticated?: Effect.Effect<boolean>;
+  readonly checkInstallation?: Effect.Effect<{ readonly version?: string | null } | null>;
   readonly cachedModelsPath?: string;
 }
 
@@ -160,20 +164,49 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
 ) {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const cachedModels = readCachedModels(options.cachedModelsPath);
+  const initialInstallation = options.checkInstallation
+    ? yield* options.checkInstallation.pipe(Effect.orElseSucceed(() => null))
+    : null;
+  const isSavedAuth = options.checkAuthenticated
+    ? yield* options.checkAuthenticated.pipe(Effect.orElseSucceed(() => false))
+    : false;
+
+  const isInitiallyReady = settings.enabled && initialInstallation !== null && isSavedAuth;
+  const isInitiallyInstalled = initialInstallation !== null;
+  const initialMessage = !settings.enabled
+    ? "Antigravity is disabled in T3 Code settings."
+    : isInitiallyReady
+      ? undefined
+      : isInitiallyInstalled
+        ? isSavedAuth
+          ? undefined
+          : SIGN_IN_MESSAGE
+        : "Checking Antigravity availability.";
+
   const initialDraft = {
     ...buildServerProvider({
       presentation: { displayName: "Antigravity", showInteractionModeToggle: false },
       enabled: settings.enabled,
       checkedAt,
       models: cachedModels,
+      slashCommands: [BTW_SLASH_COMMAND],
       probe: {
-        installed: false,
-        version: null,
-        status: "warning",
-        auth: { status: "unknown" },
-        message: settings.enabled
-          ? "Checking Antigravity availability."
-          : "Antigravity is disabled in T3 Code settings.",
+        installed: isInitiallyInstalled,
+        version: initialInstallation?.version ?? null,
+        status: isInitiallyReady ? "ready" : "warning",
+        auth: {
+          status: isSavedAuth ? "authenticated" : "unknown",
+          type: options.auth?.type ?? "oauth-personal",
+          label: options.auth?.label ?? "Google account",
+        },
+        ...(initialMessage ? { message: initialMessage } : {}),
+        usageLimits: isSavedAuth
+          ? makeAntigravityUsageLimits({ checkedAt })
+          : makeUnavailableUsageLimits({
+              checkedAt,
+              reason: "unsupported",
+              message: "Sign in with Google to view Antigravity limits.",
+            }),
       },
     }),
     setup: { canAuthenticate: true, canInstall: true },
@@ -244,6 +277,13 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             type: options.auth?.type ?? "oauth-personal",
             label: options.auth?.label ?? "Google account",
           },
+          usageLimits: authenticated
+            ? (draft.usageLimits ?? makeAntigravityUsageLimits({ checkedAt: updatedAt }))
+            : makeUnavailableUsageLimits({
+                checkedAt: updatedAt,
+                reason: "unsupported",
+                message: "Sign in with Google to view Antigravity limits.",
+              }),
           models: missingInstallation ? [] : draft.models.length > 0 ? draft.models : cachedModels,
           ...(missingInstallation
             ? {
@@ -319,6 +359,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             label: options.auth?.label ?? "Google account",
           },
           checkedAt: updatedAt,
+          usageLimits: draft.usageLimits ?? makeAntigravityUsageLimits({ checkedAt: updatedAt }),
           models: sessionModels,
           supportsTextGeneration,
           ...(cwd
@@ -353,7 +394,10 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     commands: ReadonlyArray<EffectAcpSchema.AvailableCommand>,
     cwd?: string,
   ) {
-    const slashCommands = nativeCommands(commands);
+    const slashCommands = [
+      BTW_SLASH_COMMAND,
+      ...nativeCommands(commands).filter((cmd) => cmd.name.toLowerCase() !== "btw"),
+    ];
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
     yield* SubscriptionRef.update(metadata, (state) => {
       if (state.draft.auth.status === "unauthenticated") return state;
@@ -401,6 +445,11 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             skills: [],
             workspaceSnapshots: [],
             supportsTextGeneration: false,
+            usageLimits: makeUnavailableUsageLimits({
+              checkedAt: updatedAt,
+              reason: "unsupported",
+              message: "Sign in with Google to view Antigravity limits.",
+            }),
           },
         }) satisfies AntigravityProviderState,
     );

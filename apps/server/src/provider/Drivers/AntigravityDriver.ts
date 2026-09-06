@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeOS from "node:os";
+
 import { AntigravitySettings, ProviderDriverKind, ProviderSetupError } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
@@ -91,6 +94,10 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
       };
       const authConfigIssue = antigravityAuthConfigIssue(auth);
       const processEnvironment = mergeProviderInstanceEnvironment(environment);
+      const userHome =
+        processEnvironment.USERPROFILE?.trim() ||
+        processEnvironment.HOME?.trim() ||
+        NodeOS.homedir();
       const profileDirectory = resolveAntigravityProfileDirectory(
         serverConfig.stateDir,
         instanceId,
@@ -302,6 +309,8 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
       );
       const adapter = yield* makeAntigravityAdapter(settings, {
         instanceId,
+        profileDirectory,
+        userHome,
         makeRuntime,
         withProcess: authFlow.withProcess,
         defaultModel,
@@ -380,7 +389,7 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
         snapshotForCwd: (cwd) =>
           !enabled
             ? provider.snapshot.getSnapshot
-            : discoverAntigravitySkills({ cwd, profileDirectory }).pipe(
+            : discoverAntigravitySkills({ cwd, profileDirectory, userHome }).pipe(
                 Effect.provideService(FileSystem.FileSystem, fileSystem),
                 Effect.provideService(Path.Path, path),
                 Effect.flatMap((skills) => provider.snapshotForCwd(cwd, skills)),

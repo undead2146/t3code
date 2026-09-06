@@ -31,6 +31,7 @@ import { type CodexArtifactTemplate } from "@t3tools/client-runtime/codex-artifa
 import { effectiveSnoozed, threadWokeAt } from "@t3tools/client-runtime/state/thread-settled";
 import {
   codexFeedbackMessage,
+  parseBtwCommand,
   parseCodexFeedbackCommand,
   submitCodexFeedback,
   type CodexFeedbackSubmission,
@@ -191,6 +192,7 @@ import {
   AlarmClockIcon,
   CheckCircle2Icon,
   ChevronDownIcon,
+  ClockIcon,
   GitBranchIcon,
   Minimize2Icon,
   PaperclipIcon,
@@ -295,6 +297,7 @@ import {
   useThreadShell,
 } from "../state/entities";
 import { environmentShell } from "../state/shell";
+import { BtwOverlayHUD, type BtwState } from "./chat/BtwOverlayHUD";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { createPageScrollController, type PageScrollKey } from "./chat/pageScrollController";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
@@ -302,7 +305,8 @@ import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
 import type { AssistantCitationRequest } from "./chat/AssistantCitationSource";
-import { resolveTimelineIsAtEnd } from "./chat/MessagesTimeline.logic";
+import { formatDuration } from "@t3tools/shared/orchestrationTiming";
+import { liveWorkEntryLabel, resolveTimelineIsAtEnd } from "./chat/MessagesTimeline.logic";
 import { resolveComposerTimelineInset } from "./composerFooterLayout";
 import { ChatHeader } from "./chat/ChatHeader";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
@@ -398,6 +402,7 @@ import {
   codexArtifactTemplatePromptToAppend,
   toolGroupConsumesUpwardNavigation,
   waitForStartedServerThread,
+  deriveStalledActivityAdvisory,
 } from "./ChatView.logic";
 import type { ThreadSyncPhase } from "../threadSync";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
@@ -1405,6 +1410,10 @@ export default function ChatView(props: ChatViewProps) {
   const uploadThreadFeedback = useAtomCommand(threadEnvironment.uploadFeedback, {
     reportFailure: false,
   });
+  const queryEphemeral = useAtomCommand(threadEnvironment.queryEphemeral, {
+    reportFailure: false,
+  });
+  const [btwState, setBtwState] = useState<BtwState | null>(null);
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, {
     reportFailure: false,
   });
@@ -5455,6 +5464,89 @@ export default function ChatView(props: ChatViewProps) {
     handleStopBackgroundWork,
     isStoppingBackgroundWork,
   ]);
+  const [stalledNowMs, setStalledNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (phase !== "running") return;
+    const id = setInterval(() => setStalledNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [phase]);
+
+  const [dismissedStalledActivityKey, setDismissedStalledActivityKey] = useState<string | null>(
+    null,
+  );
+
+  const latestActivity = activeThread?.activities.at(-1);
+  const latestActivityCreatedAt =
+    latestActivity?.createdAt ?? activeThread?.latestTurn?.startedAt ?? null;
+  const stalledActivityKey = activeThread
+    ? `${activeThread.id}:${latestActivityCreatedAt ?? "turn"}`
+    : null;
+
+  const stalledAdvisory = useMemo(
+    () =>
+      deriveStalledActivityAdvisory({
+        phase,
+        latestActivityCreatedAt,
+        nowMs: stalledNowMs,
+      }),
+    [phase, latestActivityCreatedAt, stalledNowMs],
+  );
+
+  const stalledActivityBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
+    if (
+      !stalledAdvisory.isStalled ||
+      !activeThread ||
+      (stalledActivityKey !== null && dismissedStalledActivityKey === stalledActivityKey)
+    ) {
+      return null;
+    }
+
+    const latestWorkEntry = workLogEntries.at(-1);
+    const activityLabel = latestWorkEntry
+      ? liveWorkEntryLabel(latestWorkEntry, activeProject?.workspaceRoot, true)
+      : "Turn";
+    const elapsedFormatted = formatDuration(stalledAdvisory.elapsedMs);
+
+    return {
+      id: `stalled-activity:${stalledActivityKey}`,
+      variant: "warning",
+      priority: "urgent",
+      icon: <ClockIcon />,
+      title: `${activityLabel} has been quiet for ${elapsedFormatted}`,
+      description:
+        "No updates received for over 2 minutes. The task may be waiting or quiet. You can keep waiting or interrupt the turn to recover the response.",
+      actions: (
+        <>
+          <Button
+            size="xs"
+            variant="destructive"
+            disabled={isStoppingBackgroundWork}
+            onClick={() => void handleStopBackgroundWork()}
+          >
+            {isStoppingBackgroundWork ? "Stopping..." : "Interrupt turn"}
+          </Button>
+          <Button
+            size="xs"
+            variant="ghost"
+            onClick={() => setDismissedStalledActivityKey(stalledActivityKey)}
+          >
+            Keep waiting
+          </Button>
+        </>
+      ),
+      onDismiss: () => setDismissedStalledActivityKey(stalledActivityKey),
+    };
+  }, [
+    stalledAdvisory.isStalled,
+    stalledAdvisory.elapsedMs,
+    activeThread,
+    stalledActivityKey,
+    dismissedStalledActivityKey,
+    workLogEntries,
+    activeProject?.workspaceRoot,
+    isStoppingBackgroundWork,
+    handleStopBackgroundWork,
+  ]);
   // A woken thread announces itself in the open view, not just the sidebar
   // pill. Dismissing marks the wake as seen (same acknowledgment as the
   // pill); sending a message clears it as a side effect of the send path.
@@ -5626,6 +5718,8 @@ export default function ChatView(props: ChatViewProps) {
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
     const backgroundLivenessItems =
       backgroundLivenessBannerItem === null ? [] : [backgroundLivenessBannerItem];
+    const stalledActivityItems =
+      stalledActivityBannerItem === null ? [] : [stalledActivityBannerItem];
     const resumeCompactionItems =
       resumeCompactionBannerItem === null ? [] : [resumeCompactionBannerItem];
     const wokeThreadItems = wokeThreadBannerItem === null ? [] : [wokeThreadBannerItem];
@@ -5633,6 +5727,7 @@ export default function ChatView(props: ChatViewProps) {
     if (!localCheckoutBranchMismatch || !showBranchMismatchBanner || !activeBranchMismatchKey) {
       return [
         ...systemComposerBannerItems,
+        ...stalledActivityItems,
         ...backgroundLivenessItems,
         ...resumeCompactionItems,
         ...wokeThreadItems,
@@ -5641,6 +5736,7 @@ export default function ChatView(props: ChatViewProps) {
     }
     return [
       ...systemComposerBannerItems,
+      ...stalledActivityItems,
       ...backgroundLivenessItems,
       ...resumeCompactionItems,
       ...wokeThreadItems,
@@ -6117,6 +6213,80 @@ export default function ChatView(props: ChatViewProps) {
         }),
       );
     };
+    const btwPrompt = promptRef.current;
+    const btwCommand = parseBtwCommand(btwPrompt);
+    if (btwCommand) {
+      if (!activeThread) return;
+      if (activeEnvironmentUnavailable || isConnecting) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "warning",
+            title: "Not connected",
+            description: "Reconnecting to the environment. Try again once it is connected.",
+          }),
+        );
+        return;
+      }
+      if (!isServerThread || activeThread.session === null) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "warning",
+            title: "Start a thread first",
+            description: "Send a message before you ask a side question.",
+          }),
+        );
+        return;
+      }
+      if (!btwCommand.query) {
+        toastManager.add(
+          stackedThreadToast({
+            type: "info",
+            title: "Side question is empty",
+            description: "Usage: /btw <your question here>",
+          }),
+        );
+        return;
+      }
+
+      promptRef.current = "";
+      clearComposerDraftContent(composerDraftTarget);
+      composerRef.current?.resetCursorState();
+
+      setBtwState({
+        query: btwCommand.query,
+        status: "loading",
+      });
+
+      const result = await queryEphemeral({
+        environmentId,
+        input: {
+          threadId: activeThread.id,
+          query: btwCommand.query,
+        },
+      });
+
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          const errorMessage = chatActionErrorMessage(squashAtomCommandFailure(result));
+          setBtwState({
+            query: btwCommand.query,
+            status: "error",
+            error: errorMessage,
+          });
+        } else {
+          setBtwState(null);
+        }
+        return;
+      }
+
+      setBtwState({
+        query: btwCommand.query,
+        status: "done",
+        text: result.value.text,
+      });
+      return;
+    }
+
     if (
       !activeThread ||
       isSendBusy ||
@@ -7951,6 +8121,21 @@ export default function ChatView(props: ChatViewProps) {
                     <ComposerSurface.Shell contextStrip={showComposerContextStrip}>
                       <ComposerSurface.Host>
                         <div ref={attachDraftHeroComposerAnchorRef} className="relative z-10">
+                          {btwState ? (
+                            <BtwOverlayHUD
+                              state={btwState}
+                              onDismiss={() => setBtwState(null)}
+                              onInsertToComposer={(text) => {
+                                const current = promptRef.current;
+                                const next = current ? `${current}\n\n${text}` : text;
+                                promptRef.current = next;
+                                setComposerDraftPrompt(composerDraftTarget, next);
+                                setBtwState(null);
+                                composerRef.current?.focusAtEnd();
+                              }}
+                              cwd={activeProject?.workspaceRoot}
+                            />
+                          ) : null}
                           <ChatComposer
                             composerRef={composerRef}
                             composerDraftTarget={composerDraftTarget}

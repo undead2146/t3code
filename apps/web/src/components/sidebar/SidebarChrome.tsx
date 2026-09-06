@@ -1,6 +1,7 @@
 import {
   ArrowLeftIcon,
   ChartNoAxesColumnIcon,
+  ExternalLinkIcon,
   GitPullRequestIcon,
   SettingsIcon,
 } from "lucide-react";
@@ -203,11 +204,24 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
             onClick={handleSettingsClick}
           />
           {pullRequestsSupported ? (
-            <SidebarUtilityItem
-              icon={<GitPullRequestIcon />}
-              label="Pull Requests"
-              onClick={handlePullRequestsClick}
-            />
+            <>
+              <SidebarUtilityItem
+                icon={<GitPullRequestIcon />}
+                label="Pull Requests"
+                onClick={handlePullRequestsClick}
+              />
+              {typeof window !== "undefined" &&
+              typeof window.desktopBridge?.openPullRequestsWindow === "function" ? (
+                <SidebarUtilityItem
+                  icon={<ExternalLinkIcon />}
+                  label="Open Pull Requests in New Window"
+                  onClick={() => {
+                    closeMobileSidebar();
+                    void window.desktopBridge?.openPullRequestsWindow?.();
+                  }}
+                />
+              ) : null}
+            </>
           ) : null}
           <SidebarUtilityItem
             icon={<ChartNoAxesColumnIcon />}

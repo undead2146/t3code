@@ -636,9 +636,11 @@ export const reconcileProviderSessions = Effect.gen(function* () {
       thread.deletedAt === null
     ) {
       const prepared = yield* Effect.gen(function* () {
+        const resumedAt = DateTime.formatIso(yield* DateTime.now);
         yield* directory.upsert({
           ...binding.value,
           status: "starting",
+          lastSeenAt: resumedAt,
           runtimePayload: {
             ...readRuntimePayload(binding.value.runtimePayload),
             // Keep recovery durable if this process also exits before sending.
@@ -647,7 +649,6 @@ export const reconcileProviderSessions = Effect.gen(function* () {
             activeTurnId: null,
           },
         });
-        const resumedAt = DateTime.formatIso(yield* DateTime.now);
         yield* orchestrationEngine.dispatch({
           type: "thread.session.set",
           commandId: CommandId.make(yield* crypto.randomUUIDv4),

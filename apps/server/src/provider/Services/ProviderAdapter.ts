@@ -9,6 +9,7 @@
  */
 import type {
   ApprovalRequestId,
+  ProviderEphemeralQueryError,
   ProviderApprovalDecision,
   ProviderDriverKind,
   ProviderUserInputAnswers,
@@ -16,6 +17,8 @@ import type {
   ProviderSendTurnInput,
   ProviderSession,
   ProviderSessionStartInput,
+  ProviderEphemeralQueryInput,
+  ProviderEphemeralQueryResult,
   ProviderUploadFeedbackInput,
   ProviderUploadFeedbackResult,
   ThreadId,
@@ -129,6 +132,14 @@ export interface ProviderAdapterShape<TError> {
   /**
    * Upload a thread to the provider when the adapter supports feedback.
    */
+  /**
+   * Run an ephemeral side-query out-of-band without recording turns or interrupting the active session.
+   */
+  readonly queryEphemeral?: (
+    input: ProviderEphemeralQueryInput,
+    modelSelection?: ProviderSendTurnInput["modelSelection"],
+  ) => Effect.Effect<ProviderEphemeralQueryResult, TError | ProviderEphemeralQueryError>;
+
   readonly uploadFeedback?: (
     input: ProviderUploadFeedbackInput,
   ) => Effect.Effect<ProviderUploadFeedbackResult, TError>;

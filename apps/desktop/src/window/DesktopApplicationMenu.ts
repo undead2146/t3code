@@ -56,6 +56,17 @@ const zoomMainWindow = Effect.fn("desktop.menu.zoomMainWindow")(function* (
   yield* desktopWindow.zoomMain(direction);
 });
 
+const openPullRequestsWindow = Effect.fn("desktop.menu.openPullRequestsWindow")(
+  function* (): Effect.fn.Return<
+    void,
+    DesktopWindow.DesktopWindowError,
+    DesktopWindow.DesktopWindow
+  > {
+    const desktopWindow = yield* DesktopWindow.DesktopWindow;
+    yield* desktopWindow.openPullRequests;
+  },
+);
+
 const checkForUpdatesFromMenu = Effect.gen(function* () {
   const updates = yield* DesktopUpdates.DesktopUpdates;
   const electronDialog = yield* ElectronDialog.ElectronDialog;
@@ -134,6 +145,9 @@ export const make = Effect.gen(function* () {
     const settingsClick = () => {
       runMenuEffect("open-settings", dispatchMenuAction("open-settings"));
     };
+    const openPullRequestsClick = () => {
+      runMenuEffect("open-pull-requests", openPullRequestsWindow());
+    };
     const zoomClick = (direction: DesktopWindow.MainWindowZoomDirection) => () => {
       runMenuEffect(`zoom-${direction}`, zoomMainWindow(direction));
     };
@@ -170,6 +184,11 @@ export const make = Effect.gen(function* () {
       {
         label: "File",
         submenu: [
+          {
+            label: "Open Pull Requests in New Window",
+            click: openPullRequestsClick,
+          },
+          { type: "separator" as const },
           ...(environment.platform === "darwin"
             ? []
             : [

@@ -7,6 +7,9 @@ import {
   RuntimeTaskId,
   TurnId,
   ThreadTokenUsageSnapshot,
+  ProviderEphemeralQueryError,
+  type ProviderEphemeralQueryInput,
+  type ProviderEphemeralQueryResult,
   ThreadTokenUsageCategories,
   type AntigravitySettings,
   type ProviderApprovalDecision,
@@ -19,9 +22,11 @@ import {
   type TurnCompletedPayload,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -29,6 +34,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -39,6 +45,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 
 import { ServerConfig } from "../../config.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
+import { removeAntigravitySessionFiles } from "../acp/AntigravitySessionFiles.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import type { AntigravityAuth } from "../AntigravityAuth.ts";
 import {
@@ -50,6 +57,7 @@ import {
 } from "../Errors.ts";
 import {
   ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE,
+  getAntigravityGlobalSkillRoots,
   isAntigravitySignInRequiredError,
 } from "../antigravityAuthSupport.ts";
 import { mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
@@ -98,6 +106,7 @@ import {
   extractConversationIdsFromText,
   findTranscriptPath,
 } from "../../orchestration/subagentTranscriptQuery.ts";
+import { makeAntigravityUsageLimitsUpdate } from "./antigravityUsageLimits.ts";
 
 export const KILLED_SUBAGENT_IDS = new Set<string>();
 export const SUBAGENT_RUNNING_PIDS = new Map<string, Set<number>>();
@@ -564,8 +573,13 @@ function mapAntigravityError(threadId: ThreadId, method: string, cause: EffectAc
     : mapAcpToAdapterError(PROVIDER, threadId, method, cause);
 }
 
+export const DEFAULT_ANTIGRAVITY_TURN_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000;
+export const DEFAULT_ANTIGRAVITY_ACTIVE_TOOL_INACTIVITY_TIMEOUT_MS = 30 * 60 * 1_000;
+
 export interface AntigravityAdapterOptions {
   readonly instanceId: ProviderInstanceId;
+  readonly profileDirectory?: string;
+  readonly userHome?: string;
   readonly makeRuntime: (
     input: Omit<AntigravityAcpRuntimeInput, "spawn" | "childProcessSpawner" | "onAuthorizationUrl">,
   ) => Effect.Effect<Runtime, EffectAcpErrors.AcpError | ProviderSetupError, Scope.Scope>;
@@ -586,6 +600,9 @@ export interface AntigravityAdapterOptions {
   readonly defaultModel?: Effect.Effect<string | undefined>;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly prewarm?: boolean;
+  /** Override turn inactivity watchdog in focused tests. */
+  readonly turnInactivityTimeoutMs?: number;
+  readonly activeToolInactivityTimeoutMs?: number;
 }
 
 interface PendingApproval {
@@ -658,6 +675,8 @@ interface SessionContext {
   stopped: boolean;
   closed: boolean;
   disconnected: boolean;
+  lastActivityAtMillis: number;
+  activeToolCalls: Set<string>;
 }
 
 const CLIENT_FILE_MAX_BYTES = 8 * 1024 * 1024;
@@ -792,11 +811,13 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         .withProcess(
           stopOwned,
           Effect.gen(function* () {
+            const globalSkillRoots = getAntigravityGlobalSkillRoots(options.userHome);
+            const additionalDirectories = [serverConfig.attachmentsDir, ...globalSkillRoots];
             const runtime = yield* options.makeRuntime({
               cwd: targetCwd,
               clientInfo: { name: "t3-code", version: "0.0.0" },
               clientFileSystem: true,
-              additionalDirectories: [serverConfig.attachmentsDir],
+              additionalDirectories,
               mcpServers: [],
               ...makeNativeLoggers({
                 nativeEventLogger: options.nativeEventLogger,
@@ -804,7 +825,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                 threadId: "standby-warm" as ThreadId,
               }),
             });
-            const allowedRoots = [targetCwd, serverConfig.attachmentsDir];
+            const allowedRoots = [targetCwd, ...additionalDirectories];
             yield* runtime.handleReadTextFile((request) =>
               readClientTextFile({ fileSystem, path, allowedRoots, request }),
             );
@@ -929,6 +950,21 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           usage: snapshot,
         },
       });
+      if (options.instanceId) {
+        const limitsUpdate = makeAntigravityUsageLimitsUpdate({
+          sessionTokensUsed: snapshot.totalProcessedTokens ?? snapshot.usedTokens,
+        });
+        yield* emit({
+          type: "account.rate-limits.updated",
+          ...(yield* stamp),
+          provider: PROVIDER,
+          providerInstanceId: options.instanceId,
+          threadId: context.threadId,
+          payload: {
+            limits: limitsUpdate,
+          },
+        });
+      }
     });
 
   function writeSubagentTranscriptStep(subagentId: string, toolCall: AcpToolCallState): void {
@@ -1197,6 +1233,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       return;
     }
     if (context.stopped) return;
+    context.lastActivityAtMillis = yield* Clock.currentTimeMillis;
     switch (event._tag) {
       case "ModeChanged":
         return;
@@ -1242,6 +1279,15 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             rawPayload: sanitizeAntigravityToolPayload(event.rawPayload),
           }),
         );
+        if (event._tag === "ContentDelta" && event.text?.includes("Agent execution error:")) {
+          context.stopped = true;
+          context.disconnected = true;
+          if (context.promptFiber) {
+            yield* Fiber.interrupt(context.promptFiber);
+            context.promptFiber = undefined;
+          }
+          yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
+        }
         return;
       case "PlanUpdated":
         yield* emit(
@@ -1261,6 +1307,11 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         yield* context.commandLock.withPermit(
           Effect.gen(function* () {
             const toolCall = normalizeAntigravityToolCall(event.toolCall);
+            if (toolCall.status === "completed" || toolCall.status === "failed") {
+              context.activeToolCalls.delete(toolCall.toolCallId);
+            } else {
+              context.activeToolCalls.add(toolCall.toolCallId);
+            }
             const tracked = context.subagents.get(toolCall.toolCallId);
             if (tracked === "finished") return;
             const kind = classifyAntigravitySubagentToolCall(toolCall, event.rawPayload);
@@ -1892,7 +1943,6 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                 threadId: input.threadId,
               }),
             });
-            yield* prewarm(cwd).pipe(Effect.forkIn(ownerScope));
           }
 
           const allowedRoots = [cwd, serverConfig.attachmentsDir];
@@ -1920,10 +1970,11 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           if (!usedStandby) {
             started = yield* runtime.start();
           }
+          const defaultModel = options.defaultModel ? yield* options.defaultModel : undefined;
           const model = yield* applyAntigravityAcpModelSelection({
             runtime,
             model: input.modelSelection?.model,
-            defaultModel: yield* options.defaultModel ?? Effect.succeed(undefined),
+            defaultModel,
             mapError: (cause) => cause,
           });
           yield* runtime.setMode(antigravityPermissionMode(input.runtimeMode));
@@ -1976,6 +2027,8 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             stopped: false,
             closed: false,
             disconnected: false,
+            lastActivityAtMillis: yield* Clock.currentTimeMillis,
+            activeToolCalls: new Set(),
           };
           const running = context;
           sessions.set(input.threadId, running);
@@ -2104,6 +2157,24 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       );
       syncTokenTrackerFromDb(context);
       yield* emitTokenUsage(context, turn.turnId);
+      const isRateLimit = /429|resource_exhausted|quota_exceeded|quota/i.test(
+        payload.errorMessage ?? "",
+      );
+      if (isRateLimit && options.instanceId) {
+        const limitsUpdate = makeAntigravityUsageLimitsUpdate({
+          rateLimited: true,
+        });
+        yield* emit({
+          type: "account.rate-limits.updated",
+          ...(yield* stamp),
+          provider: PROVIDER,
+          providerInstanceId: options.instanceId,
+          threadId: context.threadId,
+          payload: {
+            limits: limitsUpdate,
+          },
+        });
+      }
       context.activeTurnId = undefined;
       context.promptFiber = undefined;
       context.session = {
@@ -2152,10 +2223,11 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           yield* requireSession(input.threadId);
           const requestedModel = input.modelSelection?.model ?? context.session.model;
           const configOptions = yield* context.runtime.getConfigOptions;
+          const defaultModel = options.defaultModel ? yield* options.defaultModel : undefined;
           const model = resolveAntigravityModel({
             configOptions,
             model: requestedModel,
-            defaultModel: yield* options.defaultModel ?? Effect.succeed(undefined),
+            defaultModel,
           });
           const availableModels = antigravityModelOptions(configOptions);
           if (model && !availableModels.some((option) => option.value === model)) {
@@ -2226,10 +2298,52 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               Effect.asVoid,
             ),
           );
+          context.lastActivityAtMillis = yield* Clock.currentTimeMillis;
+          context.activeToolCalls.clear();
           return { turn, fiber };
         }),
       );
-      const result = yield* Fiber.await(launch.fiber).pipe(Effect.flatMap((exit) => exit));
+      const turnTimeout =
+        options.turnInactivityTimeoutMs ?? DEFAULT_ANTIGRAVITY_TURN_INACTIVITY_TIMEOUT_MS;
+      const toolTimeout =
+        options.activeToolInactivityTimeoutMs ??
+        DEFAULT_ANTIGRAVITY_ACTIVE_TOOL_INACTIVITY_TIMEOUT_MS;
+
+      const watchdog = Effect.gen(function* () {
+        while (!intent?.settled && !context.stopped) {
+          if (context.approvals.size > 0 || context.questions.size > 0) {
+            context.lastActivityAtMillis = yield* Clock.currentTimeMillis;
+            yield* Effect.sleep("1 second");
+            continue;
+          }
+          const limit = context.activeToolCalls.size > 0 ? toolTimeout : turnTimeout;
+          const now = yield* Clock.currentTimeMillis;
+          const elapsed = now - context.lastActivityAtMillis;
+          const remaining = limit - elapsed;
+          if (remaining <= 0) {
+            const errorMessage = `Antigravity response timed out after ${Math.max(1, Math.round(limit / 60000))} minutes of inactivity. The connection to the model may have stalled.`;
+            yield* context.promptLock.withPermit(
+              finishTurn(launch.turn, {
+                state: "failed",
+                errorMessage,
+              }),
+            );
+            yield* Fiber.interrupt(launch.fiber).pipe(Effect.ignore);
+            yield* context.runtime.cancel.pipe(Effect.timeoutOption("3 seconds"), Effect.ignore);
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "session/prompt",
+              detail: errorMessage,
+            });
+          }
+          const sleepDuration = Math.max(10, Math.min(remaining, 3_000));
+          yield* Effect.sleep(Duration.millis(sleepDuration));
+        }
+        return yield* Effect.never;
+      });
+
+      const promptEffect = Fiber.await(launch.fiber).pipe(Effect.flatMap((exit) => exit));
+      const result = yield* Effect.raceFirst(promptEffect, watchdog);
       yield* context.runtime.drainEvents;
       if (context.stopped) {
         return yield* new ProviderAdapterSessionClosedError({
@@ -2490,6 +2604,165 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       yield* Deferred.succeed(pending.response, { answers, result });
     });
 
+  const queryEphemeral: Adapter["queryEphemeral"] = (input, modelSelection) =>
+    Effect.gen(function* () {
+      const context = yield* requireSession(input.threadId);
+      const targetModel = modelSelection?.model ?? context.session.model;
+      if (!targetModel) {
+        return yield* new ProviderEphemeralQueryError({
+          threadId: input.threadId,
+          detail: "No active model associated with this conversation.",
+        });
+      }
+
+      const tempCwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-btw-" });
+      let sessionId: string | undefined;
+
+      yield* Effect.addFinalizer(() =>
+        removeAntigravitySessionFiles({
+          profileDirectory: options.profileDirectory ?? serverConfig.stateDir,
+          sessionId,
+          cwd: tempCwd,
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        ),
+      );
+
+      const runtime = yield* options.makeRuntime({
+        cwd: tempCwd,
+        clientInfo: { name: "t3-code-btw", version: "0.0.0" },
+        mcpServers: [],
+      });
+
+      const outputRef = yield* Ref.make("");
+      const rejected = yield* Deferred.make<never, ProviderEphemeralQueryError>();
+      const reject = (detail: string) =>
+        Deferred.fail(
+          rejected,
+          new ProviderEphemeralQueryError({
+            threadId: input.threadId,
+            detail,
+          }),
+        ).pipe(Effect.asVoid);
+
+      const rejectTool = () =>
+        reject("Antigravity attempted to execute tools during ephemeral query.").pipe(
+          Effect.andThen(
+            Effect.fail(
+              new EffectAcpErrors.AcpRequestError({
+                code: -32601,
+                errorMessage: "Tools are disabled for ephemeral queries.",
+              }),
+            ),
+          ),
+        );
+
+      yield* runtime.handleRequestPermission(() =>
+        reject("Antigravity requested tool permission during ephemeral query.").pipe(
+          Effect.as({ outcome: { outcome: "cancelled" as const } }),
+        ),
+      );
+      yield* runtime.handleReadTextFile(rejectTool);
+      yield* runtime.handleWriteTextFile(rejectTool);
+
+      yield* runtime.getEvents().pipe(
+        Stream.runForEach((event) =>
+          Effect.gen(function* () {
+            if (event._tag === "EventStreamBarrier") {
+              return yield* Deferred.succeed(event.acknowledge, undefined).pipe(Effect.asVoid);
+            }
+            if (event._tag === "ToolCallUpdated") {
+              return yield* reject("Antigravity attempted tool execution during ephemeral query.");
+            }
+            if (event._tag === "ContentDelta" && event.text) {
+              yield* Ref.update(outputRef, (current) => current + event.text);
+            }
+          }),
+        ),
+        Effect.forkScoped({ startImmediately: true }),
+      );
+
+      const runGen = Effect.gen(function* () {
+        const started = yield* runtime.start();
+        sessionId = started.sessionId;
+        yield* runtime.setMode("default");
+
+        const configOptions = yield* runtime.getConfigOptions;
+        const defaultModel = options.defaultModel ? yield* options.defaultModel : undefined;
+        const resolvedModel = resolveAntigravityModel({
+          configOptions,
+          model: targetModel,
+          defaultModel,
+        });
+
+        if (!resolvedModel) {
+          return yield* new ProviderEphemeralQueryError({
+            threadId: input.threadId,
+            detail: `Conversation model '${targetModel}' could not be resolved.`,
+          });
+        }
+
+        yield* applyAntigravityAcpModelSelection({
+          runtime,
+          model: resolvedModel,
+          mapError: (cause) =>
+            new ProviderEphemeralQueryError({
+              threadId: input.threadId,
+              detail: "Could not apply model to ephemeral runtime.",
+              cause,
+            }),
+        });
+
+        const result = yield* runtime.prompt({
+          prompt: [
+            {
+              type: "text",
+              text: [
+                "You are answering a quick side-question (/btw) from the user.",
+                "Answer concisely and directly. Do not attempt to use tools, write files, run commands, or ask for confirmation.",
+                "",
+                input.query,
+              ].join("\n"),
+            },
+          ],
+        });
+
+        if (yield* Deferred.isDone(rejected)) {
+          return yield* Deferred.await(rejected);
+        }
+
+        if (result.stopReason === "cancelled") {
+          return yield* new ProviderEphemeralQueryError({
+            threadId: input.threadId,
+            detail: "Ephemeral query was cancelled.",
+          });
+        }
+
+        yield* runtime.drainEvents;
+        const finalOutput = (yield* Ref.get(outputRef)).trim();
+        return { text: finalOutput };
+      }).pipe(
+        Effect.onInterrupt(() => runtime.cancel.pipe(Effect.timeoutOption(2_000), Effect.ignore)),
+        Effect.raceFirst(Deferred.await(rejected)),
+      );
+
+      return yield* runGen;
+    }).pipe(
+      Effect.scoped,
+      Effect.mapError((cause) => {
+        if (Schema.is(ProviderEphemeralQueryError)(cause)) return cause;
+        return new ProviderEphemeralQueryError({
+          threadId: input.threadId,
+          detail:
+            typeof cause === "object" && cause !== null && "message" in cause
+              ? String(cause.message)
+              : "Ephemeral query failed",
+          cause,
+        });
+      }),
+    );
+
   const stopSession: Adapter["stopSession"] = (threadId) =>
     Effect.gen(function* () {
       const starting = startingSessions.get(threadId);
@@ -2537,6 +2810,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
     interruptTurn,
     respondToRequest,
     respondToUserInput,
+    queryEphemeral,
     stopSession,
     stopAll,
     listSessions: () =>
@@ -2546,7 +2820,13 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           .map((context) => ({ ...context.session })),
       ),
     hasSession: (threadId) =>
-      Effect.sync(() => sessions.has(threadId) && !sessions.get(threadId)?.stopped),
+      Effect.sync(() => {
+        const session = sessions.get(threadId);
+        if (session && !session.stopped && session.session.status !== "error") {
+          return true;
+        }
+        return startingSessions.has(threadId);
+      }),
     readThread: (threadId) =>
       Effect.map(requireSession(threadId), (context) => ({ threadId, turns: context.turns })),
     rollbackThread: (_threadId: ThreadId, _numTurns: number) =>

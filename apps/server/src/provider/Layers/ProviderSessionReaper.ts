@@ -62,10 +62,17 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
         const thread = yield* projectionSnapshotQuery
           .getThreadShellById(binding.threadId)
           .pipe(Effect.map(Option.getOrUndefined));
-        if (thread?.session?.activeTurnId != null) {
+        if (
+          thread?.session?.activeTurnId != null ||
+          thread?.session?.status === "starting" ||
+          (thread?.session?.status as string) === "connecting" ||
+          binding.status === "starting"
+        ) {
           yield* Effect.logDebug("provider.session.reaper.skipped-active-turn", {
             threadId: binding.threadId,
-            activeTurnId: thread.session.activeTurnId,
+            activeTurnId: thread?.session?.activeTurnId,
+            sessionStatus: thread?.session?.status,
+            bindingStatus: binding.status,
             idleDurationMs,
           });
           continue;

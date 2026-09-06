@@ -96,6 +96,9 @@ import {
   OrchestrationKillSubagentError,
 } from "./orchestration.ts";
 import {
+  ProviderEphemeralQueryError,
+  ProviderEphemeralQueryInput,
+  ProviderEphemeralQueryResult,
   ProviderUploadFeedbackError,
   ProviderUploadFeedbackInput,
   ProviderUploadFeedbackResult,
@@ -258,6 +261,7 @@ export const WS_METHODS = {
   attachmentsDelete: "attachments.delete",
 
   // Provider methods
+  providerEphemeralQuery: "provider.ephemeralQuery",
   providerUploadFeedback: "provider.uploadFeedback",
   providerAuthStart: "provider.auth.start",
   providerConsumeResetCredit: "provider.consumeResetCredit",
@@ -870,6 +874,12 @@ export const WsAttachmentsDeleteRpc = Rpc.make(WS_METHODS.attachmentsDelete, {
   error: EnvironmentAuthorizationError,
 });
 
+export const WsProviderEphemeralQueryRpc = Rpc.make(WS_METHODS.providerEphemeralQuery, {
+  payload: ProviderEphemeralQueryInput,
+  success: ProviderEphemeralQueryResult,
+  error: Schema.Union([ProviderEphemeralQueryError, EnvironmentAuthorizationError]),
+});
+
 export const WsProviderUploadFeedbackRpc = Rpc.make(WS_METHODS.providerUploadFeedback, {
   payload: ProviderUploadFeedbackInput,
   success: ProviderUploadFeedbackResult,
@@ -1291,6 +1301,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsAssetsCreateUrlRpc,
   WsAttachmentsCreateUploadUrlRpc,
   WsAttachmentsDeleteRpc,
+  WsProviderEphemeralQueryRpc,
   WsProviderUploadFeedbackRpc,
   WsSubscribeVcsStatusRpc,
   WsVcsPullRpc,

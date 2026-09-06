@@ -31,7 +31,11 @@ import { SettingsSection } from "../settings/components/SettingsSection";
 import { useProviderColors } from "./usageProviders";
 
 const PACE_LABEL = { ahead: "ahead of pace", on: "on pace", under: "under pace" } as const;
-const DRIVER_LABEL: Partial<Record<string, string>> = { codex: "Codex", claudeAgent: "Claude" };
+const DRIVER_LABEL: Partial<Record<string, string>> = {
+  codex: "Codex",
+  claudeAgent: "Claude",
+  antigravity: "Antigravity",
+};
 
 type Driver = ServerProvider["driver"];
 
@@ -39,7 +43,13 @@ type Driver = ServerProvider["driver"];
 function useBarColor(driver: Driver): string | null {
   const colors = useProviderColors();
   const kind: UsageProviderKind | null =
-    driver === "codex" ? "codex" : driver === "claudeAgent" ? "claude" : null;
+    driver === "codex"
+      ? "codex"
+      : driver === "claudeAgent"
+        ? "claude"
+        : driver === "antigravity"
+          ? "antigravity"
+          : null;
   return kind ? colors[kind] : null;
 }
 

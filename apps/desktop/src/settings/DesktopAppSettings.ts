@@ -28,6 +28,8 @@ export interface DesktopSettings {
   readonly linuxPasswordStore: LinuxPasswordStorePreference;
   readonly mainWindowBounds: DesktopWindowBounds | null;
   readonly mainWindowMaximized: boolean;
+  readonly pullRequestsWindowBounds: DesktopWindowBounds | null;
+  readonly pullRequestsWindowMaximized: boolean;
   readonly serverExposureMode: DesktopServerExposureMode;
   readonly tailscaleServeEnabled: boolean;
   readonly tailscaleServePort: number;
@@ -76,6 +78,8 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   linuxPasswordStore: DEFAULT_LINUX_PASSWORD_STORE,
   mainWindowBounds: null,
   mainWindowMaximized: false,
+  pullRequestsWindowBounds: null,
+  pullRequestsWindowMaximized: false,
   serverExposureMode: "local-only",
   tailscaleServeEnabled: false,
   tailscaleServePort: DEFAULT_TAILSCALE_SERVE_PORT,
@@ -97,6 +101,8 @@ const DesktopSettingsDocument = Schema.Struct({
   linuxPasswordStore: Schema.optionalKey(Schema.Unknown),
   mainWindowBounds: Schema.optionalKey(Schema.NullOr(DesktopWindowBoundsDocument)),
   mainWindowMaximized: Schema.optionalKey(Schema.Boolean),
+  pullRequestsWindowBounds: Schema.optionalKey(Schema.NullOr(DesktopWindowBoundsDocument)),
+  pullRequestsWindowMaximized: Schema.optionalKey(Schema.Boolean),
   serverExposureMode: Schema.optionalKey(DesktopServerExposureModeSchema),
   tailscaleServeEnabled: Schema.optionalKey(Schema.Boolean),
   tailscaleServePort: Schema.optionalKey(Schema.Number),
@@ -156,6 +162,10 @@ export class DesktopAppSettings extends Context.Service<
       bounds: DesktopWindowBounds,
       isMaximized: boolean,
     ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
+    readonly setPullRequestsWindowBounds: (
+      bounds: DesktopWindowBounds,
+      isMaximized: boolean,
+    ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
     readonly setServerExposureMode: (
       mode: DesktopServerExposureMode,
     ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
@@ -210,6 +220,7 @@ function normalizeDesktopSettingsDocument(
 ): DesktopSettings {
   const defaultSettings = resolveDefaultDesktopSettings(appVersion);
   const mainWindowBounds = normalizeMainWindowBounds(parsed.mainWindowBounds);
+  const pullRequestsWindowBounds = normalizeMainWindowBounds(parsed.pullRequestsWindowBounds);
   const parsedUpdateChannel = Option.fromNullishOr(parsed.updateChannel);
   const isLegacySettings = parsed.updateChannelConfiguredByUser === undefined;
   const updateChannelConfiguredByUser =
@@ -227,6 +238,9 @@ function normalizeDesktopSettingsDocument(
     linuxPasswordStore: normalizeLinuxPasswordStorePreference(parsed.linuxPasswordStore),
     mainWindowBounds,
     mainWindowMaximized: mainWindowBounds !== null && parsed.mainWindowMaximized === true,
+    pullRequestsWindowBounds,
+    pullRequestsWindowMaximized:
+      pullRequestsWindowBounds !== null && parsed.pullRequestsWindowMaximized === true,
     serverExposureMode:
       parsed.serverExposureMode === "network-accessible" ? "network-accessible" : "local-only",
     tailscaleServeEnabled: parsed.tailscaleServeEnabled === true,
@@ -255,6 +269,12 @@ function toDesktopSettingsDocument(
   }
   if (settings.mainWindowMaximized) {
     document.mainWindowMaximized = true;
+  }
+  if (settings.pullRequestsWindowBounds !== null) {
+    document.pullRequestsWindowBounds = settings.pullRequestsWindowBounds;
+  }
+  if (settings.pullRequestsWindowMaximized) {
+    document.pullRequestsWindowMaximized = true;
   }
   if (settings.serverExposureMode !== defaults.serverExposureMode) {
     document.serverExposureMode = settings.serverExposureMode;
@@ -309,6 +329,22 @@ function setMainWindowBounds(
         ...settings,
         mainWindowBounds: bounds,
         mainWindowMaximized: isMaximized,
+      };
+}
+
+function setPullRequestsWindowBounds(
+  settings: DesktopSettings,
+  bounds: DesktopWindowBounds,
+  isMaximized: boolean,
+): DesktopSettings {
+  return settings.pullRequestsWindowBounds !== null &&
+    desktopWindowBoundsEquivalence(settings.pullRequestsWindowBounds, bounds) &&
+    settings.pullRequestsWindowMaximized === isMaximized
+    ? settings
+    : {
+        ...settings,
+        pullRequestsWindowBounds: bounds,
+        pullRequestsWindowMaximized: isMaximized,
       };
 }
 
@@ -518,6 +554,18 @@ export const make = Effect.gen(function* () {
           },
         }),
       ),
+    setPullRequestsWindowBounds: (bounds, isMaximized) =>
+      persist((settings) => setPullRequestsWindowBounds(settings, bounds, isMaximized)).pipe(
+        Effect.withSpan("desktop.settings.setPullRequestsWindowBounds", {
+          attributes: {
+            x: bounds.x,
+            y: bounds.y,
+            width: bounds.width,
+            height: bounds.height,
+            isMaximized,
+          },
+        }),
+      ),
     setServerExposureMode: (mode) =>
       persist((settings) => setServerExposureMode(settings, mode)).pipe(
         Effect.withSpan("desktop.settings.setServerExposureMode", { attributes: { mode } }),
@@ -577,6 +625,8 @@ export const layerTest = (initialSettings: DesktopSettings = DEFAULT_DESKTOP_SET
         load: SynchronizedRef.get(settingsRef),
         setMainWindowBounds: (bounds, isMaximized) =>
           update((settings) => setMainWindowBounds(settings, bounds, isMaximized)),
+        setPullRequestsWindowBounds: (bounds, isMaximized) =>
+          update((settings) => setPullRequestsWindowBounds(settings, bounds, isMaximized)),
         setServerExposureMode: (mode) =>
           update((settings) => setServerExposureMode(settings, mode)),
         setTailscaleServe: (input) => update((settings) => setTailscaleServe(settings, input)),

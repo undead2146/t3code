@@ -128,6 +128,16 @@ export const make = Effect.gen(function* () {
 
     if (environment.platform === "win32") {
       yield* electronApp.setAppUserModelId(environment.appUserModelId);
+      yield* electronApp.setUserTasks([
+        {
+          program: process.execPath,
+          arguments: "--pull-requests",
+          title: "Pull Requests",
+          description: "Open Pull Requests in a new window",
+          iconPath: process.execPath,
+          iconIndex: 0,
+        },
+      ]);
     }
 
     if (environment.platform === "linux") {

@@ -76,7 +76,10 @@ export const makeProviderAuthService = Effect.gen(function* () {
   return ProviderAuthService.of({
     start: Effect.fn("ProviderAuthService.start")(function* (input, ownerSessionId) {
       const auth = yield* getController(input.instanceId, "start");
-      return yield* auth.start(ownerSessionId, stopSessions(input.instanceId));
+      return yield* auth.start(
+        ownerSessionId,
+        stopSessions(input.instanceId) as Effect.Effect<void, ProviderSetupError>,
+      );
     }),
     complete: Effect.fn("ProviderAuthService.complete")(function* (input, ownerSessionId) {
       const auth = yield* getController(input.instanceId, "complete");
@@ -88,7 +91,9 @@ export const makeProviderAuthService = Effect.gen(function* () {
     }),
     logout: Effect.fn("ProviderAuthService.logout")(function* (input) {
       const auth = yield* getController(input.instanceId, "logout");
-      return yield* auth.logout(stopSessions(input.instanceId));
+      return yield* auth.logout(
+        stopSessions(input.instanceId) as Effect.Effect<void, ProviderSetupError>,
+      );
     }),
     subscribe: (input, ownerSessionId) =>
       Effect.gen(function* () {

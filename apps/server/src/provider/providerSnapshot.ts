@@ -24,6 +24,12 @@ export const DEFAULT_TIMEOUT_MS = 4_000;
 // Auth status checks involve disk/network lookups and can be slow on first run (especially Windows)
 export const AUTH_PROBE_TIMEOUT_MS = 10_000;
 
+export const BTW_SLASH_COMMAND = {
+  name: "btw",
+  description: "Ask a quick side question without adding to conversation history",
+  input: { hint: "question" },
+} satisfies ServerProviderSlashCommand;
+
 export const COMPACT_SLASH_COMMAND = {
   name: "compact",
   description: "Summarize the conversation and reduce context usage",
