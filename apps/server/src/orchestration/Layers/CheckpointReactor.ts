@@ -255,10 +255,6 @@ const make = Effect.gen(function* () {
       checkpointRef: targetCheckpointRef,
     });
 
-    // Refresh the workspace entry index so the @-mention file picker
-    // reflects files created or deleted during this turn.
-    yield* workspaceEntries.refresh(input.cwd);
-
     // Git may have been initialized during this turn, leaving no pre-turn
     // snapshot. Keep the completion checkpoint for future turns, but do not
     // invent a baseline or attempt a diff against a ref that does not exist.
@@ -355,6 +351,10 @@ const make = Effect.gen(function* () {
       },
       createdAt: input.createdAt,
     });
+
+    // Refresh the workspace entry index so the @-mention file picker
+    // reflects files created or deleted during this turn.
+    yield* workspaceEntries.refresh(input.cwd).pipe(Effect.catch(() => Effect.void));
   });
 
   // Capture the files left by a completed or interrupted turn.
@@ -853,19 +853,6 @@ const make = Effect.gen(function* () {
       const startedTurnId = startedTurns.get(event.threadId);
       const isTrackedTurn = sameId(startedTurnId, turnId);
       if (isTrackedTurn) startedTurns.delete(event.threadId);
-      if (event.type === "turn.completed") {
-        yield* refreshLocalGitStatusFromTurnCompletion(event);
-      }
-      if (
-        turnId !== null &&
-        thread !== undefined &&
-        (isTrackedTurn ||
-          sameId(thread.session?.activeTurnId, turnId) ||
-          (startedTurnId === undefined && !thread.session?.activeTurnId))
-      ) {
-        pending.delete(event.threadId);
-        yield* pullRequests.refreshAfterTurn;
-      }
       if (
         event.type === "turn.aborted" &&
         !isTrackedTurn &&
@@ -889,6 +876,19 @@ const make = Effect.gen(function* () {
           ),
         ),
       );
+      if (event.type === "turn.completed") {
+        yield* refreshLocalGitStatusFromTurnCompletion(event);
+      }
+      if (
+        turnId !== null &&
+        thread !== undefined &&
+        (isTrackedTurn ||
+          sameId(thread.session?.activeTurnId, turnId) ||
+          (startedTurnId === undefined && !thread.session?.activeTurnId))
+      ) {
+        pending.delete(event.threadId);
+        yield* pullRequests.refreshAfterTurn;
+      }
       return;
     }
   });

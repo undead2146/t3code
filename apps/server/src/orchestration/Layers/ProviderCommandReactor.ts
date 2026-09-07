@@ -598,7 +598,11 @@ const make = Effect.gen(function* () {
 
     const activeSession = yield* resolveActiveSession(threadId);
     const activeThreadSession =
-      thread.session !== null && thread.session.status !== "stopped" && activeSession
+      thread.session !== null &&
+      thread.session.status !== "stopped" &&
+      thread.session.status !== "error" &&
+      activeSession &&
+      activeSession.status !== "error"
         ? thread.session
         : null;
     if (
@@ -767,7 +771,13 @@ const make = Effect.gen(function* () {
       });
 
     const existingSessionThreadId =
-      thread.session && thread.session.status !== "stopped" && activeSession ? thread.id : null;
+      thread.session &&
+      thread.session.status !== "stopped" &&
+      thread.session.status !== "error" &&
+      activeSession &&
+      activeSession.status !== "error"
+        ? thread.id
+        : null;
     if (existingSessionThreadId) {
       const runtimeModeChanged = thread.runtimeMode !== thread.session?.runtimeMode;
       const cwdChanged = effectiveCwd !== activeSession?.cwd;
@@ -834,7 +844,11 @@ const make = Effect.gen(function* () {
       return restartedSession.threadId;
     }
 
-    const startedSession = yield* startProviderSession(undefined);
+    const startedSession = yield* startProviderSession(
+      activeSession?.resumeCursor !== undefined
+        ? { resumeCursor: activeSession.resumeCursor }
+        : undefined,
+    );
     yield* bindSessionToThread(startedSession);
     return startedSession.threadId;
   });

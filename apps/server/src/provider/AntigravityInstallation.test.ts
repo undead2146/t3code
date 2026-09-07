@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off globalDateInEffect:off
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import {
@@ -22,7 +23,10 @@ import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as NodeCrypto from "node:crypto";
 
+import * as NodeFS from "node:fs";
+
 import {
+  cleanOrphanedAntigravityTempDirectories,
   makeAntigravityInstallation,
   type AntigravityExecutable,
   type AntigravityInstallation,
@@ -915,6 +919,39 @@ it.layer(NodeServices.layer)("Antigravity installation", (it) => {
       });
       expect(yield* installation.state).toMatchObject({ phase: "idle", operationId: null });
       expect(requests).toEqual([]);
+    }),
+  );
+
+  it.effect("cleans orphaned _MEI directories older than minAgeMs", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "test-temp-mei-" });
+
+      const oldMeiDir = path.join(tempDir, "_MEI12345");
+      const freshMeiDir = path.join(tempDir, "_MEI67890");
+      const otherDir = path.join(tempDir, "other_folder");
+
+      yield* fs.makeDirectory(oldMeiDir);
+      yield* fs.writeFileString(path.join(oldMeiDir, "file.txt"), "data");
+      yield* fs.makeDirectory(freshMeiDir);
+      yield* fs.writeFileString(path.join(freshMeiDir, "file.txt"), "data");
+      yield* fs.makeDirectory(otherDir);
+      yield* fs.writeFileString(path.join(otherDir, "file.txt"), "data");
+
+      // Set oldMeiDir mtime to 1 hour ago
+      const oneHourAgo = new Date(Date.now() - 3600 * 1000);
+      yield* Effect.sync(() => {
+        NodeFS.utimesSync(oldMeiDir, oneHourAgo, oneHourAgo);
+      });
+
+      const result = cleanOrphanedAntigravityTempDirectories(tempDir, 10 * 60 * 1000);
+      expect(result.cleaned).toBe(1);
+      expect(result.skipped).toBe(1); // freshMeiDir was skipped because it's too new
+
+      expect(yield* fs.exists(oldMeiDir)).toBe(false);
+      expect(yield* fs.exists(freshMeiDir)).toBe(true);
+      expect(yield* fs.exists(otherDir)).toBe(true);
     }),
   );
 });

@@ -3,6 +3,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  TurnId,
   type OrchestrationShellSnapshot,
   type OrchestrationThread,
 } from "@t3tools/contracts";
@@ -230,6 +231,70 @@ describe("environment entity projections", () => {
       worktreePath: "/repo/current-worktree",
     });
     expect(merged?.messages).toBe(messages);
+  });
+
+  it("preserves settled session and latestTurn when shell is still lagging in running state", () => {
+    const detail = {
+      ...THREAD_SHELL,
+      environmentId: ENVIRONMENT_ID,
+      title: "Thread 1",
+      branch: "branch-1",
+      worktreePath: "/repo/worktree-1",
+      deletedAt: null,
+      messages: [],
+      proposedPlans: [],
+      activities: [],
+      checkpoints: [],
+      session: {
+        threadId: THREAD_ID,
+        status: "ready",
+        providerName: "codex",
+        runtimeMode: "full-access",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: "2026-09-07T14:20:35.417Z",
+      },
+      latestTurn: {
+        turnId: TurnId.make("turn-1"),
+        state: "completed",
+        startedAt: "2026-09-07T14:18:35.012Z",
+        completedAt: "2026-09-07T14:20:35.417Z",
+        requestedAt: "2026-09-07T14:18:35.012Z",
+        assistantMessageId: null,
+      },
+    } satisfies OrchestrationThread & { readonly environmentId: EnvironmentId };
+
+    const laggingShell = {
+      ...THREAD_SHELL,
+      environmentId: ENVIRONMENT_ID,
+      title: "Thread 1",
+      branch: "branch-1",
+      worktreePath: "/repo/worktree-1",
+      session: {
+        threadId: THREAD_ID,
+        status: "running" as const,
+        providerName: "codex",
+        runtimeMode: "full-access" as const,
+        activeTurnId: TurnId.make("turn-1"),
+        lastError: null,
+        updatedAt: "2026-09-07T14:18:35.012Z",
+      },
+      latestTurn: {
+        turnId: TurnId.make("turn-1"),
+        state: "running" as const,
+        startedAt: "2026-09-07T14:18:35.012Z",
+        completedAt: null,
+        requestedAt: "2026-09-07T14:18:35.012Z",
+        assistantMessageId: null,
+      },
+    };
+
+    const merged = mergeEnvironmentThread(detail, laggingShell);
+
+    expect(merged?.session?.status).toBe("ready");
+    expect(merged?.session?.activeTurnId).toBeNull();
+    expect(merged?.latestTurn?.state).toBe("completed");
+    expect(merged?.latestTurn?.completedAt).toBe("2026-09-07T14:20:35.417Z");
   });
 
   it("preserves untouched project and thread identities across unrelated shell updates", () => {

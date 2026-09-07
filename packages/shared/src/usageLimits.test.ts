@@ -144,6 +144,43 @@ describe("collectLimitsGroups", () => {
       "Desktop",
     ]);
   });
+
+  it("deduplicates providers sharing the same account across environments, preferring primary", () => {
+    const limits = { checkedAt: "2026-09-03T11:00:00.000Z", windows: [window] };
+    const antigravityRemote = provider({
+      instanceId: ProviderInstanceId.make("antigravity"),
+      driver: ProviderDriverKind.make("antigravity"),
+      usageLimits: limits,
+    });
+    const antigravityPrimary = provider({
+      instanceId: ProviderInstanceId.make("antigravity"),
+      driver: ProviderDriverKind.make("antigravity"),
+      auth: { status: "authenticated", email: "user@example.com" },
+      usageLimits: limits,
+    });
+    const fleet = new Map([
+      [
+        "cc-1",
+        { entry: { target: { label: "CC-1" } }, serverConfig: { providers: [antigravityRemote] } },
+      ],
+      [
+        "cc-2",
+        { entry: { target: { label: "CC-2" } }, serverConfig: { providers: [antigravityRemote] } },
+      ],
+      [
+        "primary",
+        {
+          entry: { target: { label: "BRAVO" } },
+          serverConfig: { providers: [antigravityPrimary] },
+        },
+      ],
+    ] as const);
+
+    const groups = collectLimitsGroups(fleet as never);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.environmentId).toBe("primary");
+    expect(groups[0]?.providers[0]?.auth.email).toBe("user@example.com");
+  });
 });
 
 describe("collectLimitSources", () => {

@@ -1738,6 +1738,35 @@ describe("hasServerAcknowledgedLocalDispatch", () => {
       }),
     ).toBe(true);
   });
+
+  it("acknowledges only a new thread error", () => {
+    const localDispatch = {
+      ...createLocalDispatchSnapshot(makeThread()),
+      threadError: "old error",
+    };
+    const common = {
+      localDispatch,
+      phase: "ready" as const,
+      latestTurn: null,
+      latestUserMessageId: localDispatch.latestUserMessageId,
+      session: null,
+      hasPendingApproval: false,
+      hasPendingUserInput: false,
+    };
+
+    expect(
+      hasServerAcknowledgedLocalDispatch({
+        ...common,
+        threadError: "old error",
+      }),
+    ).toBe(false);
+    expect(
+      hasServerAcknowledgedLocalDispatch({
+        ...common,
+        threadError: "new error",
+      }),
+    ).toBe(true);
+  });
 });
 
 describe("deriveStalledActivityAdvisory", () => {

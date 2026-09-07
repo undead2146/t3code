@@ -1,3 +1,4 @@
+import * as Clock from "effect/Clock";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
@@ -1875,7 +1876,85 @@ const makeWsRpcLayer = (
         [WS_METHODS.providerEphemeralQuery]: (input) =>
           observeRpcEffect(
             WS_METHODS.providerEphemeralQuery,
-            providerService.queryEphemeral(input).pipe(
+            Effect.gen(function* () {
+              let enrichedInput = input;
+              if (!input.conversationHistory?.trim()) {
+                const threadOption = yield* projectionSnapshotQuery
+                  .getThreadDetailById(input.threadId)
+                  .pipe(Effect.orElseSucceed(() => Option.none()));
+                if (Option.isSome(threadOption)) {
+                  const thread = threadOption.value;
+                  const parts: string[] = [];
+                  if (thread.title) {
+                    parts.push(`Thread Title: ${thread.title}`);
+                  }
+                  const isRunning =
+                    thread.session?.status === "running" || thread.latestTurn?.state === "running";
+                  const startedAt = thread.latestTurn?.startedAt ?? thread.latestTurn?.requestedAt;
+                  let durationText: string | null = null;
+                  if (isRunning && startedAt) {
+                    const now = yield* Clock.currentTimeMillis;
+                    const startedMs = DateTime.toEpochMillis(DateTime.makeUnsafe(startedAt));
+                    const elapsedSec = Math.max(0, Math.floor((now - startedMs) / 1000));
+                    const mins = Math.floor(elapsedSec / 60);
+                    const secs = elapsedSec % 60;
+                    durationText = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+                  }
+                  parts.push(
+                    isRunning
+                      ? `Current Turn Status: Running${durationText ? ` (working for ${durationText})` : ""}`
+                      : `Current Turn Status: ${thread.session?.status ?? "idle"}`,
+                  );
+                  const latestUser = thread.messages.findLast((m) => m.role === "user");
+                  if (latestUser?.text) {
+                    parts.push(
+                      `Active User Request under execution:\n${latestUser.text.length > 1000 ? `${latestUser.text.slice(0, 1000)}\n...[truncated]` : latestUser.text}`,
+                    );
+                  }
+                  if (thread.activities.length > 0) {
+                    const recentActivities = thread.activities
+                      .slice(-15)
+                      .map((a, idx) => `${idx + 1}. [${a.kind}] ${a.summary}`)
+                      .join("\n");
+                    parts.push(`Recent Actions in Current Session:\n${recentActivities}`);
+                  }
+                  const latestPlan = thread.proposedPlans.at(-1);
+                  if (latestPlan?.planMarkdown?.trim()) {
+                    const planText =
+                      latestPlan.planMarkdown.length > 3000
+                        ? `${latestPlan.planMarkdown.slice(0, 3000)}\n...[truncated]`
+                        : latestPlan.planMarkdown;
+                    parts.push(`Latest Plan:\n${planText}`);
+                  }
+                  const recentMessages = thread.messages.slice(-30);
+                  if (recentMessages.length > 0) {
+                    const formatted = recentMessages
+                      .map((msg) => {
+                        const role =
+                          msg.role === "user"
+                            ? "User"
+                            : msg.role === "assistant"
+                              ? "Assistant"
+                              : "System";
+                        const text =
+                          msg.text.length > 4000
+                            ? `${msg.text.slice(0, 4000)}\n...[truncated]`
+                            : msg.text;
+                        return `[${role}]:\n${text}`;
+                      })
+                      .join("\n\n");
+                    parts.push(`Recent Conversation Messages:\n${formatted}`);
+                  }
+                  if (parts.length > 0) {
+                    enrichedInput = {
+                      ...input,
+                      conversationHistory: parts.join("\n\n"),
+                    };
+                  }
+                }
+              }
+              return yield* providerService.queryEphemeral(enrichedInput);
+            }).pipe(
               Effect.mapError((cause) =>
                 Schema.is(ProviderEphemeralQueryError)(cause)
                   ? cause

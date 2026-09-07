@@ -357,4 +357,24 @@ describe("normalizeDispatchCommand attachments", () => {
       expect(mismatchedType.message).toContain("attachment type");
     }).pipe(Effect.provide(testLayer)),
   );
+
+  it.effect("accepts attachments that are already owned by the thread on retry", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const ownedId = `thread-1-${attachmentUuid}`;
+      const ownedPath = NodePath.join(config.attachmentsDir, `${ownedId}.png`);
+      NodeFS.writeFileSync(ownedPath, Buffer.from("pixels"));
+
+      const command = turnStartCommand({
+        attachments: [{ id: ownedId, sizeBytes: 6 }],
+      });
+      const normalized = yield* normalizeDispatchCommand(command);
+      if (normalized.type !== "thread.turn.start") {
+        throw new Error("Expected a thread.turn.start command.");
+      }
+
+      expect(normalized.message.attachments).toHaveLength(1);
+      expect(normalized.message.attachments[0]?.id).toBe(ownedId);
+    }).pipe(Effect.provide(testLayer)),
+  );
 });

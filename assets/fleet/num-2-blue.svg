@@ -1,0 +1,6 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="128" height="128" rx="26" fill="#0C1013"/>
+  <rect x="1.5" y="1.5" width="125" height="125" rx="24.5" stroke="#3B82F6" stroke-opacity="0.35" stroke-width="3"/>
+  <!-- Bold 2 Numeral -->
+  <path d="M43 49.5C43 39 51 32 64.5 32C78 32 86 39 86 49.5C86 58 79.5 65.5 69.5 75L57 87H88V99H40V86.5L60.5 67C66.5 61 69.5 56 69.5 49.5C69.5 44 66 41 61.5 41C56 41 52.8 44.5 52 49.5L43 49.5Z" fill="#3B82F6"/>
+</svg>

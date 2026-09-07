@@ -127,6 +127,7 @@ export type ProviderUploadFeedbackResult = typeof ProviderUploadFeedbackResult.T
 export const ProviderEphemeralQueryInput = Schema.Struct({
   threadId: ThreadId,
   query: TrimmedNonEmptyString,
+  conversationHistory: Schema.optional(Schema.String),
 });
 export type ProviderEphemeralQueryInput = typeof ProviderEphemeralQueryInput.Type;
 

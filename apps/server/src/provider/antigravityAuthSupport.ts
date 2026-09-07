@@ -8,6 +8,7 @@ import type { AntigravityAuthMethod, ProviderInstanceId } from "@t3tools/contrac
 import { HostProcessExecutablePath, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
@@ -263,6 +264,7 @@ export function syncAntigravityGlobalSkills(
   }
 
   const candidateRoots = getAntigravityGlobalSkillRoots(userHome);
+  const seenSkills = new Set<string>();
 
   for (const root of candidateRoots) {
     let entries: NodeFS.Dirent[] = [];
@@ -275,6 +277,8 @@ export function syncAntigravityGlobalSkills(
     for (const entry of entries) {
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
       const skillName = entry.name;
+      if (seenSkills.has(skillName)) continue;
+
       const sourcePath = NodePath.join(root, skillName);
       const destPath = NodePath.join(configSkillsDirectory, skillName);
 
@@ -285,29 +289,33 @@ export function syncAntigravityGlobalSkills(
         continue;
       }
 
+      seenSkills.add(skillName);
+
+      // Remove any existing symlink/junction. Go's filepath.Walk (used by localharness_external)
+      // does not follow symlinks or junctions, so skills must be copied as real directories.
       try {
         const lstat = NodeFS.lstatSync(destPath);
         if (lstat.isSymbolicLink()) {
-          try {
-            NodeFS.statSync(destPath);
-            continue;
-          } catch {
-            NodeFS.unlinkSync(destPath);
-          }
-        } else {
-          continue;
+          NodeFS.unlinkSync(destPath);
         }
       } catch (err: unknown) {
-        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") continue;
+        if (
+          typeof err === "object" &&
+          err !== null &&
+          "code" in err &&
+          (err as { code?: string }).code !== "ENOENT"
+        ) {
+          continue;
+        }
       }
 
       try {
-        NodeFS.symlinkSync(sourcePath, destPath, platform === "win32" ? "junction" : "dir");
+        NodeFS.cpSync(sourcePath, destPath, { recursive: true, dereference: true, force: true });
       } catch {
         try {
-          NodeFS.cpSync(sourcePath, destPath, { recursive: true, dereference: true, force: true });
+          NodeFS.symlinkSync(sourcePath, destPath, platform === "win32" ? "junction" : "dir");
         } catch {
-          // Continue if a symlink couldn't be created
+          // Continue if copy and symlink both fail
         }
       }
     }
@@ -433,13 +441,20 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   // Rewriting on every launch keeps a method, project, or location edit in
   // Settings effective. The agent also records auth.type here after a
   // sign-in, which matches the value written below.
-  yield* fs
-    .writeFileString(path.join(acpDirectory, "settings.json"), antigravityProfileSettings(auth))
-    .pipe(
-      Effect.mapError(() =>
-        authSupportError("The Antigravity profile settings could not be written."),
-      ),
-    );
+  // Avoid unconditional overwrites if settings are identical to prevent file-locking
+  // collisions with concurrent turns or child processes on Windows.
+  const settingsPath = path.join(acpDirectory, "settings.json");
+  const desiredSettings = antigravityProfileSettings(auth);
+  const currentSettings = yield* fs.readFileString(settingsPath).pipe(Effect.option);
+  if (Option.isNone(currentSettings) || currentSettings.value !== desiredSettings) {
+    yield* fs
+      .writeFileString(settingsPath, desiredSettings)
+      .pipe(
+        Effect.mapError(() =>
+          authSupportError("The Antigravity profile settings could not be written."),
+        ),
+      );
+  }
   return profile;
 });
 

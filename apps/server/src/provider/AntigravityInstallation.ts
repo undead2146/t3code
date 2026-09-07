@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - Effect has no incremental digest or free-space query.
+// @effect-diagnostics nodeBuiltinImport:off globalDate:off - Effect has no incremental digest or free-space query.
 import * as EffectNodeStream from "@effect/platform-node/NodeStream";
 import { ProviderDriverKind, type ProviderInstallState } from "@t3tools/contracts";
 import {
@@ -25,7 +25,11 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as NodeCrypto from "node:crypto";
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+import * as Schedule from "effect/Schedule";
 import type * as NodeStream from "node:stream";
 import * as Yauzl from "yauzl";
 
@@ -111,7 +115,10 @@ export class AntigravityInstallation extends Context.Service<
     AntigravityInstallation,
     Effect.gen(function* () {
       const config = yield* ServerConfig;
-      return yield* makeAntigravityInstallation({ baseDir: config.baseDir });
+      return yield* makeAntigravityInstallation({
+        baseDir: config.baseDir,
+        cleanTempDirectories: true,
+      });
     }),
   );
 }
@@ -123,6 +130,7 @@ export interface AntigravityInstallationOptions {
     executable: AntigravityExecutable,
     expectedVersion: string,
   ) => Effect.Effect<void, AntigravityInstallationError, Scope.Scope>;
+  readonly cleanTempDirectories?: boolean;
 }
 
 const installationError = (operation: string, detail: string, cause?: unknown) =>
@@ -261,6 +269,59 @@ const openArchive = Effect.fn("AntigravityInstallation.openArchive")(function* (
     );
   return { entryCount: opened.zip.entryCount, next, streamEntry };
 });
+
+export interface CleanedTempDirectoriesResult {
+  readonly cleaned: number;
+  readonly skipped: number;
+}
+
+/**
+ * Scans the OS temporary directory for orphaned PyInstaller _MEI extraction directories
+ * left behind by abrupt process terminations (e.g. SIGKILL / TerminateProcess).
+ * Skips directories currently in use (file-locked by active processes on Windows)
+ * or modified within the last 10 minutes.
+ */
+export function cleanOrphanedAntigravityTempDirectories(
+  tempDirectory: string = NodeOS.tmpdir(),
+  minAgeMs: number = 10 * 60 * 1_000,
+): CleanedTempDirectoriesResult {
+  let cleaned = 0;
+  let skipped = 0;
+
+  let entries: string[] = [];
+  try {
+    entries = NodeFS.readdirSync(tempDirectory);
+  } catch {
+    return { cleaned, skipped };
+  }
+
+  const now = Date.now();
+  for (const entry of entries) {
+    if (!entry.toLowerCase().startsWith("_mei")) continue;
+    const fullPath = NodePath.join(tempDirectory, entry);
+
+    try {
+      const stat = NodeFS.statSync(fullPath);
+      if (!stat.isDirectory()) continue;
+
+      // Skip folders created or modified recently (< minAgeMs) to avoid racing with a starting process
+      if (now - stat.mtimeMs < minAgeMs) {
+        skipped++;
+        continue;
+      }
+
+      // Attempt removal. On Windows, if a process holds open file handles in the folder,
+      // rmSync will fail with EBUSY / EPERM, protecting actively running processes.
+      NodeFS.rmSync(fullPath, { recursive: true, force: true, maxRetries: 1, retryDelay: 100 });
+      cleaned++;
+    } catch {
+      // Locked by active process or permission denied
+      skipped++;
+    }
+  }
+
+  return { cleaned, skipped };
+}
 
 export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.make")(function* (
   options: AntigravityInstallationOptions,
@@ -889,6 +950,9 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
             }
           }
           yield* fs.remove(managedDirectory, { recursive: true, force: true });
+          yield* Effect.sync(() => {
+            cleanOrphanedAntigravityTempDirectories(NodeOS.tmpdir(), 0);
+          });
           yield* SubscriptionRef.update(
             state,
             (current) =>
@@ -936,6 +1000,23 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
       ),
     ),
   );
+
+  if (options.cleanTempDirectories) {
+    yield* Effect.forkIn(
+      Effect.gen(function* () {
+        yield* Effect.sync(() => {
+          cleanOrphanedAntigravityTempDirectories();
+        });
+        yield* Effect.repeat(
+          Effect.sync(() => {
+            cleanOrphanedAntigravityTempDirectories();
+          }),
+          Schedule.spaced("1 hour"),
+        );
+      }),
+      serviceScope,
+    );
+  }
 
   return AntigravityInstallation.of({
     managedDirectory,

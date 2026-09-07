@@ -643,6 +643,54 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
         expect(yield* fs.exists(linkedSkill)).toBe(true);
         const content = yield* fs.readFileString(linkedSkill);
         expect(content).toContain("name: postplan-helper");
+
+        const skillStat = yield* fs.stat(
+          path.join(profileDirectory, "config", "skills", "postplan-helper"),
+        );
+        expect(skillStat.type).toBe("Directory");
       }),
+  );
+
+  it.effect("replaces pre-existing junctions/symlinks in config/skills with real directories", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+      const mockHome = path.join(temporaryDirectory, "mock-home");
+      const mockSkillDir = path.join(mockHome, ".t3", "skills", "custom-skill");
+      yield* fs.makeDirectory(mockSkillDir, { recursive: true });
+      yield* fs.writeFileString(
+        path.join(mockSkillDir, "SKILL.md"),
+        "---\nname: custom-skill\n---\n",
+      );
+
+      const profileDirectory = path.join(temporaryDirectory, "profile");
+      const configSkills = path.join(profileDirectory, "config", "skills");
+      yield* fs.makeDirectory(configSkills, { recursive: true });
+
+      // Simulate legacy junction/symlink
+      const destSkill = path.join(configSkills, "custom-skill");
+      yield* Effect.sync(() => {
+        const NodeFS = require("node:fs");
+        NodeFS.symlinkSync(
+          mockSkillDir,
+          destSkill,
+          process.platform === "win32" ? "junction" : "dir",
+        );
+      });
+
+      // Run profile prep
+      yield* prepareAntigravityProfile({
+        profileDirectory,
+        userHome: mockHome,
+      });
+
+      // Verify junction was removed and replaced with a real directory
+      const NodeFS = require("node:fs");
+      const lstat = NodeFS.lstatSync(destSkill);
+      expect(lstat.isSymbolicLink()).toBe(false);
+      expect(lstat.isDirectory()).toBe(true);
+      expect(yield* fs.exists(path.join(destSkill, "SKILL.md"))).toBe(true);
+    }),
   );
 });

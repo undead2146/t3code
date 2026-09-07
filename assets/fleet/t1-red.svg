@@ -1,0 +1,9 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background squircle matching T3 Code dark theme -->
+  <rect width="128" height="128" rx="24" fill="#0C1013"/>
+  <rect x="1" y="1" width="126" height="126" rx="23" stroke="#EF4444" stroke-opacity="0.3" stroke-width="2"/>
+  <!-- T glyph (White) -->
+  <path d="M26 92V47H11V36H55V47H40V92H26Z" fill="#FFFFFF"/>
+  <!-- 1 numeral (Vibrant Red) -->
+  <path d="M72 48.5L88.5 36H100V92H86V51.5L74.5 59.5L72 48.5Z" fill="#EF4444"/>
+</svg>

@@ -1,3 +1,4 @@
+// @effect-diagnostics globalDate:off
 /**
  * Selection and pace maths for the provider limits view, shared by web and
  * mobile so both agree on which providers show, what "ahead of pace" means,
@@ -43,10 +44,52 @@ export interface LimitsGroup {
   readonly providers: readonly ServerProvider[];
 }
 
+function providerAccountKey(provider: ServerProvider): string | null {
+  if (provider.driver === "antigravity") {
+    return "antigravity";
+  }
+  const normalizedEmail = provider.auth.email?.trim().toLowerCase();
+  if (normalizedEmail) {
+    return `${provider.driver}:${normalizedEmail}`;
+  }
+  return null;
+}
+
+function providerQualityScore(
+  environmentId: EnvironmentId,
+  label: string,
+  provider: ServerProvider,
+): number {
+  let score = 0;
+  const isPrimary =
+    environmentId === "primary" ||
+    label.toLowerCase() === "bravo" ||
+    label.toLowerCase() === "local";
+  if (isPrimary) {
+    score += 100;
+  }
+  if (provider.usageLimits && !provider.usageLimits.unavailable) {
+    score += 10;
+    const hasFutureReset = provider.usageLimits.windows.some((w) => {
+      if (!w.resetsAt) return false;
+      const t = Date.parse(w.resetsAt);
+      return !Number.isNaN(t) && t > Date.now();
+    });
+    if (hasFutureReset) {
+      score += 5;
+    }
+  }
+  return score;
+}
+
 /**
  * One group per connected environment with a provider reporting limits.
  * Provider snapshots come from the config stream every client already holds,
  * so opening the view costs no extra request.
+ *
+ * When multiple environments connect (e.g. workstation + remote fleet),
+ * providers sharing the same subscription/account (such as Antigravity) are
+ * deduplicated to prefer the primary local machine with valid live limits.
  */
 export function collectLimitsGroups(
   presentations: ReadonlyMap<
@@ -57,9 +100,33 @@ export function collectLimitsGroups(
     }
   >,
 ): readonly LimitsGroup[] {
+  const bestByAccountKey = new Map<
+    string,
+    { readonly environmentId: EnvironmentId; readonly score: number }
+  >();
+
+  for (const [environmentId, presentation] of presentations) {
+    const label = presentation.entry.target.label;
+    for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
+      const key = providerAccountKey(provider);
+      if (!key) continue;
+      const score = providerQualityScore(environmentId, label, provider);
+      const existing = bestByAccountKey.get(key);
+      if (!existing || score > existing.score) {
+        bestByAccountKey.set(key, { environmentId, score });
+      }
+    }
+  }
+
   const groups: LimitsGroup[] = [];
   for (const [environmentId, presentation] of presentations) {
-    const providers = providersWithLimits(presentation.serverConfig?.providers ?? []);
+    const rawProviders = providersWithLimits(presentation.serverConfig?.providers ?? []);
+    const providers = rawProviders.filter((provider) => {
+      const key = providerAccountKey(provider);
+      if (!key) return true;
+      const best = bestByAccountKey.get(key);
+      return best?.environmentId === environmentId;
+    });
     if (providers.length === 0) continue;
     groups.push({ environmentId, environmentLabel: presentation.entry.target.label, providers });
   }
@@ -139,7 +206,11 @@ export function collectLimitSources(
 
 function accountKey(driver: ServerProvider["driver"], email: string | undefined): string | null {
   const normalizedEmail = email?.trim().toLowerCase();
-  return normalizedEmail ? `${driver}:${normalizedEmail}` : null;
+  return normalizedEmail
+    ? `${driver}:${normalizedEmail}`
+    : driver === "antigravity"
+      ? "antigravity"
+      : null;
 }
 
 /** The instance's configured name, else the driver's, else its raw kind. */

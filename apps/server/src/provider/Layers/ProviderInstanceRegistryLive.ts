@@ -254,33 +254,61 @@ const makeReconcile = <R>(input: {
         }
       }
 
-      // 2. Build additions and replacements. Walk `nextRaw` so the final
-      //    entry order follows settings-author order.
+      // 2. Build additions and replacements concurrently while preserving
+      //    settings-author order in `nextOrder` and the resulting maps.
       const builtEntries = new Map<ProviderInstanceId, LiveEntry>();
       const builtUnavailable = new Map<ProviderInstanceId, ServerProvider>();
       let orderChanged = false;
       const previousOrder = [...previousEntries.keys()];
       const nextOrder: Array<ProviderInstanceId> = [];
 
-      for (const [rawInstanceId, entry] of nextRaw) {
-        const instanceId = ProviderInstanceId.make(rawInstanceId);
-        nextOrder.push(instanceId);
+      for (const [rawInstanceId] of nextRaw) {
+        nextOrder.push(ProviderInstanceId.make(rawInstanceId));
+      }
 
-        const existing = previousEntries.get(instanceId);
-        if (existing !== undefined && !replacedIds.has(instanceId)) {
-          // No-op update: keep the existing live entry and scope.
-          builtEntries.set(instanceId, existing);
-          continue;
-        }
+      interface BuiltInstanceResult {
+        readonly instanceId: ProviderInstanceId;
+        readonly result:
+          | { readonly kind: "existing"; readonly existing: LiveEntry }
+          | { readonly kind: "live"; readonly live: LiveEntry }
+          | { readonly kind: "unavailable"; readonly snapshot: ServerProvider };
+      }
 
-        const result = yield* buildEntry({
-          driversById,
-          parentScope,
-          instanceId,
-          rawInstanceId,
-          entry,
-        });
-        if (result.kind === "live") {
+      const buildResults = yield* Effect.forEach(
+        nextRaw,
+        ([rawInstanceId, entry]): Effect.Effect<BuiltInstanceResult, never, R> => {
+          const instanceId = ProviderInstanceId.make(rawInstanceId);
+          const existing = previousEntries.get(instanceId);
+          if (existing !== undefined && !replacedIds.has(instanceId)) {
+            return Effect.succeed({
+              instanceId,
+              result: { kind: "existing", existing },
+            });
+          }
+
+          return buildEntry({
+            driversById,
+            parentScope,
+            instanceId,
+            rawInstanceId,
+            entry,
+          }).pipe(
+            Effect.map((result): BuiltInstanceResult => ({
+              instanceId,
+              result:
+                result.kind === "live"
+                  ? { kind: "live", live: result.live }
+                  : { kind: "unavailable", snapshot: result.snapshot },
+            })),
+          );
+        },
+        { concurrency: "unbounded" },
+      );
+
+      for (const { instanceId, result } of buildResults) {
+        if (result.kind === "existing") {
+          builtEntries.set(instanceId, result.existing);
+        } else if (result.kind === "live") {
           builtEntries.set(instanceId, result.live);
         } else {
           builtUnavailable.set(instanceId, result.snapshot);

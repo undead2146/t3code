@@ -1,0 +1,5 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Circular outline with number 3 in green -->
+  <circle cx="64" cy="64" r="54" stroke="#22C55E" stroke-width="12"/>
+  <path d="M51 43H79V54L68 64C76 66 82 72 82 80C82 89 74.5 96 63.5 96C53 96 46 89.5 45.5 81L57 80C57.5 83.5 60 85.5 64 85.5C68 85.5 70.5 83 70.5 79.5C70.5 75.5 67.5 73 63 73H58V63L71 52H51V43Z" fill="#22C55E"/>
+</svg>

@@ -16,6 +16,7 @@ import {
   PENDING_ATTACHMENT_THREAD_SEGMENT,
   parseThreadSegmentFromAttachmentId,
   resolveAttachmentPath,
+  toSafeThreadAttachmentSegment,
 } from "../attachmentStore.ts";
 import { ServerConfig } from "../config.ts";
 import { parseBase64DataUrl } from "../imageMime.ts";
@@ -139,6 +140,46 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
       (attachment) =>
         Effect.gen(function* () {
           if (!("dataUrl" in attachment)) {
+            const requestedSegment = parseThreadSegmentFromAttachmentId(attachment.id);
+            const safeThreadSegment = toSafeThreadAttachmentSegment(canonicalCommand.threadId);
+
+            if (
+              requestedSegment !== null &&
+              safeThreadSegment !== null &&
+              requestedSegment === safeThreadSegment
+            ) {
+              const normalizedAttachment = {
+                ...attachment,
+                mimeType: attachment.mimeType.toLowerCase(),
+              };
+              const expectedPath = resolveAttachmentPath({
+                attachmentsDir: serverConfig.attachmentsDir,
+                attachment: normalizedAttachment,
+              });
+              if (!expectedPath) {
+                return yield* new OrchestrationDispatchCommandError({
+                  message: `Attachment '${attachment.name}' cannot be sent: failed to resolve attachment path.`,
+                });
+              }
+
+              const info = yield* fileSystem.stat(expectedPath).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationDispatchCommandError({
+                      message: `Attachment '${attachment.name}' cannot be sent: attachment not found.`,
+                      cause,
+                    }),
+                ),
+              );
+              if (Number(info.size) !== attachment.sizeBytes) {
+                return yield* new OrchestrationDispatchCommandError({
+                  message: `Attachment '${attachment.name}' cannot be sent: stored size does not match.`,
+                });
+              }
+
+              return normalizedAttachment;
+            }
+
             const claim = planAttachmentClaim({
               attachmentsDir: serverConfig.attachmentsDir,
               threadId: canonicalCommand.threadId,
@@ -184,15 +225,17 @@ export const normalizeDispatchCommand = (command: ClientOrchestrationCommand) =>
             // bootstrap can then retry with a fresh thread id. A copy, not a
             // hard link: an agent editing the delivered file in place must not
             // mutate the retry source.
-            yield* fileSystem.copyFile(claim.currentPath, claim.finalPath).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new OrchestrationDispatchCommandError({
-                    message: `Failed to claim attachment '${attachment.name}' for this thread.`,
-                    cause,
-                  }),
-              ),
-            );
+            if (claim.currentPath !== claim.finalPath) {
+              yield* fileSystem.copyFile(claim.currentPath, claim.finalPath).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationDispatchCommandError({
+                      message: `Failed to claim attachment '${attachment.name}' for this thread.`,
+                      cause,
+                    }),
+                ),
+              );
+            }
             claimedAttachmentPaths.push(claim.finalPath);
 
             return normalizedAttachment;

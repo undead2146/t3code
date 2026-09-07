@@ -928,6 +928,7 @@ export interface LocalDispatchSnapshot {
   sessionStatus: NonNullable<Thread["session"]>["status"] | null;
   sessionUpdatedAt: string | null;
   latestTurnStartFailureId: string | null;
+  threadError: string | null;
 }
 
 export function latestTurnStartFailureId(
@@ -952,6 +953,7 @@ export function createLocalDispatchSnapshot(
   options?: {
     preparingWorktree?: boolean;
     submissionIntent?: ComposerSubmissionIntent;
+    threadError?: string | null;
   },
 ): LocalDispatchSnapshot {
   const latestTurn = activeThread?.latestTurn ?? null;
@@ -969,6 +971,7 @@ export function createLocalDispatchSnapshot(
     sessionStatus: session?.status ?? null,
     sessionUpdatedAt: session?.updatedAt ?? null,
     latestTurnStartFailureId: latestTurnStartFailureId(activeThread, latestUserMessage?.id ?? null),
+    threadError: options?.threadError ?? null,
   };
 }
 
@@ -986,7 +989,10 @@ export function hasServerAcknowledgedLocalDispatch(input: {
   if (!input.localDispatch) {
     return false;
   }
-  if (input.hasPendingApproval || input.hasPendingUserInput || Boolean(input.threadError)) {
+  const hasNewThreadError = Boolean(
+    input.threadError && input.threadError !== input.localDispatch.threadError,
+  );
+  if (input.hasPendingApproval || input.hasPendingUserInput || hasNewThreadError) {
     return true;
   }
   if (

@@ -261,30 +261,44 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
       // Kick the TTL-gated manifest refresh alongside the health check, as
       // Codex and Claude do. Without it an environment that only runs
       // Antigravity would keep classifying against a stale disk cache.
+      // Resolving the installation verifies binary and harness files on disk
+      // and reports the installed version without spawning a 1.2GB PyInstaller runtime.
       const probe = Effect.gen(function* () {
         yield* modelManifest.refreshInBackground;
-        const processScope = yield* Scope.make();
-        yield* Effect.addFinalizer((exit) => Scope.close(processScope, exit));
-        return yield* authFlow
-          .withProcess(
-            Scope.close(processScope, Exit.void),
-            Effect.gen(function* () {
-              const runtime = yield* makeRuntime({
-                cwd: serverConfig.stateDir,
-                clientInfo: { name: "t3-code-provider-probe", version: "0.0.0" },
-                mcpServers: [],
-              });
-              return yield* runtime.initialize();
-            }),
-          )
-          .pipe(Effect.provideService(Scope.Scope, processScope));
-      }).pipe(Effect.scoped);
+        if (authConfigIssue !== null) {
+          return yield* new ProviderSetupError({
+            instanceId,
+            operation: "configure",
+            detail: authConfigIssue,
+          });
+        }
+        const executable = yield* installation
+          .resolve(settings.binaryPath, processEnvironment)
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderSetupError({
+                  instanceId,
+                  operation: "resolve",
+                  detail: cause.detail,
+                }),
+            ),
+          );
+        return {
+          protocolVersion: 1,
+          agentInfo: {
+            name: "antigravity",
+            version: executable.version ?? "unknown",
+          },
+        };
+      });
 
       const provider = yield* makeAntigravityProvider(settings, {
         stampIdentity: classifyModels,
         probe,
         auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
         cachedModelsPath: path.join(profileDirectory, "antigravity-acp", "models.json"),
+        profileDirectory,
         checkAuthenticated: fileSystem
           .exists(path.join(profileDirectory, "antigravity-acp", "acp_token.json"))
           .pipe(Effect.orElseSucceed(() => false)),

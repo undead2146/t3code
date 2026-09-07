@@ -1,0 +1,5 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Circular outline with number 2 in blue -->
+  <circle cx="64" cy="64" r="54" stroke="#3B82F6" stroke-width="12"/>
+  <path d="M47 50.5C47 41.5 54 35 64.5 35C75 35 82 41.5 82 50.5C82 57.5 76.5 64 68 72L58 81.5H84V93H45V82.5L62 65.5C67 60.5 69.5 56.5 69.5 51C69.5 46 66.5 43.5 62.5 43.5C57.5 43.5 55 46.5 54.5 50.5L47 50.5Z" fill="#3B82F6"/>
+</svg>

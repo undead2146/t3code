@@ -21,6 +21,61 @@ const EMPTY_ACTIVITIES: ReadonlyArray<OrchestrationThreadActivity> = Object.free
 const EMPTY_PROPOSED_PLANS: ReadonlyArray<OrchestrationProposedPlan> = Object.freeze([]);
 const EMPTY_CHECKPOINTS: ReadonlyArray<OrchestrationCheckpointSummary> = Object.freeze([]);
 
+function selectAuthoritativeSession(
+  detailSession: OrchestrationSession | null,
+  shellSession: OrchestrationSession | null,
+): OrchestrationSession | null {
+  if (detailSession === null) return shellSession;
+  if (shellSession === null) return detailSession;
+
+  // If detail has already settled the turn (leaving running/starting) while
+  // shell is still lagging in running/starting for the same active turn,
+  // the detail event stream is authoritative and prevents UI regression.
+  const isDetailSettled = detailSession.status !== "running" && detailSession.status !== "starting";
+  const isShellRunning = shellSession.status === "running" || shellSession.status === "starting";
+  if (isDetailSettled && isShellRunning) {
+    return detailSession;
+  }
+
+  const detailTime = Date.parse(detailSession.updatedAt);
+  const shellTime = Date.parse(shellSession.updatedAt);
+  if (!Number.isNaN(detailTime) && !Number.isNaN(shellTime)) {
+    return detailTime >= shellTime ? detailSession : shellSession;
+  }
+
+  return shellSession;
+}
+
+function selectAuthoritativeLatestTurn(
+  detailTurn: OrchestrationLatestTurn | null,
+  shellTurn: OrchestrationLatestTurn | null,
+): OrchestrationLatestTurn | null {
+  if (detailTurn === null) return shellTurn;
+  if (shellTurn === null) return detailTurn;
+
+  if (detailTurn.turnId === shellTurn.turnId) {
+    const isDetailSettled = detailTurn.completedAt !== null && detailTurn.state !== "running";
+    const isShellSettled = shellTurn.completedAt !== null && shellTurn.state !== "running";
+    // If detail settled the turn first, do not allow a stale shell to regress it to running
+    if (isDetailSettled && !isShellSettled) {
+      return detailTurn;
+    }
+    return shellTurn;
+  }
+
+  const detailTime = Date.parse(
+    detailTurn.completedAt ?? detailTurn.startedAt ?? detailTurn.requestedAt,
+  );
+  const shellTime = Date.parse(
+    shellTurn.completedAt ?? shellTurn.startedAt ?? shellTurn.requestedAt,
+  );
+  if (!Number.isNaN(detailTime) && !Number.isNaN(shellTime)) {
+    return detailTime >= shellTime ? detailTurn : shellTurn;
+  }
+
+  return shellTurn;
+}
+
 /**
  * Combine detail-only collections with the shell's authoritative thread metadata.
  *
@@ -52,7 +107,7 @@ export function mergeEnvironmentThread(
     interactionMode: shell.interactionMode,
     branch: shell.branch,
     worktreePath: shell.worktreePath,
-    latestTurn: shell.latestTurn,
+    latestTurn: selectAuthoritativeLatestTurn(detail.latestTurn, shell.latestTurn),
     createdAt: shell.createdAt,
     updatedAt: shell.updatedAt,
     archivedAt: shell.archivedAt,
@@ -62,7 +117,7 @@ export function mergeEnvironmentThread(
     snoozedAt: shell.snoozedAt,
     pinnedAt: shell.pinnedAt,
     pinOrderKey: shell.pinOrderKey,
-    session: shell.session,
+    session: selectAuthoritativeSession(detail.session, shell.session),
   };
 }
 

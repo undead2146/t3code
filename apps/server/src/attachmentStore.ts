@@ -179,7 +179,8 @@ export function planAttachmentClaim(input: {
     return { ok: false, reason: "invalid attachment id" };
   }
 
-  if (!toSafeThreadAttachmentSegment(input.threadId)) {
+  const safeThreadSegment = toSafeThreadAttachmentSegment(input.threadId);
+  if (!safeThreadSegment) {
     return { ok: false, reason: "invalid thread id" };
   }
   if (requestedSegment !== PENDING_ATTACHMENT_THREAD_SEGMENT) {
@@ -193,6 +194,7 @@ export function planAttachmentClaim(input: {
   if (!currentPath) {
     return { ok: false, reason: "attachment not found (removed or expired)" };
   }
+
   const fileExtension = parseAttachmentFileExtension(input.attachmentId) ?? undefined;
   const finalId = createAttachmentId(input.threadId, fileExtension);
   if (!finalId) {

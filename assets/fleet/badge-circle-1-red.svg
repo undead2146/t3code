@@ -1,0 +1,5 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Circular outline with number 1 in red -->
+  <circle cx="64" cy="64" r="54" stroke="#EF4444" stroke-width="12"/>
+  <path d="M49 53L67 38H81V94H66V55.5L52 64L49 53Z" fill="#EF4444"/>
+</svg>

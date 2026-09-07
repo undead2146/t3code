@@ -26,7 +26,10 @@ import {
   TerminalOpenInput,
 } from "@t3tools/contracts";
 import { type EnvironmentConnectionPresentation } from "@t3tools/client-runtime/connection";
-import { wasBootstrapThreadDeleted } from "@t3tools/client-runtime/errors";
+import {
+  shouldRotateBootstrapThreadId,
+  wasBootstrapThreadDeleted,
+} from "@t3tools/client-runtime/errors";
 import { type CodexArtifactTemplate } from "@t3tools/client-runtime/codex-artifact-templates";
 import { effectiveSnoozed, threadWokeAt } from "@t3tools/client-runtime/state/thread-settled";
 import {
@@ -290,6 +293,7 @@ import { resolveProviderSkillsForCwd } from "@t3tools/client-runtime/providerSki
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import {
+  readThreadShell,
   useProject,
   useProjects,
   useThread,
@@ -733,10 +737,13 @@ function useLocalDispatchState(input: {
             ? active
             : { ...active, preparingWorktree, submissionIntent };
         }
-        return createLocalDispatchSnapshot(input.activeThread, options);
+        return createLocalDispatchSnapshot(input.activeThread, {
+          ...options,
+          threadError: input.threadError ?? null,
+        });
       });
     },
-    [input.activeThread, serverAcknowledgedLocalDispatch],
+    [input.activeThread, input.threadError, serverAcknowledgedLocalDispatch],
   );
 
   return {
@@ -1413,7 +1420,18 @@ export default function ChatView(props: ChatViewProps) {
   const queryEphemeral = useAtomCommand(threadEnvironment.queryEphemeral, {
     reportFailure: false,
   });
-  const [btwState, setBtwState] = useState<BtwState | null>(null);
+  const [btwStateByThread, setBtwStateByThread] = useState<Record<string, BtwState>>({});
+  const setBtwStateForThread = useCallback((threadId: string, state: BtwState | null) => {
+    setBtwStateByThread((prev) => {
+      if (!state) {
+        if (!(threadId in prev)) return prev;
+        const copy = { ...prev };
+        delete copy[threadId];
+        return copy;
+      }
+      return { ...prev, [threadId]: state };
+    });
+  }, []);
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, {
     reportFailure: false,
   });
@@ -1789,6 +1807,7 @@ export default function ChatView(props: ChatViewProps) {
   const isLocalDraftThread = !isServerThread && localDraftThread !== undefined;
   const canCheckoutPullRequestIntoThread = isLocalDraftThread;
   const activeThreadId = activeThread?.id ?? null;
+  const btwState = activeThreadId ? (btwStateByThread[activeThreadId] ?? null) : null;
   const activeThreadEnvironmentId = activeThread?.environmentId ?? null;
   const runningTerminalIds = useThreadRunningTerminalIds({
     environmentId: activeThread?.environmentId ?? null,
@@ -6248,11 +6267,73 @@ export default function ChatView(props: ChatViewProps) {
         return;
       }
 
+      const targetThreadId = activeThread.id;
+      const isRunning = activeThread.session?.status === "running" || phase === "running";
+      const startedAt = activeThread.latestTurn?.startedAt ?? activeThread.latestTurn?.requestedAt;
+      let durationText: string | null = null;
+      if (isRunning && startedAt) {
+        const elapsedSec = Math.max(
+          0,
+          Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000),
+        );
+        const mins = Math.floor(elapsedSec / 60);
+        const secs = elapsedSec % 60;
+        durationText = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+      }
+
+      const latestWorkEntry = workLogEntries.at(-1);
+      const currentAction = latestWorkEntry
+        ? liveWorkEntryLabel(latestWorkEntry, activeProject?.workspaceRoot, true)
+        : null;
+
+      const recentActions = workLogEntries
+        .slice(-15)
+        .map((entry, idx) => {
+          const label = liveWorkEntryLabel(entry, activeProject?.workspaceRoot, false);
+          return `${idx + 1}. ${label}`;
+        })
+        .join("\n");
+
+      const latestUserMessage = activeThread.messages.findLast((m) => m.role === "user");
+
+      const conversationHistory = activeThread.messages
+        .slice(-30)
+        .map((m) => {
+          const role = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : "System";
+          const text = m.text.length > 4000 ? `${m.text.slice(0, 4000)}\n...[truncated]` : m.text;
+          return `[${role}]:\n${text}`;
+        })
+        .join("\n\n");
+
+      const latestPlan = activeThread.proposedPlans?.at(-1);
+      const planContext = latestPlan?.planMarkdown
+        ? `Latest Plan:\n${latestPlan.planMarkdown.length > 3000 ? `${latestPlan.planMarkdown.slice(0, 3000)}\n...[truncated]` : latestPlan.planMarkdown}`
+        : undefined;
+
+      const conversationContext = [
+        activeThread.title ? `Thread Title: ${activeThread.title}` : undefined,
+        activeProject?.workspaceRoot ? `Workspace Root: ${activeProject.workspaceRoot}` : undefined,
+        isRunning
+          ? `Current Turn Status: Running${durationText ? ` (working for ${durationText})` : ""}`
+          : `Current Turn Status: ${activeThread.session?.status ?? "idle"}`,
+        isRunning && currentAction ? `Currently Executing Action: ${currentAction}` : undefined,
+        latestUserMessage?.text
+          ? `Active User Request under execution:\n${latestUserMessage.text.length > 1000 ? `${latestUserMessage.text.slice(0, 1000)}\n...[truncated]` : latestUserMessage.text}`
+          : undefined,
+        recentActions
+          ? `Recent Actions and Tools Executed in this Session:\n${recentActions}`
+          : undefined,
+        planContext,
+        conversationHistory ? `Recent Conversation Messages:\n${conversationHistory}` : undefined,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+
       promptRef.current = "";
       clearComposerDraftContent(composerDraftTarget);
       composerRef.current?.resetCursorState();
 
-      setBtwState({
+      setBtwStateForThread(targetThreadId, {
         query: btwCommand.query,
         status: "loading",
       });
@@ -6260,26 +6341,27 @@ export default function ChatView(props: ChatViewProps) {
       const result = await queryEphemeral({
         environmentId,
         input: {
-          threadId: activeThread.id,
+          threadId: targetThreadId,
           query: btwCommand.query,
+          conversationHistory: conversationContext,
         },
       });
 
       if (result._tag === "Failure") {
         if (!isAtomCommandInterrupted(result)) {
           const errorMessage = chatActionErrorMessage(squashAtomCommandFailure(result));
-          setBtwState({
+          setBtwStateForThread(targetThreadId, {
             query: btwCommand.query,
             status: "error",
             error: errorMessage,
           });
         } else {
-          setBtwState(null);
+          setBtwStateForThread(targetThreadId, null);
         }
         return;
       }
 
-      setBtwState({
+      setBtwStateForThread(targetThreadId, {
         query: btwCommand.query,
         status: "done",
         text: result.value.text,
@@ -6923,6 +7005,9 @@ export default function ChatView(props: ChatViewProps) {
           releaseDraftAttachments(composerAttachmentsSnapshot);
         }
         acknowledgeActiveThreadWoke();
+        if (isLocalDraftThread || draftId) {
+          markPromotedDraftThreadByRef(scopeThreadRef(environmentId, threadIdForSend));
+        }
         if (backgroundThreadRef) {
           markPromotedDraftThreadByRef(backgroundThreadRef);
           try {
@@ -7014,7 +7099,10 @@ export default function ChatView(props: ChatViewProps) {
       }
       if (!isAtomCommandInterrupted(failure)) {
         const error = squashAtomCommandFailure(failure);
-        if (isLocalDraftThread && draftId && wasBootstrapThreadDeleted(error)) {
+        const shouldRotateThread =
+          shouldRotateBootstrapThreadId(error) ||
+          readThreadShell(scopeThreadRef(environmentId, threadIdForSend)) !== null;
+        if (isLocalDraftThread && draftId && shouldRotateThread) {
           const failedDraftSession = getDraftSession(draftId);
           if (failedDraftSession?.threadId === threadIdForSend) {
             setLogicalProjectDraftThreadId(
@@ -8121,16 +8209,16 @@ export default function ChatView(props: ChatViewProps) {
                     <ComposerSurface.Shell contextStrip={showComposerContextStrip}>
                       <ComposerSurface.Host>
                         <div ref={attachDraftHeroComposerAnchorRef} className="relative z-10">
-                          {btwState ? (
+                          {btwState && activeThreadId ? (
                             <BtwOverlayHUD
                               state={btwState}
-                              onDismiss={() => setBtwState(null)}
+                              onDismiss={() => setBtwStateForThread(activeThreadId, null)}
                               onInsertToComposer={(text) => {
                                 const current = promptRef.current;
                                 const next = current ? `${current}\n\n${text}` : text;
                                 promptRef.current = next;
                                 setComposerDraftPrompt(composerDraftTarget, next);
-                                setBtwState(null);
+                                setBtwStateForThread(activeThreadId, null);
                                 composerRef.current?.focusAtEnd();
                               }}
                               cwd={activeProject?.workspaceRoot}

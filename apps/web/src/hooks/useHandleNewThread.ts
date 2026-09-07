@@ -325,11 +325,21 @@ export function useNewThreadHandler() {
         })();
       }
 
+      const latestActiveDraftThreadRef = latestActiveDraftThread
+        ? scopeThreadRef(latestActiveDraftThread.environmentId, latestActiveDraftThread.threadId)
+        : null;
+      const latestActiveDraftThreadExistsOnServer =
+        latestActiveDraftThreadRef !== null && readThreadShell(latestActiveDraftThreadRef) !== null;
+      if (latestActiveDraftThreadRef && latestActiveDraftThreadExistsOnServer) {
+        markPromotedDraftThreadByRef(latestActiveDraftThreadRef);
+      }
+
       if (
         latestActiveDraftThread &&
         currentRouteTarget?.kind === "draft" &&
         latestActiveDraftThread.logicalProjectKey === logicalProjectKey &&
         latestActiveDraftThread.promotedTo == null &&
+        !latestActiveDraftThreadExistsOnServer &&
         // Same content rule as above: a new-thread request while viewing an
         // invested draft mints a fresh one instead of repurposing it.
         !composerDraftHasUserContent(getComposerDraft(currentRouteTarget.draftId))

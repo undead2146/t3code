@@ -26,7 +26,11 @@ import {
   makeManualOnlyProviderMaintenanceCapabilities,
   type ProviderMaintenanceCapabilities,
 } from "../providerMaintenance.ts";
-import { makeAntigravityUsageLimits } from "./antigravityUsageLimits.ts";
+import {
+  fetchAntigravityLiveQuota,
+  getLiveAntigravityUsageLimits,
+  makeAntigravityUsageLimits,
+} from "./antigravityUsageLimits.ts";
 import { makeUnavailableUsageLimits } from "../providerUsageLimits.ts";
 import {
   BTW_SLASH_COMMAND,
@@ -155,6 +159,7 @@ interface AntigravityProviderOptions {
   readonly checkAuthenticated?: Effect.Effect<boolean>;
   readonly checkInstallation?: Effect.Effect<{ readonly version?: string | null } | null>;
   readonly cachedModelsPath?: string;
+  readonly profileDirectory?: string;
 }
 
 /** Health uses initialize only. Session callbacks supply account-specific metadata. */
@@ -253,10 +258,31 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     const isSavedAuth = options.checkAuthenticated
       ? yield* options.checkAuthenticated.pipe(Effect.orElseSucceed(() => false))
       : false;
+    const currentDraft = before.draft;
+    const authenticated = currentDraft.auth.status === "authenticated" || isSavedAuth;
+    const liveQuota = authenticated
+      ? yield* Effect.promise(() =>
+          fetchAntigravityLiveQuota({
+            forceRefresh: true,
+            checkedAt: updatedAt,
+            ...(options.profileDirectory ? { profileDirectory: options.profileDirectory } : {}),
+          }),
+        ).pipe(Effect.orElseSucceed(() => null))
+      : null;
+    const liveUsageLimits = authenticated
+      ? makeAntigravityUsageLimits({
+          checkedAt: updatedAt,
+          liveQuota: liveQuota ?? undefined,
+        })
+      : makeUnavailableUsageLimits({
+          checkedAt: updatedAt,
+          reason: "unsupported",
+          message: "Sign in with Google to view Antigravity limits.",
+        });
+
     const next = yield* SubscriptionRef.updateAndGet(metadata, (state) => {
       if (state.authRevision !== before.authRevision) return state;
       const { message: _previousMessage, ...draft } = state.draft;
-      const authenticated = draft.auth.status === "authenticated" || isSavedAuth;
       const message =
         errorMessage ??
         (authenticated
@@ -276,14 +302,11 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             status: authenticated ? "authenticated" : draft.auth.status,
             type: options.auth?.type ?? "oauth-personal",
             label: options.auth?.label ?? "Google account",
+            ...(liveQuota?.userEmail || draft.auth.email
+              ? { email: (liveQuota?.userEmail ?? draft.auth.email)! }
+              : {}),
           },
-          usageLimits: authenticated
-            ? (draft.usageLimits ?? makeAntigravityUsageLimits({ checkedAt: updatedAt }))
-            : makeUnavailableUsageLimits({
-                checkedAt: updatedAt,
-                reason: "unsupported",
-                message: "Sign in with Google to view Antigravity limits.",
-              }),
+          usageLimits: liveUsageLimits,
           models: missingInstallation ? [] : draft.models.length > 0 ? draft.models : cachedModels,
           ...(missingInstallation
             ? {
@@ -336,6 +359,18 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
     const sessionModels = buildAntigravityModelsFromSession(started.sessionSetupResult);
     writeCachedModels(options.cachedModelsPath, sessionModels);
+    const currentDraft = before.draft;
+    const liveQuota = yield* Effect.promise(() =>
+      fetchAntigravityLiveQuota({
+        forceRefresh: true,
+        checkedAt: updatedAt,
+        ...(options.profileDirectory ? { profileDirectory: options.profileDirectory } : {}),
+      }),
+    ).pipe(Effect.orElseSucceed(() => null));
+    const liveUsageLimits = makeAntigravityUsageLimits({
+      checkedAt: updatedAt,
+      liveQuota: liveQuota ?? undefined,
+    });
     yield* SubscriptionRef.update(metadata, (state) => {
       if (
         state.authRevision !== before.authRevision &&
@@ -357,9 +392,12 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             status: "authenticated",
             type: options.auth?.type ?? "oauth-personal",
             label: options.auth?.label ?? "Google account",
+            ...(liveQuota?.userEmail || draft.auth.email
+              ? { email: (liveQuota?.userEmail ?? draft.auth.email)! }
+              : {}),
           },
           checkedAt: updatedAt,
-          usageLimits: draft.usageLimits ?? makeAntigravityUsageLimits({ checkedAt: updatedAt }),
+          usageLimits: liveUsageLimits,
           models: sessionModels,
           supportsTextGeneration,
           ...(cwd

@@ -59,6 +59,7 @@ import {
   ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE,
   getAntigravityGlobalSkillRoots,
   isAntigravitySignInRequiredError,
+  syncAntigravityGlobalSkills,
 } from "../antigravityAuthSupport.ts";
 import { mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
 import {
@@ -106,7 +107,10 @@ import {
   extractConversationIdsFromText,
   findTranscriptPath,
 } from "../../orchestration/subagentTranscriptQuery.ts";
-import { makeAntigravityUsageLimitsUpdate } from "./antigravityUsageLimits.ts";
+import {
+  fetchAntigravityLiveQuota,
+  makeAntigravityUsageLimitsUpdate,
+} from "./antigravityUsageLimits.ts";
 
 export const KILLED_SUBAGENT_IDS = new Set<string>();
 export const SUBAGENT_RUNNING_PIDS = new Map<string, Set<number>>();
@@ -578,8 +582,8 @@ export const DEFAULT_ANTIGRAVITY_ACTIVE_TOOL_INACTIVITY_TIMEOUT_MS = 30 * 60 * 1
 
 export interface AntigravityAdapterOptions {
   readonly instanceId: ProviderInstanceId;
-  readonly profileDirectory?: string;
-  readonly userHome?: string;
+  readonly profileDirectory?: string | undefined;
+  readonly userHome?: string | undefined;
   readonly makeRuntime: (
     input: Omit<AntigravityAcpRuntimeInput, "spawn" | "childProcessSpawner" | "onAuthorizationUrl">,
   ) => Effect.Effect<Runtime, EffectAcpErrors.AcpError | ProviderSetupError, Scope.Scope>;
@@ -601,8 +605,8 @@ export interface AntigravityAdapterOptions {
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly prewarm?: boolean;
   /** Override turn inactivity watchdog in focused tests. */
-  readonly turnInactivityTimeoutMs?: number;
-  readonly activeToolInactivityTimeoutMs?: number;
+  readonly turnInactivityTimeoutMs?: number | undefined;
+  readonly activeToolInactivityTimeoutMs?: number | undefined;
 }
 
 interface PendingApproval {
@@ -768,6 +772,23 @@ const writeClientTextFile = Effect.fn("AntigravityAdapter.writeClientTextFile")(
 });
 
 /** Keeps one official ACP process per thread and drains a cancelled prompt before steering. */
+function getAntigravityAdditionalDirectories(input: {
+  readonly attachmentsDir: string;
+  readonly userHome?: string | undefined;
+  readonly profileDirectory?: string | undefined;
+  readonly path: Path.Path;
+}): ReadonlyArray<string> {
+  const globalSkillRoots = getAntigravityGlobalSkillRoots(input.userHome);
+  const profileRoots = input.profileDirectory
+    ? [
+        input.path.join(input.profileDirectory, "config", "skills"),
+        input.path.join(input.profileDirectory, "antigravity-cli", "skills"),
+      ]
+    : [];
+  const directories = [input.attachmentsDir, ...globalSkillRoots, ...profileRoots];
+  return [...new Set(directories)];
+}
+
 export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(function* (
   settings: AntigravitySettings,
   options: AntigravityAdapterOptions,
@@ -811,8 +832,20 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         .withProcess(
           stopOwned,
           Effect.gen(function* () {
-            const globalSkillRoots = getAntigravityGlobalSkillRoots(options.userHome);
-            const additionalDirectories = [serverConfig.attachmentsDir, ...globalSkillRoots];
+            if (options.profileDirectory && options.userHome) {
+              const configSkillsDirectory = path.join(options.profileDirectory, "config", "skills");
+              syncAntigravityGlobalSkills(
+                configSkillsDirectory,
+                options.userHome,
+                process.platform,
+              );
+            }
+            const additionalDirectories = getAntigravityAdditionalDirectories({
+              attachmentsDir: serverConfig.attachmentsDir,
+              userHome: options.userHome,
+              profileDirectory: options.profileDirectory,
+              path,
+            });
             const runtime = yield* options.makeRuntime({
               cwd: targetCwd,
               clientInfo: { name: "t3-code", version: "0.0.0" },
@@ -950,21 +983,6 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           usage: snapshot,
         },
       });
-      if (options.instanceId) {
-        const limitsUpdate = makeAntigravityUsageLimitsUpdate({
-          sessionTokensUsed: snapshot.totalProcessedTokens ?? snapshot.usedTokens,
-        });
-        yield* emit({
-          type: "account.rate-limits.updated",
-          ...(yield* stamp),
-          provider: PROVIDER,
-          providerInstanceId: options.instanceId,
-          threadId: context.threadId,
-          payload: {
-            limits: limitsUpdate,
-          },
-        });
-      }
     });
 
   function writeSubagentTranscriptStep(subagentId: string, toolCall: AcpToolCallState): void {
@@ -1920,12 +1938,22 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
 
         const setupSessionBody = Effect.gen(function* () {
           const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
+          if (options.profileDirectory && options.userHome) {
+            const configSkillsDirectory = path.join(options.profileDirectory, "config", "skills");
+            syncAntigravityGlobalSkills(configSkillsDirectory, options.userHome, process.platform);
+          }
+          const additionalDirectories = getAntigravityAdditionalDirectories({
+            attachmentsDir: serverConfig.attachmentsDir,
+            userHome: options.userHome,
+            profileDirectory: options.profileDirectory,
+            path,
+          });
           if (!usedStandby) {
             runtime = yield* options.makeRuntime({
               cwd,
               clientInfo: { name: "t3-code", version: "0.0.0" },
               clientFileSystem: true,
-              additionalDirectories: [serverConfig.attachmentsDir],
+              additionalDirectories,
               ...(Option.isSome(cursor) ? { resumeSessionId: cursor.value.sessionId } : {}),
               mcpServers: mcp
                 ? [
@@ -1945,7 +1973,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             });
           }
 
-          const allowedRoots = [cwd, serverConfig.attachmentsDir];
+          const allowedRoots = [cwd, ...additionalDirectories];
           yield* runtime.handleReadTextFile((request) =>
             readClientTextFile({ fileSystem, path, allowedRoots, request }),
           );
@@ -2174,6 +2202,28 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             limits: limitsUpdate,
           },
         });
+      } else if (options.instanceId) {
+        const liveQuota = yield* Effect.promise(() =>
+          fetchAntigravityLiveQuota({
+            forceRefresh: true,
+            ...(options.profileDirectory ? { profileDirectory: options.profileDirectory } : {}),
+          }),
+        ).pipe(Effect.orElseSucceed(() => null));
+        if (liveQuota) {
+          const limitsUpdate = makeAntigravityUsageLimitsUpdate({
+            liveQuota,
+          });
+          yield* emit({
+            type: "account.rate-limits.updated",
+            ...(yield* stamp),
+            provider: PROVIDER,
+            providerInstanceId: options.instanceId,
+            threadId: context.threadId,
+            payload: {
+              limits: limitsUpdate,
+            },
+          });
+        }
       }
       context.activeTurnId = undefined;
       context.promptFiber = undefined;
@@ -2344,7 +2394,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
 
       const promptEffect = Fiber.await(launch.fiber).pipe(Effect.flatMap((exit) => exit));
       const result = yield* Effect.raceFirst(promptEffect, watchdog);
-      yield* context.runtime.drainEvents;
+      yield* context.runtime.drainEvents.pipe(Effect.timeoutOption("3 seconds"), Effect.ignore);
       if (context.stopped) {
         return yield* new ProviderAdapterSessionClosedError({
           provider: PROVIDER,
@@ -2714,16 +2764,60 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             }),
         });
 
+        const isRunning = context.promptFiber !== undefined && context.activeTurnId !== undefined;
+        const promptParts: string[] = [
+          "You are an AI assistant answering a quick side-question (/btw) for the user while they are working in T3 Code.",
+          `Workspace root: ${context.cwd}`,
+        ];
+
+        if (isRunning) {
+          promptParts.push(
+            `Current Turn Status: Actively running (turn ID: ${context.activeTurnId})`,
+          );
+          if (context.activeToolCalls.size > 0) {
+            promptParts.push(`Active Tool Calls: ${context.activeToolCalls.size} in progress`);
+          }
+          if (context.commands.size > 0) {
+            const commandList = Array.from(context.commands.values())
+              .map((c) => c.toolCall.title || c.toolCall.toolCallId)
+              .filter(Boolean)
+              .join(", ");
+            if (commandList) {
+              promptParts.push(`Active Background Commands: ${commandList}`);
+            }
+          }
+          if (context.trackedSubagents.size > 0) {
+            promptParts.push(`Active Subagents: ${context.trackedSubagents.size}`);
+          }
+        } else {
+          promptParts.push("Current Turn Status: Idle");
+        }
+
+        promptParts.push(
+          "",
+          "Instructions:",
+          "- Answer the user's question directly, accurately, and concisely based on the provided context, task status, and recent actions.",
+          "- Never output generic refusal disclaimers claiming you are in an isolated context without access to tasks or logs. You have access to the conversation context, actions, and status provided here.",
+          "- Do not attempt to execute tools, edit files, or run commands.",
+          "",
+        );
+
+        if (input.conversationHistory?.trim()) {
+          promptParts.push(
+            "=== CONVERSATION & TASK CONTEXT ===",
+            input.conversationHistory.trim(),
+            "=== END CONVERSATION CONTEXT ===",
+            "",
+          );
+        }
+
+        promptParts.push("=== USER SIDE QUESTION (/btw) ===", input.query);
+
         const result = yield* runtime.prompt({
           prompt: [
             {
               type: "text",
-              text: [
-                "You are answering a quick side-question (/btw) from the user.",
-                "Answer concisely and directly. Do not attempt to use tools, write files, run commands, or ask for confirmation.",
-                "",
-                input.query,
-              ].join("\n"),
+              text: promptParts.join("\n"),
             },
           ],
         });

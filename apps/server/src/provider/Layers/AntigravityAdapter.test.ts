@@ -78,6 +78,8 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
   readonly holdDispatch?: boolean;
   readonly turnInactivityTimeoutMs?: number;
   readonly activeToolInactivityTimeoutMs?: number;
+  readonly userHome?: string;
+  readonly profileDirectory?: string;
   readonly customRuntime?: (
     input: Parameters<AntigravityAdapterOptions["makeRuntime"]>[0],
     defaultRuntime: Runtime,
@@ -228,6 +230,8 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
       instanceId,
       turnInactivityTimeoutMs: options?.turnInactivityTimeoutMs,
       activeToolInactivityTimeoutMs: options?.activeToolInactivityTimeoutMs,
+      userHome: options?.userHome,
+      profileDirectory: options?.profileDirectory,
       makeRuntime: (input) =>
         Effect.gen(function* () {
           launches.push(input);
@@ -1312,6 +1316,62 @@ it.layer(layer)("AntigravityAdapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect(
+    "includes global and profile skill roots in additionalDirectories and allowedRoots",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const fakeHome = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agy-home-" });
+        const fakeProfile = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agy-profile-" });
+        const globalSkillDir = path.join(fakeHome, ".antigravity", "skills", "test-skill");
+        yield* fs.makeDirectory(globalSkillDir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(globalSkillDir, "SKILL.md"),
+          "---\nname: test-skill\ndescription: A test skill\n---\n# Test Skill",
+        );
+
+        const h = yield* makeHarness({ userHome: fakeHome, profileDirectory: fakeProfile });
+        const { attachmentsDir } = yield* ServerConfig;
+        const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agy-fs-" });
+
+        yield* h.adapter.startSession({ threadId, cwd, runtimeMode: "approval-required" });
+
+        expect(h.launches[0]?.clientFileSystem).toBe(true);
+        const dirs = h.launches[0]?.additionalDirectories ?? [];
+        expect(dirs).toContain(attachmentsDir);
+        expect(dirs).toContain(path.join(fakeHome, ".antigravity", "skills"));
+        expect(dirs).toContain(path.join(fakeProfile, "config", "skills"));
+
+        const read = h.fileHandlers.read;
+        if (!read) return yield* Effect.die("Read handler not registered");
+
+        // Can read from global skill root
+        const globalSkillFile = yield* read({
+          sessionId: nativeSessionId,
+          path: path.join(globalSkillDir, "SKILL.md"),
+        });
+        expect(globalSkillFile.content).toContain("test-skill");
+
+        // Verify sync copied global skill into profile config skills
+        const syncedSkillFile = path.join(
+          fakeProfile,
+          "config",
+          "skills",
+          "test-skill",
+          "SKILL.md",
+        );
+        expect(yield* fs.exists(syncedSkillFile)).toBe(true);
+
+        // Can read from synced profile skill root
+        const profileSkillRead = yield* read({
+          sessionId: nativeSessionId,
+          path: syncedSkillFile,
+        });
+        expect(profileSkillRead.content).toContain("test-skill");
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("does not launch a process for a disabled instance or invalid resume cursor", () =>
     Effect.gen(function* () {
       const disabled = yield* makeHarness({ enabled: false });
@@ -1443,15 +1503,16 @@ it.layer(layer)("AntigravityAdapter", (it) => {
         }).pipe(Effect.forkChild);
 
         const ephPrompt = yield* Queue.take(ephemeralPrompts);
-        expect(ephPrompt.content).toEqual([
-          {
-            type: "text",
-            text:
-              "You are answering a quick side-question (/btw) from the user.\n" +
-              "Answer concisely and directly. Do not attempt to use tools, write files, run commands, or ask for confirmation.\n\n" +
-              "What is this file?",
-          },
-        ]);
+        const firstBlock = ephPrompt.content[0];
+        expect(firstBlock?.type).toBe("text");
+        if (firstBlock?.type === "text") {
+          expect(firstBlock.text).toContain(
+            "You are an AI assistant answering a quick side-question (/btw) for the user while they are working in T3 Code.",
+          );
+          expect(firstBlock.text).toContain("Current Turn Status: Actively running");
+          expect(firstBlock.text).toContain("=== USER SIDE QUESTION (/btw) ===");
+          expect(firstBlock.text).toContain("What is this file?");
+        }
 
         // Emit content delta on ephemeral events
         yield* Queue.offer(ephemeralEvents, {
