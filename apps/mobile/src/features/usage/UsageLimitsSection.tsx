@@ -28,7 +28,6 @@ import { useProviderColors } from "./usageProviders";
 
 const PACE_LABEL = { ahead: "ahead of pace", on: "on pace", under: "under pace" } as const;
 
-
 type Driver = ServerProvider["driver"];
 
 /** The series colour the usage chart uses for this driver, so the two views read as one. */
