@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
-import * as NodeOS from "node:os";
+import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 
 import type { AntigravityAuthMethod, ProviderInstanceId } from "@t3tools/contracts";
@@ -19,6 +19,10 @@ import * as AcpErrors from "effect-acp/errors";
 
 import { collectUint8StreamText } from "../stream/collectUint8StreamText.ts";
 import type { AcpSpawnInput } from "./acp/AcpSessionRuntime.ts";
+import {
+  antigravityUserSkillDirectories,
+  resolveAntigravityUserHome,
+} from "./Drivers/AntigravitySkills.ts";
 
 export const ANTIGRAVITY_AUTH_STDOUT_PREFIX =
   "Open the following link to authenticate the ACP server: ";
@@ -322,6 +326,56 @@ export function syncAntigravityGlobalSkills(
   }
 }
 
+/**
+ * The agent reads its user-global skills under `GEMINI_HOME`, which T3 points
+ * at the private profile. Link the two skill directories back to the user's
+ * real `~/.gemini` so global skills load, while MCP servers, hooks, and
+ * credentials stay isolated. Best effort: a link that cannot be made only
+ * costs global skills, never the session. A real directory at the link path
+ * is the user's own content and is left alone.
+ */
+const linkAntigravityUserSkills = Effect.fn("linkAntigravityUserSkills")(function* (input: {
+  readonly profileDirectory: string;
+  readonly userHome: string;
+  readonly platform: NodeJS.Platform;
+}): Effect.fn.Return<void, never, FileSystem.FileSystem | Path.Path> {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const links = antigravityUserSkillDirectories(path, input.profileDirectory);
+  const targets = antigravityUserSkillDirectories(path, path.join(input.userHome, ".gemini"));
+  for (const [link, target] of [
+    [links[0], targets[0]],
+    [links[1], targets[1]],
+  ] as const) {
+    yield* Effect.gen(function* () {
+      const existing = yield* fs.readLink(link).pipe(
+        Effect.map((value): string | undefined => path.resolve(path.dirname(link), value)),
+        Effect.catch((error) =>
+          error.reason._tag === "NotFound" ? Effect.succeed(undefined) : Effect.fail(error),
+        ),
+      );
+      if (existing === target) return;
+      if (existing !== undefined) {
+        yield* fs.remove(link);
+      }
+      yield* fs.makeDirectory(path.dirname(link), { recursive: true });
+      yield* Effect.tryPromise(() =>
+        NodeFSP.symlink(target, link, input.platform === "win32" ? "junction" : "dir"),
+      );
+    }).pipe(
+      // A non-symlink at the link path fails `readLink`; anything else is a
+      // filesystem refusal. Both leave the profile usable.
+      Effect.catch((error) =>
+        Effect.logWarning("Antigravity user skills are not linked into the profile.", {
+          link,
+          target,
+          error,
+        }),
+      ),
+    );
+  }
+});
+
 /** Prepares a private profile without reading or copying Google credentials. */
 export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(function* (input: {
   readonly profileDirectory: string;
@@ -329,6 +383,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   readonly runtimeExecutablePath?: string;
   readonly platform?: NodeJS.Platform;
   readonly auth?: AntigravityAuthConfig;
+  /** Home the agent expands `~` against. Defaults to the launch environment's. */
   readonly userHome?: string;
   readonly skipBrowserPreflight?: boolean;
 }) {
@@ -337,6 +392,8 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   const path = yield* Path.Path;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const platform = input.platform ?? (yield* HostProcessPlatform);
+  const userHome =
+    input.userHome ?? resolveAntigravityUserHome(platform, input.baseEnv ?? process.env);
   const runtimeExecutablePath = input.runtimeExecutablePath ?? (yield* HostProcessExecutablePath);
   const helperExecutable =
     platform === "win32" ? runtimeExecutablePath.replaceAll("\\", "/") : runtimeExecutablePath;
@@ -430,12 +487,6 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
         );
     }
   }
-
-  const userHome =
-    input.userHome ??
-    input.baseEnv?.HOME?.trim() ??
-    input.baseEnv?.USERPROFILE?.trim() ??
-    NodeOS.homedir();
   syncAntigravityGlobalSkills(configSkillsDirectory, userHome, platform);
 
   // Rewriting on every launch keeps a method, project, or location edit in
@@ -455,6 +506,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
         ),
       );
   }
+  yield* linkAntigravityUserSkills({ profileDirectory: geminiHome, userHome, platform });
   return profile;
 });
 

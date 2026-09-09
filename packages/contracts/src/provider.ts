@@ -19,6 +19,7 @@ import {
   ProviderRequestKind,
   ProviderSandboxMode,
   ProviderUserInputAnswers,
+  UserInputAttachments,
   RuntimeMode,
 } from "./orchestration.ts";
 import { ProviderInstanceId, ProviderDriverKind } from "./providerInstance.ts";
@@ -110,6 +111,7 @@ export const ProviderRespondToUserInputInput = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,
   answers: ProviderUserInputAnswers,
+  attachmentsByQuestionId: Schema.optional(UserInputAttachments),
 });
 export type ProviderRespondToUserInputInput = typeof ProviderRespondToUserInputInput.Type;
 
@@ -136,7 +138,7 @@ export const ProviderEphemeralQueryResult = Schema.Struct({
 });
 export type ProviderEphemeralQueryResult = typeof ProviderEphemeralQueryResult.Type;
 
-export class ProviderEphemeralQueryError extends Schema.TaggedErrorClass<ProviderEphemeralQueryError>()(
+export class ProviderEphemeralQueryError extends Schema.TaggedError<ProviderEphemeralQueryError>()(
   "ProviderEphemeralQueryError",
   {
     threadId: ThreadId,
@@ -149,7 +151,7 @@ export class ProviderEphemeralQueryError extends Schema.TaggedErrorClass<Provide
   }
 }
 
-export class ProviderUploadFeedbackError extends Schema.TaggedErrorClass<ProviderUploadFeedbackError>()(
+export class ProviderUploadFeedbackError extends Schema.TaggedError<ProviderUploadFeedbackError>()(
   "ProviderUploadFeedbackError",
   {
     threadId: ThreadId,
