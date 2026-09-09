@@ -45,7 +45,10 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 
 import { ServerConfig } from "../../config.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
-import { removeAntigravitySessionFiles } from "../acp/AntigravitySessionFiles.ts";
+import {
+  removeAntigravitySessionFiles,
+  sanitizeAntigravitySessionDatabase,
+} from "../acp/AntigravitySessionFiles.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import type { AntigravityAuth } from "../AntigravityAuth.ts";
 import {
@@ -1134,6 +1137,29 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             context.disconnected ? "Antigravity process stopped." : undefined,
           );
           context.subagents.clear();
+          if (context.disconnected && context.nativeSessionId) {
+            yield* sanitizeAntigravitySessionDatabase({
+              profileDirectory: options.profileDirectory ?? serverConfig.stateDir,
+              sessionId: context.nativeSessionId,
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, path),
+              Effect.tap(({ repairedCheckpoints, removedErrorSteps }) =>
+                repairedCheckpoints > 0 || removedErrorSteps > 0
+                  ? Effect.logWarning(
+                      "Sanitized corrupt Antigravity session database after process disconnect",
+                      {
+                        threadId: context.threadId,
+                        sessionId: context.nativeSessionId,
+                        repairedCheckpoints,
+                        removedErrorSteps,
+                      },
+                    )
+                  : Effect.void,
+              ),
+              Effect.ignore,
+            );
+          }
           yield* emit({
             type: "session.exited",
             ...(yield* stamp),
@@ -1949,6 +1975,29 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             path,
           });
           if (!usedStandby) {
+            if (Option.isSome(cursor)) {
+              yield* sanitizeAntigravitySessionDatabase({
+                profileDirectory: options.profileDirectory ?? serverConfig.stateDir,
+                sessionId: cursor.value.sessionId,
+              }).pipe(
+                Effect.provideService(FileSystem.FileSystem, fileSystem),
+                Effect.provideService(Path.Path, path),
+                Effect.tap(({ repairedCheckpoints, removedErrorSteps }) =>
+                  repairedCheckpoints > 0 || removedErrorSteps > 0
+                    ? Effect.logWarning(
+                        "Sanitized corrupt Antigravity session database before resume",
+                        {
+                          threadId: input.threadId,
+                          sessionId: cursor.value.sessionId,
+                          repairedCheckpoints,
+                          removedErrorSteps,
+                        },
+                      )
+                    : Effect.void,
+                ),
+                Effect.ignore,
+              );
+            }
             runtime = yield* options.makeRuntime({
               cwd,
               clientInfo: { name: "t3-code", version: "0.0.0" },

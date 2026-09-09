@@ -5,13 +5,14 @@
  * Antigravity uses Google's Gemini and Claude models under the hood.
  * Google Cloud Code exposes quota and rate limit telemetry via:
  * 1. Active ACP Google OAuth credentials in `acp_token.json` (inside the active profile)
- * 2. Google Cloud Code API (`v1internal:fetchAvailableModels`)
- * 3. Cached quota files in `~/.antigravity_cockpit/cache/quota_api_v1_plugin/authorized/`
+ * 2. Google Cloud Code Quota API (`v1internal:retrieveUserQuotaSummary`)
+ * 3. Fallback Model API (`v1internal:fetchAvailableModels`)
+ * 4. Cached quota files in `~/.antigravity_cockpit/cache/`
  *
- * This module computes and updates ServerProviderUsageLimits for Antigravity:
- * - Session window: 300 minutes (5 hours) rolling quota (Pro / Claude pool)
- * - Daily window: 1440 minutes (24 hours) rolling quota (Flash pool)
- * - Model-scoped windows for active models (Claude Sonnet 4.6, Gemini 3.1 Pro, etc.)
+ * Google Cloud Code quota structure:
+ * - Session window: 300 minutes (5 hours) rolling quota (`window: "5h"`)
+ * - Weekly window: 10080 minutes (7 days / 168 hours) quota (`window: "weekly"`)
+ * - Model groups: "Gemini Models" (Flash/Pro) and "Claude and GPT models" (Sonnet/Opus)
  *
  * When an account is authenticated, usageLimits are exposed so the Limits tab
  * displays actual live percentages and reset countdowns from the user's Google account.
@@ -38,23 +39,135 @@ import {
 
 export const ANTIGRAVITY_LIMIT_CONSTANTS = {
   SESSION_MINS: 300, // 5 hours
-  DAILY_MINS: 1440, // 24 hours
+  WEEKLY_MINS: 10080, // 7 days (168 hours)
+  DAILY_MINS: 1440, // 24 hours (legacy fallback)
   DEFAULT_SESSION_TOKEN_LIMIT: 250_000,
   DEFAULT_DAILY_TOKEN_LIMIT: 1_000_000,
+  DEFAULT_WEEKLY_TOKEN_LIMIT: 7_000_000,
   CACHE_TTL_MS: 60_000, // 1 minute in-memory cache
 } as const;
 
 export const ANTIGRAVITY_WINDOW_IDS = {
   SESSION: "session_window",
-  DAILY: "daily_window",
+  WEEKLY: "weekly_window",
+  /** Legacy alias for WEEKLY */
+  DAILY: "weekly_window",
 } as const;
 
 const ANTIGRAVITY_CLIENT_ID = String.fromCharCode(
-  49, 48, 55, 49, 48, 48, 54, 48, 54, 48, 53, 57, 49, 45, 116, 109, 104, 115, 115, 105, 110, 50, 104, 50, 49, 108, 99, 114, 101, 50, 51, 53, 118, 116, 111, 108, 111, 106, 104, 52, 103, 52, 48, 51, 101, 112, 46, 97, 112, 112, 115, 46, 103, 111, 111, 103, 108, 101, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116, 46, 99, 111, 109,
+  49,
+  48,
+  55,
+  49,
+  48,
+  48,
+  54,
+  48,
+  54,
+  48,
+  53,
+  57,
+  49,
+  45,
+  116,
+  109,
+  104,
+  115,
+  115,
+  105,
+  110,
+  50,
+  104,
+  50,
+  49,
+  108,
+  99,
+  114,
+  101,
+  50,
+  51,
+  53,
+  118,
+  116,
+  111,
+  108,
+  111,
+  106,
+  104,
+  52,
+  103,
+  52,
+  48,
+  51,
+  101,
+  112,
+  46,
+  97,
+  112,
+  112,
+  115,
+  46,
+  103,
+  111,
+  111,
+  103,
+  108,
+  101,
+  117,
+  115,
+  101,
+  114,
+  99,
+  111,
+  110,
+  116,
+  101,
+  110,
+  116,
+  46,
+  99,
+  111,
+  109,
 );
 const ANTIGRAVITY_CLIENT_SECRET = String.fromCharCode(
-  71, 79, 67, 83, 80, 88, 45, 75, 53, 56, 70, 87, 82, 52, 56, 54, 76, 100, 76, 74, 49, 109, 76, 66, 56, 115, 88, 67, 52, 122, 54, 113, 68, 65, 102,
+  71,
+  79,
+  67,
+  83,
+  80,
+  88,
+  45,
+  75,
+  53,
+  56,
+  70,
+  87,
+  82,
+  52,
+  56,
+  54,
+  76,
+  100,
+  76,
+  74,
+  49,
+  109,
+  76,
+  66,
+  56,
+  115,
+  88,
+  67,
+  52,
+  122,
+  54,
+  113,
+  68,
+  65,
+  102,
 );
+const CLOUDCODE_QUOTA_SUMMARY_URL =
+  "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 const CLOUDCODE_MODELS_URL = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
@@ -64,13 +177,24 @@ export interface AntigravityModelQuota {
   readonly remainingFraction: number;
   readonly usedPercent: number;
   readonly resetsAt?: string | undefined;
+  readonly bucketId?: string | undefined;
+}
+
+export interface AntigravityQuotaBucket extends AntigravityModelQuota {
+  readonly bucketId: string;
+  readonly groupName: string;
+  readonly window: "5h" | "weekly" | string;
+  readonly description?: string | undefined;
 }
 
 export interface AntigravityLiveQuotaData {
   readonly checkedAt: string;
   readonly userEmail?: string | undefined;
-  readonly sessionQuota?: AntigravityModelQuota | undefined;
-  readonly dailyQuota?: AntigravityModelQuota | undefined;
+  readonly sessionQuota?: AntigravityQuotaBucket | AntigravityModelQuota | undefined;
+  readonly weeklyQuota?: AntigravityQuotaBucket | AntigravityModelQuota | undefined;
+  /** Backwards compatibility alias for weeklyQuota */
+  readonly dailyQuota?: AntigravityQuotaBucket | AntigravityModelQuota | undefined;
+  readonly buckets?: ReadonlyArray<AntigravityQuotaBucket> | undefined;
   readonly models: ReadonlyArray<AntigravityModelQuota>;
 }
 
@@ -82,6 +206,9 @@ export interface AntigravityUsageLimitsInput {
   readonly dailyTokensUsed?: number | undefined;
   readonly dailyTokenLimit?: number | undefined;
   readonly dailyResetsAt?: string | undefined;
+  readonly weeklyTokensUsed?: number | undefined;
+  readonly weeklyTokenLimit?: number | undefined;
+  readonly weeklyResetsAt?: string | undefined;
   readonly liveQuota?: AntigravityLiveQuotaData | null | undefined;
 }
 
@@ -232,19 +359,108 @@ interface RawModelEntry {
   };
 }
 
+interface RawQuotaBucket {
+  bucketId?: string;
+  displayName?: string;
+  window?: string;
+  resetTime?: string;
+  description?: string;
+  remainingFraction?: number;
+}
+
+interface RawQuotaGroup {
+  displayName?: string;
+  description?: string;
+  buckets?: RawQuotaBucket[];
+}
+
 /**
- * Parses raw Google Cloud Code fetchAvailableModels response payload into AntigravityLiveQuotaData.
+ * Parses Google Cloud Code quota response payload (either retrieveUserQuotaSummary or fetchAvailableModels)
+ * into AntigravityLiveQuotaData.
  */
 export function parseAntigravityQuotaPayload(
   raw: Record<string, unknown>,
   checkedAt?: string,
   userEmail?: string,
 ): AntigravityLiveQuotaData | null {
+  const nowIso = checkedAt ?? DateTime.formatIso(DateTime.nowUnsafe());
+
+  // 1. Check for retrieveUserQuotaSummary format (with groups)
+  const rawGroups = raw.groups as RawQuotaGroup[] | undefined;
+  if (Array.isArray(rawGroups) && rawGroups.length > 0) {
+    const buckets: AntigravityQuotaBucket[] = [];
+    let gemini5h: AntigravityQuotaBucket | null = null;
+    let geminiWeekly: AntigravityQuotaBucket | null = null;
+    let thirdParty5h: AntigravityQuotaBucket | null = null;
+    let thirdPartyWeekly: AntigravityQuotaBucket | null = null;
+
+    for (const group of rawGroups) {
+      const groupName = group.displayName || "";
+      const isGemini = /gemini/i.test(groupName);
+      const is3P = /claude|gpt|3p/i.test(groupName);
+
+      for (const b of group.buckets || []) {
+        const rawRemaining = b.remainingFraction;
+        const remainingFraction =
+          typeof rawRemaining === "number" && rawRemaining >= 0 && rawRemaining <= 1
+            ? rawRemaining
+            : 0;
+        const usedPercent = clampPercent(Math.round((1 - remainingFraction) * 100));
+        const windowType = b.window || (b.bucketId?.includes("5h") ? "5h" : "weekly");
+        const bucketId = b.bucketId || "unknown";
+
+        const bucket: AntigravityQuotaBucket = {
+          bucketId,
+          modelId: bucketId,
+          label: b.displayName || bucketId || "Limit",
+          groupName,
+          window: windowType,
+          remainingFraction,
+          usedPercent,
+          ...(b.resetTime ? { resetsAt: b.resetTime } : {}),
+          ...(b.description ? { description: b.description } : {}),
+        };
+        buckets.push(bucket);
+
+        if (isGemini) {
+          if (windowType === "5h") gemini5h = bucket;
+          else if (windowType === "weekly") geminiWeekly = bucket;
+        } else if (is3P) {
+          if (windowType === "5h") thirdParty5h = bucket;
+          else if (windowType === "weekly") thirdPartyWeekly = bucket;
+        }
+      }
+    }
+
+    const sessionQuota =
+      gemini5h ?? thirdParty5h ?? buckets.find((b) => b.window === "5h") ?? buckets[0];
+    const weeklyQuota =
+      geminiWeekly ?? thirdPartyWeekly ?? buckets.find((b) => b.window === "weekly") ?? buckets[1];
+
+    const models: AntigravityModelQuota[] = buckets.map((b) => ({
+      modelId: b.bucketId,
+      bucketId: b.bucketId,
+      label: b.label,
+      remainingFraction: b.remainingFraction,
+      usedPercent: b.usedPercent,
+      ...(b.resetsAt ? { resetsAt: b.resetsAt } : {}),
+    }));
+
+    return {
+      checkedAt: nowIso,
+      ...(userEmail ? { userEmail } : {}),
+      ...(sessionQuota ? { sessionQuota } : {}),
+      ...(weeklyQuota ? { weeklyQuota, dailyQuota: weeklyQuota } : {}),
+      buckets,
+      models,
+    };
+  }
+
+  // 2. Fallback to fetchAvailableModels format (with models map)
   const modelsMap = (raw.models ?? {}) as Record<string, RawModelEntry>;
   const modelEntries = Object.entries(modelsMap);
   if (modelEntries.length === 0) return null;
 
-  const nowIso = checkedAt ?? DateTime.formatIso(DateTime.nowUnsafe());
   const parsedModels: AntigravityModelQuota[] = [];
 
   for (const [key, entry] of modelEntries) {
@@ -253,13 +469,14 @@ export function parseAntigravityQuotaPayload(
     if (!quotaInfo) continue;
 
     const rawRemaining = quotaInfo.remainingFraction;
-    // Undefined remainingFraction means exhausted (0 remaining / 100% used)
     const remainingFraction =
       typeof rawRemaining === "number" && rawRemaining >= 0 && rawRemaining <= 1 ? rawRemaining : 0;
     const usedPercent = clampPercent(Math.round((1 - remainingFraction) * 100));
+    const modelId = entry.model ?? key;
 
     parsedModels.push({
-      modelId: entry.model ?? key,
+      modelId,
+      bucketId: modelId,
       label: entry.displayName?.trim() || key,
       remainingFraction,
       usedPercent,
@@ -267,11 +484,10 @@ export function parseAntigravityQuotaPayload(
     });
   }
 
-  // Find primary models for Session and Daily windows
   // Pro models (Gemini 3.1 Pro High / Pro Agent)
   const proModel = parsedModels.find(
     (m) =>
-      /gemini-(?:3(?:\.1)?|2\.5)-pro(?:-high|-agent)?/i.test(m.modelId) ||
+      /gemini-(?:3(?:\\.1)?|2\\.5)-pro(?:-high|-agent)?/i.test(m.modelId) ||
       /gemini.*pro/i.test(m.label),
   );
   // Claude models (Claude Sonnet 4.6 / Opus)
@@ -281,19 +497,17 @@ export function parseAntigravityQuotaPayload(
   // Flash models (Gemini 3 Flash / 3.6 Flash High)
   const flashModel = parsedModels.find(
     (m) =>
-      /gemini-(?:3(?:\.[0-9]+)?|2\.5)-flash/i.test(m.modelId) || /gemini.*flash/i.test(m.label),
+      /gemini-(?:3(?:\\.[0-9]+)?|2\\.5)-flash/i.test(m.modelId) || /gemini.*flash/i.test(m.label),
   );
 
-  // Session window tracks the Pro / Claude pool (most constrained tier)
   const sessionQuota = claudeModel ?? proModel ?? parsedModels[0];
-  // Daily window tracks the Flash pool
-  const dailyQuota = flashModel ?? parsedModels[1] ?? sessionQuota;
+  const weeklyQuota = flashModel ?? parsedModels[1] ?? sessionQuota;
 
   return {
     checkedAt: nowIso,
     ...(userEmail ? { userEmail } : {}),
     ...(sessionQuota ? { sessionQuota } : {}),
-    ...(dailyQuota ? { dailyQuota } : {}),
+    ...(weeklyQuota ? { weeklyQuota, dailyQuota: weeklyQuota } : {}),
     models: parsedModels,
   };
 }
@@ -314,10 +528,60 @@ export async function fetchAntigravityLiveQuota(
   }
 
   // In automated vitest runs, avoid blocking live outbound HTTP requests unless explicitly requested
-  if (process.env.VITEST && !options?.forceRefresh) {
+  if (process.env.VITEST && !process.env.ANTIGRAVITY_LIVE_TEST) {
     const disk = readDiskQuotaCache();
     return disk ? parseAntigravityQuotaPayload(disk) : (inMemoryLiveQuotaCache?.data ?? null);
   }
+
+  // Helper to query Google Cloud Code quota endpoints
+  const fetchQuotaWithToken = async (
+    token: string,
+    projectId: string,
+    email?: string,
+  ): Promise<AntigravityLiveQuotaData | null> => {
+    // Priority A: retrieveUserQuotaSummary (exact rolling 5h and weekly quota per group)
+    try {
+      const summaryRes = await fetch(CLOUDCODE_QUOTA_SUMMARY_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "User-Agent": "antigravity/1.107.0 windows/amd64",
+        },
+        body: JSON.stringify(projectId ? { project: projectId } : {}),
+        signal: AbortSignal.timeout(4000),
+      });
+      if (summaryRes.ok) {
+        const summaryData = (await summaryRes.json()) as Record<string, unknown>;
+        const parsed = parseAntigravityQuotaPayload(summaryData, undefined, email);
+        if (parsed) return parsed;
+      }
+    } catch {
+      // Fallback to fetchAvailableModels below
+    }
+
+    // Priority B: fetchAvailableModels
+    try {
+      const modelsRes = await fetch(CLOUDCODE_MODELS_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "User-Agent": "antigravity/1.107.0 windows/amd64",
+        },
+        body: JSON.stringify(projectId ? { project: projectId } : {}),
+        signal: AbortSignal.timeout(4000),
+      });
+      if (modelsRes.ok) {
+        const modelsData = (await modelsRes.json()) as Record<string, unknown>;
+        return parseAntigravityQuotaPayload(modelsData, undefined, email);
+      }
+    } catch {
+      // Fall through
+    }
+
+    return null;
+  };
 
   // 1. First priority: read active T3 Code ACP token (acp_token.json)
   const acpTokenPath = resolveAcpTokenPath(options);
@@ -367,7 +631,7 @@ export async function fetchAntigravityLiveQuota(
             accessToken = tokenData.access_token;
             const expiresIn =
               typeof tokenData.expires_in === "number" ? tokenData.expires_in : 3600;
-            // Retrieve actual linked user email
+            // Retrieve actual linked user email from Google
             try {
               const userRes = await fetch("https://www.googleapis.com/oauth2/v1/userinfo", {
                 headers: { Authorization: `Bearer ${accessToken}` },
@@ -390,23 +654,10 @@ export async function fetchAntigravityLiveQuota(
       }
 
       if (accessToken) {
-        const quotaRes = await fetch(CLOUDCODE_MODELS_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${accessToken}`,
-            "User-Agent": "antigravity/1.107.0 windows/amd64",
-          },
-          body: JSON.stringify({ project: projectId }),
-          signal: AbortSignal.timeout(4000),
-        });
-        if (quotaRes.ok) {
-          const quotaData = (await quotaRes.json()) as Record<string, unknown>;
-          const parsed = parseAntigravityQuotaPayload(quotaData, undefined, userEmail);
-          if (parsed) {
-            inMemoryLiveQuotaCache = { data: parsed, fetchedAt: now };
-            return parsed;
-          }
+        const parsed = await fetchQuotaWithToken(accessToken, projectId, userEmail);
+        if (parsed) {
+          inMemoryLiveQuotaCache = { data: parsed, fetchedAt: now };
+          return parsed;
         }
       }
     } catch {
@@ -430,7 +681,6 @@ export async function fetchAntigravityLiveQuota(
       let activeEmail = creds.activeAccount as string | undefined;
       if (!activeEmail || !accounts[activeEmail]) {
         const emails = Object.keys(accounts);
-        // Avoid defaulting to enterlife11@gmail.com if other accounts exist
         activeEmail = emails.find((e) => e !== "enterlife11@gmail.com") ?? emails[0];
       }
 
@@ -438,55 +688,37 @@ export async function fetchAntigravityLiveQuota(
       if (account) {
         let accessToken = account.accessToken;
         const refreshToken = account.refreshToken;
+        const projectId = account.projectId || "aicode-consumers";
 
-        const callApi = async (token: string): Promise<Response> => {
-          const body = account.projectId ? { project: account.projectId } : {};
-          return await fetch(CLOUDCODE_MODELS_URL, {
+        if (!accessToken && refreshToken) {
+          const tokenParams = new URLSearchParams({
+            client_id: ANTIGRAVITY_CLIENT_ID,
+            client_secret: ANTIGRAVITY_CLIENT_SECRET,
+            refresh_token: refreshToken,
+            grant_type: "refresh_token",
+          });
+          const tokenRes = await fetch(GOOGLE_TOKEN_URL, {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${token}`,
-              "User-Agent": "antigravity/1.107.0 windows/amd64",
-            },
-            body: JSON.stringify(body),
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: tokenParams.toString(),
             signal: AbortSignal.timeout(3000),
           });
-        };
-
-        let res: Response | null = accessToken ? await callApi(accessToken) : null;
-        if (!res || res.status === 401) {
-          if (refreshToken) {
-            const tokenParams = new URLSearchParams({
-              client_id: ANTIGRAVITY_CLIENT_ID,
-              client_secret: ANTIGRAVITY_CLIENT_SECRET,
-              refresh_token: refreshToken,
-              grant_type: "refresh_token",
-            });
-            const tokenRes = await fetch(GOOGLE_TOKEN_URL, {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body: tokenParams.toString(),
-              signal: AbortSignal.timeout(3000),
-            });
-            if (tokenRes.ok) {
-              const tokenData = (await tokenRes.json()) as { access_token?: string };
-              if (tokenData.access_token) {
-                accessToken = tokenData.access_token;
-                account.accessToken = accessToken;
-                try {
-                  NodeFS.writeFileSync(credPath, JSON.stringify(creds, null, 2), "utf8");
-                } catch {
-                  // Best effort write
-                }
-                res = await callApi(accessToken);
+          if (tokenRes.ok) {
+            const tokenData = (await tokenRes.json()) as { access_token?: string };
+            if (tokenData.access_token) {
+              accessToken = tokenData.access_token;
+              account.accessToken = accessToken;
+              try {
+                NodeFS.writeFileSync(credPath, JSON.stringify(creds, null, 2), "utf8");
+              } catch {
+                // Best effort write
               }
             }
           }
         }
 
-        if (res && res.ok) {
-          const data = (await res.json()) as Record<string, unknown>;
-          const parsed = parseAntigravityQuotaPayload(data, undefined, activeEmail);
+        if (accessToken) {
+          const parsed = await fetchQuotaWithToken(accessToken, projectId, activeEmail);
           if (parsed) {
             inMemoryLiveQuotaCache = { data: parsed, fetchedAt: now };
             return parsed;
@@ -527,16 +759,16 @@ export function makeAntigravityUsageLimits(
 
   if (liveQuota) {
     const sessionQuota = liveQuota.sessionQuota;
-    const dailyQuota = liveQuota.dailyQuota;
+    const weeklyQuota = liveQuota.weeklyQuota ?? liveQuota.dailyQuota;
 
     const sessionUsedPercent = sessionQuota?.usedPercent ?? 0;
     const sessionResetsAt =
       sessionQuota?.resetsAt ??
       computeWindowResetsAt(now, ANTIGRAVITY_LIMIT_CONSTANTS.SESSION_MINS);
 
-    const dailyUsedPercent = dailyQuota?.usedPercent ?? 0;
-    const dailyResetsAt =
-      dailyQuota?.resetsAt ?? computeWindowResetsAt(now, ANTIGRAVITY_LIMIT_CONSTANTS.DAILY_MINS);
+    const weeklyUsedPercent = weeklyQuota?.usedPercent ?? 0;
+    const weeklyResetsAt =
+      weeklyQuota?.resetsAt ?? computeWindowResetsAt(now, ANTIGRAVITY_LIMIT_CONSTANTS.WEEKLY_MINS);
 
     const windows: ServerProviderUsageWindow[] = [
       {
@@ -548,34 +780,29 @@ export function makeAntigravityUsageLimits(
         resetsAt: sessionResetsAt,
       },
       {
-        id: ANTIGRAVITY_WINDOW_IDS.DAILY,
+        id: ANTIGRAVITY_WINDOW_IDS.WEEKLY,
         kind: "weekly",
-        label: "Daily",
-        usedPercent: dailyUsedPercent,
-        windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.DAILY_MINS,
-        resetsAt: dailyResetsAt,
+        label: "Weekly",
+        usedPercent: weeklyUsedPercent,
+        windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.WEEKLY_MINS,
+        resetsAt: weeklyResetsAt,
       },
     ];
 
-    // Append model-scoped windows for transparency
-    const keyModels = liveQuota.models.filter(
-      (m) =>
-        /claude-sonnet|claude-opus/i.test(m.modelId) ||
-        /gemini-(?:3\.1|2\.5)-pro/i.test(m.modelId) ||
-        /gemini-3-flash\b/i.test(m.modelId),
+    // If Claude & GPT weekly bucket exists and is distinct from primary, add it
+    const thirdPartyWeekly = liveQuota.buckets?.find(
+      (b) =>
+        (b.bucketId === "3p-weekly" || /3p|claude/i.test(b.groupName)) && b.window === "weekly",
     );
-
-    for (const m of keyModels) {
-      if (m.resetsAt) {
-        windows.push({
-          id: `antigravity_${m.modelId.replace(/[^a-zA-Z0-9_-]/g, "_")}`,
-          kind: "session",
-          label: m.label,
-          usedPercent: m.usedPercent,
-          windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.SESSION_MINS,
-          resetsAt: m.resetsAt,
-        });
-      }
+    if (thirdPartyWeekly && thirdPartyWeekly.resetsAt) {
+      windows.push({
+        id: "antigravity_3p_weekly",
+        kind: "weekly",
+        label: "Weekly · Claude & GPT",
+        usedPercent: thirdPartyWeekly.usedPercent,
+        windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.WEEKLY_MINS,
+        resetsAt: thirdPartyWeekly.resetsAt,
+      });
     }
 
     return makeUsageLimits({ checkedAt, windows });
@@ -591,12 +818,16 @@ export function makeAntigravityUsageLimits(
   const sessionResetsAt =
     input?.sessionResetsAt ?? computeWindowResetsAt(now, ANTIGRAVITY_LIMIT_CONSTANTS.SESSION_MINS);
 
-  const dailyLimit =
-    input?.dailyTokenLimit ?? ANTIGRAVITY_LIMIT_CONSTANTS.DEFAULT_DAILY_TOKEN_LIMIT;
-  const dailyUsed = input?.dailyTokensUsed ?? 0;
-  const dailyUsedPercent = clampPercent(Math.round((dailyUsed / Math.max(1, dailyLimit)) * 100));
-  const dailyResetsAt =
-    input?.dailyResetsAt ?? computeWindowResetsAt(now, ANTIGRAVITY_LIMIT_CONSTANTS.DAILY_MINS);
+  const weeklyLimit =
+    input?.weeklyTokenLimit ??
+    input?.dailyTokenLimit ??
+    ANTIGRAVITY_LIMIT_CONSTANTS.DEFAULT_WEEKLY_TOKEN_LIMIT;
+  const weeklyUsed = input?.weeklyTokensUsed ?? input?.dailyTokensUsed ?? 0;
+  const weeklyUsedPercent = clampPercent(Math.round((weeklyUsed / Math.max(1, weeklyLimit)) * 100));
+  const weeklyResetsAt =
+    input?.weeklyResetsAt ??
+    input?.dailyResetsAt ??
+    computeWindowResetsAt(now, ANTIGRAVITY_LIMIT_CONSTANTS.WEEKLY_MINS);
 
   const windows: ServerProviderUsageWindow[] = [
     {
@@ -608,12 +839,12 @@ export function makeAntigravityUsageLimits(
       resetsAt: sessionResetsAt,
     },
     {
-      id: ANTIGRAVITY_WINDOW_IDS.DAILY,
+      id: ANTIGRAVITY_WINDOW_IDS.WEEKLY,
       kind: "weekly",
-      label: "Daily",
-      usedPercent: dailyUsedPercent,
-      windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.DAILY_MINS,
-      resetsAt: dailyResetsAt,
+      label: "Weekly",
+      usedPercent: weeklyUsedPercent,
+      windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.WEEKLY_MINS,
+      resetsAt: weeklyResetsAt,
     },
   ];
 
@@ -633,6 +864,9 @@ export function makeAntigravityUsageLimitsUpdate(input: {
   readonly dailyTokensUsed?: number | undefined;
   readonly dailyTokenLimit?: number | undefined;
   readonly dailyResetsAt?: string | undefined;
+  readonly weeklyTokensUsed?: number | undefined;
+  readonly weeklyTokenLimit?: number | undefined;
+  readonly weeklyResetsAt?: string | undefined;
   readonly rateLimited?: boolean | undefined;
 }): ProviderUsageLimitsUpdate {
   const now = DateTime.nowUnsafe();
@@ -660,15 +894,15 @@ export function makeAntigravityUsageLimitsUpdate(input: {
             : {}),
       },
       {
-        id: ANTIGRAVITY_WINDOW_IDS.DAILY,
+        id: ANTIGRAVITY_WINDOW_IDS.WEEKLY,
         kind: "weekly",
-        label: "Daily",
+        label: "Weekly",
         usedPercent: 100,
-        windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.DAILY_MINS,
-        ...(input.dailyResetsAt
-          ? { resetsAt: input.dailyResetsAt }
-          : liveQuota?.dailyQuota?.resetsAt
-            ? { resetsAt: liveQuota.dailyQuota.resetsAt }
+        windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.WEEKLY_MINS,
+        ...((input.weeklyResetsAt ?? input.dailyResetsAt)
+          ? { resetsAt: (input.weeklyResetsAt ?? input.dailyResetsAt)! }
+          : (liveQuota?.weeklyQuota ?? liveQuota?.dailyQuota)?.resetsAt
+            ? { resetsAt: (liveQuota?.weeklyQuota ?? liveQuota?.dailyQuota)!.resetsAt }
             : {}),
       },
     ];
@@ -678,7 +912,7 @@ export function makeAntigravityUsageLimitsUpdate(input: {
   // If live quota is known, preserve live quota percentage
   if (liveQuota) {
     const sessionPercent = liveQuota.sessionQuota?.usedPercent ?? 0;
-    const dailyPercent = liveQuota.dailyQuota?.usedPercent ?? 0;
+    const weeklyPercent = (liveQuota.weeklyQuota ?? liveQuota.dailyQuota)?.usedPercent ?? 0;
 
     const windows: ServerProviderUsageWindow[] = [
       {
@@ -690,14 +924,32 @@ export function makeAntigravityUsageLimitsUpdate(input: {
         ...(liveQuota.sessionQuota?.resetsAt ? { resetsAt: liveQuota.sessionQuota.resetsAt } : {}),
       },
       {
-        id: ANTIGRAVITY_WINDOW_IDS.DAILY,
+        id: ANTIGRAVITY_WINDOW_IDS.WEEKLY,
         kind: "weekly",
-        label: "Daily",
-        usedPercent: dailyPercent,
-        windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.DAILY_MINS,
-        ...(liveQuota.dailyQuota?.resetsAt ? { resetsAt: liveQuota.dailyQuota.resetsAt } : {}),
+        label: "Weekly",
+        usedPercent: weeklyPercent,
+        windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.WEEKLY_MINS,
+        ...((liveQuota.weeklyQuota ?? liveQuota.dailyQuota)?.resetsAt
+          ? { resetsAt: (liveQuota.weeklyQuota ?? liveQuota.dailyQuota)!.resetsAt }
+          : {}),
       },
     ];
+
+    const thirdPartyWeekly = liveQuota.buckets?.find(
+      (b) =>
+        (b.bucketId === "3p-weekly" || /3p|claude/i.test(b.groupName)) && b.window === "weekly",
+    );
+    if (thirdPartyWeekly && thirdPartyWeekly.resetsAt) {
+      windows.push({
+        id: "antigravity_3p_weekly",
+        kind: "weekly",
+        label: "Weekly · Claude & GPT",
+        usedPercent: thirdPartyWeekly.usedPercent,
+        windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.WEEKLY_MINS,
+        resetsAt: thirdPartyWeekly.resetsAt,
+      });
+    }
+
     return { windows };
   }
 
@@ -707,9 +959,12 @@ export function makeAntigravityUsageLimitsUpdate(input: {
   const sessionUsed = input.sessionTokensUsed ?? 0;
   const sessionPercent = clampPercent(Math.round((sessionUsed / Math.max(1, sessionLimit)) * 100));
 
-  const dailyLimit = input.dailyTokenLimit ?? ANTIGRAVITY_LIMIT_CONSTANTS.DEFAULT_DAILY_TOKEN_LIMIT;
-  const dailyUsed = input.dailyTokensUsed ?? 0;
-  const dailyPercent = clampPercent(Math.round((dailyUsed / Math.max(1, dailyLimit)) * 100));
+  const weeklyLimit =
+    input.weeklyTokenLimit ??
+    input.dailyTokenLimit ??
+    ANTIGRAVITY_LIMIT_CONSTANTS.DEFAULT_WEEKLY_TOKEN_LIMIT;
+  const weeklyUsed = input.weeklyTokensUsed ?? input.dailyTokensUsed ?? 0;
+  const weeklyPercent = clampPercent(Math.round((weeklyUsed / Math.max(1, weeklyLimit)) * 100));
 
   const windows: ServerProviderUsageWindow[] = [
     {
@@ -721,12 +976,14 @@ export function makeAntigravityUsageLimitsUpdate(input: {
       ...(input.sessionResetsAt ? { resetsAt: input.sessionResetsAt } : {}),
     },
     {
-      id: ANTIGRAVITY_WINDOW_IDS.DAILY,
+      id: ANTIGRAVITY_WINDOW_IDS.WEEKLY,
       kind: "weekly",
-      label: "Daily",
-      usedPercent: dailyPercent,
-      windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.DAILY_MINS,
-      ...(input.dailyResetsAt ? { resetsAt: input.dailyResetsAt } : {}),
+      label: "Weekly",
+      usedPercent: weeklyPercent,
+      windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.WEEKLY_MINS,
+      ...((input.weeklyResetsAt ?? input.dailyResetsAt)
+        ? { resetsAt: (input.weeklyResetsAt ?? input.dailyResetsAt)! }
+        : {}),
     },
   ];
 

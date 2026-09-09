@@ -15,7 +15,7 @@ describe("antigravityUsageLimits", () => {
     resetAntigravityLiveQuotaCacheForTesting();
   });
 
-  it("builds initial limits with session and daily windows", () => {
+  it("builds initial limits with session and weekly windows", () => {
     const limits = makeAntigravityUsageLimits();
     expect(limits.windows).toHaveLength(2);
 
@@ -27,13 +27,13 @@ describe("antigravityUsageLimits", () => {
     expect(session?.usedPercent).toBe(0);
     expect(session?.resetsAt).toBeDefined();
 
-    const daily = limits.windows.find((w) => w.id === ANTIGRAVITY_WINDOW_IDS.DAILY);
-    expect(daily).toBeDefined();
-    expect(daily?.kind).toBe("weekly");
-    expect(daily?.label).toBe("Daily");
-    expect(daily?.windowDurationMins).toBe(ANTIGRAVITY_LIMIT_CONSTANTS.DAILY_MINS);
-    expect(daily?.usedPercent).toBe(0);
-    expect(daily?.resetsAt).toBeDefined();
+    const weekly = limits.windows.find((w) => w.id === ANTIGRAVITY_WINDOW_IDS.WEEKLY);
+    expect(weekly).toBeDefined();
+    expect(weekly?.kind).toBe("weekly");
+    expect(weekly?.label).toBe("Weekly");
+    expect(weekly?.windowDurationMins).toBe(ANTIGRAVITY_LIMIT_CONSTANTS.WEEKLY_MINS);
+    expect(weekly?.usedPercent).toBe(0);
+    expect(weekly?.resetsAt).toBeDefined();
   });
 
   it("calculates accurate used percentages from tokens used in fallback mode", () => {
@@ -47,25 +47,105 @@ describe("antigravityUsageLimits", () => {
     const session = limits.windows.find((w) => w.id === ANTIGRAVITY_WINDOW_IDS.SESSION);
     expect(session?.usedPercent).toBe(50);
 
-    const daily = limits.windows.find((w) => w.id === ANTIGRAVITY_WINDOW_IDS.DAILY);
-    expect(daily?.usedPercent).toBe(50);
+    const weekly = limits.windows.find((w) => w.id === ANTIGRAVITY_WINDOW_IDS.WEEKLY);
+    expect(weekly?.usedPercent).toBe(50);
   });
 
   it("creates updates with rateLimited flag setting 100%", () => {
     const update = makeAntigravityUsageLimitsUpdate({
       rateLimited: true,
       sessionResetsAt: "2026-09-06T20:00:00.000Z",
+      weeklyResetsAt: "2026-09-13T20:00:00.000Z",
     });
 
     const session = update.windows.find((w) => w.id === ANTIGRAVITY_WINDOW_IDS.SESSION);
     expect(session?.usedPercent).toBe(100);
     expect(session?.resetsAt).toBe("2026-09-06T20:00:00.000Z");
 
-    const daily = update.windows.find((w) => w.id === ANTIGRAVITY_WINDOW_IDS.DAILY);
-    expect(daily?.usedPercent).toBe(100);
+    const weekly = update.windows.find((w) => w.id === ANTIGRAVITY_WINDOW_IDS.WEEKLY);
+    expect(weekly?.usedPercent).toBe(100);
+    expect(weekly?.resetsAt).toBe("2026-09-13T20:00:00.000Z");
   });
 
-  it("correctly parses Google Cloud Code fetchAvailableModels payload", () => {
+  it("correctly parses Google Cloud Code retrieveUserQuotaSummary payload", () => {
+    const quotaSummaryPayload = {
+      groups: [
+        {
+          displayName: "Gemini Models",
+          description: "Models within this group: Gemini Flash, Gemini Pro",
+          buckets: [
+            {
+              bucketId: "gemini-weekly",
+              displayName: "Weekly Limit Remaining",
+              window: "weekly",
+              resetTime: "2026-09-10T10:41:32Z",
+              description:
+                "You have used some of your weekly limit, it will fully refresh in 1 day, 7 hours.",
+              remainingFraction: 0.9624469,
+            },
+            {
+              bucketId: "gemini-5h",
+              displayName: "Five Hour Limit Remaining",
+              window: "5h",
+              resetTime: "2026-09-09T08:01:51Z",
+              remainingFraction: 1,
+            },
+          ],
+        },
+        {
+          displayName: "Claude and GPT models",
+          description: "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+          buckets: [
+            {
+              bucketId: "3p-weekly",
+              displayName: "Weekly Limit Remaining",
+              window: "weekly",
+              resetTime: "2026-09-10T12:54:28Z",
+              description:
+                "You have used some of your weekly limit, it will fully refresh in 1 day, 9 hours.",
+              remainingFraction: 0.9985625,
+            },
+            {
+              bucketId: "3p-5h",
+              displayName: "Five Hour Limit Remaining",
+              window: "5h",
+              resetTime: "2026-09-09T08:01:51Z",
+              remainingFraction: 1,
+            },
+          ],
+        },
+      ],
+    };
+
+    const parsed = parseAntigravityQuotaPayload(
+      quotaSummaryPayload,
+      "2026-09-07T10:00:00.000Z",
+      "user2146name@gmail.com",
+    );
+    expect(parsed).not.toBeNull();
+    expect(parsed?.checkedAt).toBe("2026-09-07T10:00:00.000Z");
+    expect(parsed?.userEmail).toBe("user2146name@gmail.com");
+
+    // Session quota tracks gemini-5h
+    expect(parsed?.sessionQuota?.bucketId).toBe("gemini-5h");
+    expect(parsed?.sessionQuota?.remainingFraction).toBe(1);
+    expect(parsed?.sessionQuota?.usedPercent).toBe(0);
+    expect(parsed?.sessionQuota?.resetsAt).toBe("2026-09-09T08:01:51Z");
+
+    // Weekly quota tracks gemini-weekly
+    expect(parsed?.weeklyQuota?.bucketId).toBe("gemini-weekly");
+    expect(parsed?.weeklyQuota?.remainingFraction).toBe(0.9624469);
+    expect(parsed?.weeklyQuota?.usedPercent).toBe(4); // (1 - 0.9624469) * 100 = ~3.75 -> 4
+    expect(parsed?.weeklyQuota?.resetsAt).toBe("2026-09-10T10:41:32Z");
+
+    // Buckets include all 4 buckets
+    expect(parsed?.buckets).toHaveLength(4);
+    const claudeWeekly = parsed?.buckets?.find((b) => b.bucketId === "3p-weekly");
+    expect(claudeWeekly).toBeDefined();
+    expect(claudeWeekly?.resetsAt).toBe("2026-09-10T12:54:28Z");
+  });
+
+  it("correctly parses fallback Google Cloud Code fetchAvailableModels payload", () => {
     const samplePayload = {
       models: {
         "gemini-3.1-pro-high": {
@@ -105,30 +185,47 @@ describe("antigravityUsageLimits", () => {
     expect(parsed?.sessionQuota?.usedPercent).toBe(40); // (1 - 0.6) * 100
     expect(parsed?.sessionQuota?.resetsAt).toBe("2026-09-07T14:30:00Z");
 
-    // Daily quota tracks Flash
-    expect(parsed?.dailyQuota?.modelId).toBe("gemini-3-flash");
-    expect(parsed?.dailyQuota?.remainingFraction).toBe(1.0);
-    expect(parsed?.dailyQuota?.usedPercent).toBe(0); // (1 - 1.0) * 100
-    expect(parsed?.dailyQuota?.resetsAt).toBe("2026-09-08T00:00:00Z");
+    // Weekly quota tracks Flash in fallback mode
+    expect(parsed?.weeklyQuota?.modelId).toBe("gemini-3-flash");
+    expect(parsed?.weeklyQuota?.remainingFraction).toBe(1.0);
+    expect(parsed?.weeklyQuota?.usedPercent).toBe(0); // (1 - 1.0) * 100
+    expect(parsed?.weeklyQuota?.resetsAt).toBe("2026-09-08T00:00:00Z");
   });
 
   it("builds limits and updates from live Google quota data", () => {
     const liveQuota = {
       checkedAt: "2026-09-07T10:00:00.000Z",
       sessionQuota: {
-        modelId: "claude-sonnet-4-6",
-        label: "Claude Sonnet 4.6",
+        bucketId: "gemini-5h",
+        modelId: "gemini-5h",
+        label: "Five Hour Limit Remaining",
+        groupName: "Gemini Models",
+        window: "5h",
         remainingFraction: 0.75,
         usedPercent: 25,
         resetsAt: "2026-09-07T15:00:00Z",
       },
-      dailyQuota: {
-        modelId: "gemini-3-flash",
-        label: "Gemini 3 Flash",
+      weeklyQuota: {
+        bucketId: "gemini-weekly",
+        modelId: "gemini-weekly",
+        label: "Weekly Limit Remaining",
+        groupName: "Gemini Models",
+        window: "weekly",
         remainingFraction: 0.9,
         usedPercent: 10,
-        resetsAt: "2026-09-08T00:00:00Z",
+        resetsAt: "2026-09-10T10:00:00Z",
       },
+      buckets: [
+        {
+          bucketId: "3p-weekly",
+          label: "Weekly Limit Remaining",
+          groupName: "Claude and GPT models",
+          window: "weekly",
+          remainingFraction: 1.0,
+          usedPercent: 0,
+          resetsAt: "2026-09-10T12:00:00Z",
+        },
+      ],
       models: [
         {
           modelId: "claude-sonnet-4-6",
@@ -147,9 +244,15 @@ describe("antigravityUsageLimits", () => {
     expect(session?.usedPercent).toBe(25);
     expect(session?.resetsAt).toBe("2026-09-07T15:00:00Z");
 
-    const daily = limits.windows.find((w) => w.id === ANTIGRAVITY_WINDOW_IDS.DAILY);
-    expect(daily?.usedPercent).toBe(10);
-    expect(daily?.resetsAt).toBe("2026-09-08T00:00:00Z");
+    const weekly = limits.windows.find((w) => w.id === ANTIGRAVITY_WINDOW_IDS.WEEKLY);
+    expect(weekly?.usedPercent).toBe(10);
+    expect(weekly?.resetsAt).toBe("2026-09-10T10:00:00Z");
+
+    const thirdParty = limits.windows.find((w) => w.id === "antigravity_3p_weekly");
+    expect(thirdParty).toBeDefined();
+    expect(thirdParty?.label).toBe("Weekly · Claude & GPT");
+    expect(thirdParty?.usedPercent).toBe(0);
+    expect(thirdParty?.resetsAt).toBe("2026-09-10T12:00:00Z");
 
     // Also verify mid-turn update preserves the real quota instead of token counts
     const update = makeAntigravityUsageLimitsUpdate({

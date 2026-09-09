@@ -202,7 +202,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
         auth: {
           status: isSavedAuth ? "authenticated" : "unknown",
           type: options.auth?.type ?? "oauth-personal",
-          label: options.auth?.label ?? "Google account",
+          ...(isSavedAuth ? { label: options.auth?.label ?? "Google account" } : {}),
         },
         ...(initialMessage ? { message: initialMessage } : {}),
         usageLimits: isSavedAuth
@@ -301,7 +301,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           auth: {
             status: authenticated ? "authenticated" : draft.auth.status,
             type: options.auth?.type ?? "oauth-personal",
-            label: options.auth?.label ?? "Google account",
+            ...(authenticated ? { label: options.auth?.label ?? "Google account" } : {}),
             ...(liveQuota?.userEmail || draft.auth.email
               ? { email: (liveQuota?.userEmail ?? draft.auth.email)! }
               : {}),
