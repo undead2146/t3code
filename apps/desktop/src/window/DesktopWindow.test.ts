@@ -277,6 +277,10 @@ function makeTestLayer(input: {
     main: Ref.get(input.mainWindow),
     currentMainOrFirst: Ref.get(input.mainWindow),
     focusedMainOrFirst: Ref.get(input.mainWindow),
+    findByWebContentsId: (webContentsId) =>
+      Ref.get(input.mainWindow).pipe(
+        Effect.map(Option.filter((win) => win.webContents?.id === webContentsId)),
+      ),
     setMain: (window) => Ref.set(input.mainWindow, Option.some(window)),
     clearMain: () => Ref.set(input.mainWindow, Option.none()),
     prepareReveal: () => Effect.succeed(false),
@@ -391,6 +395,10 @@ const makeSplashScenario = (createOutcomes: readonly (Electron.BrowserWindow | n
       main: Ref.get(mainWindow),
       currentMainOrFirst,
       focusedMainOrFirst: currentMainOrFirst,
+      findByWebContentsId: (webContentsId) =>
+        Ref.get(mainWindow).pipe(
+          Effect.map(Option.filter((win) => win.webContents?.id === webContentsId)),
+        ),
       setMain: (window) => Ref.set(mainWindow, Option.some(window)),
       clearMain: () => Ref.set(mainWindow, Option.none()),
       prepareReveal: () => Effect.succeed(false),

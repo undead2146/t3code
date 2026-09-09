@@ -1,0 +1,824 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>T3 Code Upstream Synchronization Plan & Merge Assessment</title>
+    <style>
+      :root {
+        --bg: #000000;
+        --card-bg: #0d0d0d;
+        --card-alt: #141414;
+        --card-hover: #1c1c1c;
+        --border: #262626;
+        --border-accent: #3b3b3b;
+        --text: #ededed;
+        --text-muted: #8e8e8e;
+        --text-dim: #606060;
+        --cyan: #38bdf8;
+        --cyan-dim: #075985;
+        --green: #34d399;
+        --green-dim: #064e3b;
+        --amber: #fbbf24;
+        --amber-dim: #78350f;
+        --red: #f87171;
+        --red-dim: #7f1d1d;
+        --purple: #c084fc;
+        --purple-dim: #581c87;
+        --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        --font-sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        background-color: var(--bg);
+        color: var(--text);
+        font-family: var(--font-sans);
+        font-size: 14px;
+        line-height: 1.55;
+        letter-spacing: -0.01em;
+        padding: 32px 20px 80px;
+      }
+
+      .container {
+        max-width: 1040px;
+        margin: 0 auto;
+      }
+
+      header {
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 24px;
+        margin-bottom: 32px;
+      }
+
+      .meta-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 16px;
+        margin-bottom: 12px;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+        font-family: var(--font-mono);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+
+      .badge-cyan {
+        background: #0c4a6e;
+        color: #7dd3fc;
+        border: 1px solid #0284c7;
+      }
+      .badge-amber {
+        background: #451a03;
+        color: #fde68a;
+        border: 1px solid #b45309;
+      }
+      .badge-red {
+        background: #450a0a;
+        color: #fca5a5;
+        border: 1px solid #b91c1c;
+      }
+      .badge-green {
+        background: #022c22;
+        color: #a7f3d0;
+        border: 1px solid #047857;
+      }
+      .badge-purple {
+        background: #3b0764;
+        color: #e9d5ff;
+        border: 1px solid #7e22ce;
+      }
+
+      h1 {
+        font-size: 24px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        margin-bottom: 8px;
+        color: #ffffff;
+      }
+
+      h2 {
+        font-size: 17px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        color: #ffffff;
+        margin: 36px 0 16px;
+        padding-bottom: 8px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      h3 {
+        font-size: 14px;
+        font-weight: 600;
+        color: #f1f1f1;
+        margin: 16px 0 8px;
+      }
+
+      p {
+        color: #cccccc;
+        margin-bottom: 12px;
+      }
+
+      .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 12px;
+        margin: 20px 0;
+      }
+
+      .stat-card {
+        background: var(--card-bg);
+        border: 1px solid var(--border);
+        padding: 14px 16px;
+        border-radius: 6px;
+      }
+
+      .stat-label {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        font-family: var(--font-mono);
+        margin-bottom: 6px;
+      }
+
+      .stat-value {
+        font-size: 22px;
+        font-weight: 700;
+        font-family: var(--font-mono);
+        color: #ffffff;
+      }
+
+      .stat-sub {
+        font-size: 11px;
+        color: var(--text-dim);
+        margin-top: 4px;
+      }
+
+      .callout {
+        background: var(--card-bg);
+        border: 1px solid var(--border);
+        border-left: 3px solid var(--border-accent);
+        padding: 14px 16px;
+        border-radius: 4px;
+        margin: 16px 0;
+      }
+
+      .callout-amber {
+        border-left-color: var(--amber);
+        background: rgba(251, 191, 36, 0.03);
+      }
+
+      .callout-red {
+        border-left-color: var(--red);
+        background: rgba(239, 68, 68, 0.03);
+      }
+
+      .callout-cyan {
+        border-left-color: var(--cyan);
+        background: rgba(56, 189, 248, 0.03);
+      }
+
+      .callout-title {
+        font-size: 12px;
+        font-weight: 700;
+        font-family: var(--font-mono);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-bottom: 6px;
+      }
+
+      .callout-amber .callout-title {
+        color: var(--amber);
+      }
+      .callout-red .callout-title {
+        color: var(--red);
+      }
+      .callout-cyan .callout-title {
+        color: var(--cyan);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+        margin: 16px 0;
+        background: var(--card-bg);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        overflow: hidden;
+      }
+
+      th,
+      td {
+        padding: 10px 12px;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--border);
+      }
+
+      th {
+        font-family: var(--font-mono);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        background: var(--card-alt);
+        border-bottom: 1px solid var(--border-accent);
+      }
+
+      tr:last-child td {
+        border-bottom: none;
+      }
+
+      tr:hover td {
+        background: var(--card-hover);
+      }
+
+      code {
+        font-family: var(--font-mono);
+        font-size: 12px;
+        background: #171717;
+        padding: 2px 5px;
+        border-radius: 4px;
+        border: 1px solid #292929;
+        color: #e5e5e5;
+      }
+
+      pre {
+        font-family: var(--font-mono);
+        font-size: 12px;
+        background: #0d0d0d;
+        border: 1px solid var(--border);
+        padding: 12px 14px;
+        border-radius: 6px;
+        overflow-x: auto;
+        margin: 12px 0;
+        color: #d4d4d4;
+        line-height: 1.45;
+      }
+
+      ul,
+      ol {
+        padding-left: 20px;
+        margin: 8px 0 16px;
+        color: #cccccc;
+      }
+
+      li {
+        margin-bottom: 6px;
+      }
+
+      .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+        gap: 12px;
+        margin: 16px 0;
+      }
+
+      .feature-card {
+        background: var(--card-bg);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 16px;
+        transition: border-color 0.15s ease;
+      }
+
+      .feature-card:hover {
+        border-color: var(--border-accent);
+      }
+
+      .feature-card h4 {
+        font-size: 13px;
+        font-weight: 600;
+        color: #ffffff;
+        margin-bottom: 6px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .feature-card p {
+        font-size: 12px;
+        color: var(--text-muted);
+        margin-bottom: 8px;
+        line-height: 1.45;
+      }
+
+      .diff-add {
+        color: var(--green);
+      }
+      .diff-sub {
+        color: var(--red);
+      }
+      .diff-mod {
+        color: var(--amber);
+      }
+
+      .step-list {
+        list-style: none;
+        padding-left: 0;
+        counter-reset: step-counter;
+        margin: 20px 0;
+      }
+
+      .step-item {
+        position: relative;
+        padding-left: 44px;
+        margin-bottom: 24px;
+      }
+
+      .step-item::before {
+        counter-increment: step-counter;
+        content: counter(step-counter);
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 28px;
+        height: 28px;
+        background: var(--card-alt);
+        border: 1px solid var(--border-accent);
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--text);
+      }
+
+      .step-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: #ffffff;
+        margin-bottom: 4px;
+      }
+
+      .step-desc {
+        font-size: 13px;
+        color: #b0b0b0;
+        margin-bottom: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <div class="meta-row">
+          <span>TARGET: upstream/main (3e6f856f)</span>
+          <span>MERGE BASE: cb9a6942</span>
+          <span>ENVIRONMENT: Windows Workstation / Antigravity</span>
+          <span>DATE: 2026-09-09</span>
+        </div>
+        <h1>T3 Code Upstream Synchronization Plan & Merge Assessment</h1>
+        <p>
+          Analysis of 271 upstream commits, divergence audit of 75 local commits, fast-forward
+          feasibility evaluation, and conflict resolution roadmap.
+        </p>
+      </header>
+
+      <main>
+        <section>
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">Upstream Commits</div>
+              <div class="stat-value diff-add">+271</div>
+              <div class="stat-sub">Commits behind upstream/main</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Local Commits</div>
+              <div class="stat-value diff-mod">+75</div>
+              <div class="stat-sub">Commits ahead of merge base</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Conflict Files</div>
+              <div class="stat-value diff-sub">21</div>
+              <div class="stat-sub">Simulated via git merge-tree</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Fast-Forward Feasibility</div>
+              <div class="stat-value diff-sub">IMPOSSIBLE</div>
+              <div class="stat-sub">Branches have diverged</div>
+            </div>
+          </div>
+
+          <div class="callout callout-amber">
+            <div class="callout-title">Fast-Forward Analysis: Why ff-only Fails</div>
+            <p>
+              Local <code>main</code> and <code>upstream/main</code> have diverged from the common
+              ancestor <code>cb9a6942363ed7f097c7d1fb075bf3a265fbf5d2</code>. A fast-forward merge
+              (<code>git merge --ff-only upstream/main</code>) requires local <code>main</code> to
+              be a direct ancestor of upstream. Because local contains 75 distinct commits that do
+              not exist upstream, Git will reject fast-forwarding with
+              <code>fatal: Not possible to fast-forward, aborting</code>.
+            </p>
+            <p>
+              <strong>Destructive Reset Warning:</strong> Attempting to "force fast-forward" via
+              <code>git reset --hard upstream/main</code> would permanently destroy all 75 custom
+              commits, wiping out the Google Antigravity ACP integration, Subagent live tracking and
+              kill controls, custom model routing, context window metering, and Windows fixes. A
+              <strong>3-way Git merge</strong> is strictly required.
+            </p>
+          </div>
+        </section>
+
+        <section>
+          <h2>1. What Is New in Upstream (271 Commits)</h2>
+          <p>
+            Upstream has undergone a major platform milestone including compiler upgrades,
+            architectural dead-code elimination, desktop screenshot tooling, and UX overhauls.
+          </p>
+
+          <div class="feature-grid">
+            <div class="feature-card">
+              <h4>
+                <span class="badge badge-purple">Core Runtime</span> TypeScript 7.0.2 & Effect
+                rc.112
+              </h4>
+              <p>
+                Upgraded to TypeScript 7.0.2 and Effect rc.112 with Alchemy beta.76. Migrated tagged
+                errors from <code>Schema.TaggedErrorClass</code> to <code>Schema.TaggedError</code>.
+                Comprehensive Knip pass classified dozens of module exports to private package
+                scope.
+              </p>
+            </div>
+            <div class="feature-card">
+              <h4><span class="badge badge-cyan">New Feature</span> SnapShot Desktop Tool</h4>
+              <p>
+                Native desktop visual capture system. Includes native Rust binaries for Hyprland and
+                KDE Wayland capture (<code>native/hyprland-snap-shot</code>,
+                <code>native/kde-snap-shot</code>), Mac/Windows window capture, audio feedback
+                (click/whoosh sounds), zoom overlays, and composer integration.
+              </p>
+            </div>
+            <div class="feature-card">
+              <h4>
+                <span class="badge badge-cyan">New Feature</span> Multi-Machine Load Balancing
+              </h4>
+              <p>
+                Added weighted load balancing across connected backend machines
+                (<code>useLoadBalancedEnvironment.ts</code>,
+                <code>LoadBalancingSettings.tsx</code>). Allows distributing new threads according
+                to machine capacity.
+              </p>
+            </div>
+            <div class="feature-card">
+              <h4><span class="badge badge-cyan">New Feature</span> Pooled Usage Limits</h4>
+              <p>
+                Introduced pooled subscription limits (<code>UsageLimitsPooled.tsx</code>) and an
+                interactive <code>/usage-limits</code> slash command. Aggregates reset credits and
+                capacity across multiple provider instances.
+              </p>
+            </div>
+            <div class="feature-card">
+              <h4>
+                <span class="badge badge-green">Web & Sidebar</span> Drag & Drop Thread Organization
+              </h4>
+              <p>
+                Sidebar drag-and-drop overhaul supporting cross-section moves, divider indicators,
+                persistent manual ordering of active threads, and direct file drops into sidebar
+                threads.
+              </p>
+            </div>
+            <div class="feature-card">
+              <h4>
+                <span class="badge badge-green">Chat & Timeline</span> Question Attachments & Turn
+                Navigation
+              </h4>
+              <p>
+                Users can now attach files and images directly to interactive agent question
+                answers. Added previous/next turn navigation in the timeline minimap, markdown image
+                gallery viewers, and dismissible questions without replying.
+              </p>
+            </div>
+            <div class="feature-card">
+              <h4>
+                <span class="badge badge-purple">Settings</span> Project Defaults & Scoped Overrides
+              </h4>
+              <p>
+                Project defaults for model selection, project scripts, and auto-pull behavior, with
+                per-project override capabilities in
+                <code>packages/contracts/src/settings.ts</code>.
+              </p>
+            </div>
+            <div class="feature-card">
+              <h4><span class="badge badge-cyan">Mobile App</span> Material You & Multi-Drafts</h4>
+              <p>
+                Added dynamic Material You layout with Android wallpaper color theming, branch-based
+                thread creation, multiple new-task drafts per project, and updated app versioning
+                (1.1.1).
+              </p>
+            </div>
+            <div class="feature-card">
+              <h4>
+                <span class="badge badge-amber">Stability</span> Windows Terminal & Process Polling
+              </h4>
+              <p>
+                Resolved high CPU usage during terminal polling on Windows, fixed zombie process
+                cleanup on shutdown, and added index-lock detection during Git status scans.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h2>2. Merge Difficulty Assessment: Moderate (6.5 / 10)</h2>
+          <p>
+            The merge difficulty is rated <strong>Moderate (6.5/10)</strong>. While 271 commits is a
+            large delta, the conflicts are cleanly segmented into 21 files. The primary complexities
+            lie in adapting local code to <strong>Effect rc.112</strong> tagged error changes and
+            reconciling overlapping Antigravity driver improvements.
+          </p>
+
+          <table>
+            <thead>
+              <tr>
+                <th>Domain</th>
+                <th>Conflicted Files</th>
+                <th>Nature of Conflict</th>
+                <th>Complexity</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Contracts & RPC</strong></td>
+                <td>
+                  <code>packages/contracts/src/rpc.ts</code><br />
+                  <code>packages/contracts/src/provider.ts</code><br />
+                  <code>packages/contracts/src/settings.ts</code>
+                </td>
+                <td>
+                  Local added <code>providerEphemeralQuery</code> and subagent RPCs
+                  (<code>getSubagentTranscript</code>, <code>killSubagent</code>). Upstream
+                  converted <code>export const Ws...Rpc</code> to private <code>const</code> for
+                  Knip, migrated to <code>Schema.TaggedError</code>, and added
+                  SnapShot/LoadBalancing settings.
+                </td>
+                <td><span class="badge badge-green">Low</span></td>
+              </tr>
+              <tr>
+                <td><strong>Server & Antigravity</strong></td>
+                <td>
+                  <code>apps/server/src/ws.ts</code><br />
+                  <code>apps/server/src/provider/Drivers/AntigravityDriver.ts</code><br />
+                  <code>apps/server/src/provider/Drivers/AntigravitySkills.ts</code><br />
+                  <code>apps/server/src/provider/Layers/AntigravityProvider.ts</code><br />
+                  <code>apps/server/src/provider/Layers/ProviderSessionReaper.ts</code><br />
+                  <code>apps/server/src/provider/antigravityAuthSupport.ts</code>
+                </td>
+                <td>
+                  Both sides added user home resolution for skills (upstream via
+                  <code>resolveAntigravityUserHome</code>, local inline). Local added fast
+                  executable resolve probe, live quota telemetry, cached models, and session reaper
+                  guards for connecting threads.
+                </td>
+                <td><span class="badge badge-amber">Medium</span></td>
+              </tr>
+              <tr>
+                <td><strong>Web & Composer</strong></td>
+                <td>
+                  <code>apps/web/src/components/chat/ChatComposer.tsx</code><br />
+                  <code>apps/web/src/components/ChatView.tsx</code><br />
+                  <code>apps/web/src/components/ChatView.logic.ts</code><br />
+                  <code>apps/web/src/hooks/useHandleNewThread.test.ts</code>
+                </td>
+                <td>
+                  Upstream integrated SnapShot animations, question attachments, and removed
+                  blur-collapse. Local added <code>/btw</code> ephemeral query support, connecting
+                  phase indicators, and stalled activity detection.
+                </td>
+                <td><span class="badge badge-amber">Medium</span></td>
+              </tr>
+              <tr>
+                <td><strong>Desktop Application</strong></td>
+                <td>
+                  <code>apps/desktop/src/window/DesktopWindow.ts</code><br />
+                  <code>apps/desktop/src/app/DesktopLifecycle.test.ts</code><br />
+                  <code>apps/desktop/src/backend/DesktopBackendPool.test.ts</code><br />
+                  <code>apps/desktop/src/settings/DesktopClientSettings.test.ts</code><br />
+                  <code>apps/desktop/src/window/DesktopApplicationMenu.test.ts</code>
+                </td>
+                <td>
+                  Upstream refactored desktop tests and window exposure. Local had custom Windows
+                  fixes and menu test assertions.
+                </td>
+                <td><span class="badge badge-green">Low</span></td>
+              </tr>
+              <tr>
+                <td><strong>Mobile</strong></td>
+                <td>
+                  <code>apps/mobile/src/features/threads/threadListV2.ts</code><br />
+                  <code>apps/mobile/src/features/usage/UsageLimitsSection.tsx</code>
+                </td>
+                <td>
+                  Upstream added Material You styling and draft badges; local added Antigravity
+                  usage limits section and fleet icons.
+                </td>
+                <td><span class="badge badge-green">Low</span></td>
+              </tr>
+              <tr>
+                <td><strong>Scripts</strong></td>
+                <td>
+                  <code>scripts/clean-tsgo-backups.mjs</code>
+                </td>
+                <td>
+                  Modify/delete conflict. Upstream removed the script as dead code; local modified
+                  it. Resolution: delete.
+                </td>
+                <td><span class="badge badge-green">Trivial</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section>
+          <h2>3. Detailed Conflict Hotspot Inventory</h2>
+
+          <h3>Hotspot A: Effect rc.112 Tagged Error Syntax Migration</h3>
+          <p>
+            In <code>packages/contracts/src/provider.ts</code> and <code>settings.ts</code>, Effect
+            rc.112 replaced <code>Schema.TaggedErrorClass</code> with
+            <code>Schema.TaggedError</code>:
+          </p>
+          <pre><code>// Deprecated in Effect rc.112:
+export class ProviderEphemeralQueryError extends Schema.TaggedErrorClass&lt;ProviderEphemeralQueryError&gt;()(...)
+
+// Required in Effect rc.112:
+export class ProviderEphemeralQueryError extends Schema.TaggedError&lt;ProviderEphemeralQueryError&gt;()(...)</code></pre>
+          <p>
+            Any local error class must be updated to <code>Schema.TaggedError</code> during the
+            merge to pass compilation.
+          </p>
+
+          <h3>Hotspot B: Antigravity Skills and Driver Integration</h3>
+          <p>
+            Upstream created <code>resolveAntigravityUserHome(platform, processEnv)</code> in
+            <code>AntigravitySkills.ts</code> to locate <code>~/.gemini</code> skills. Local had
+            implemented inline home resolution and added fast executable resolve probing, cached
+            models, and live quota queries.
+          </p>
+          <div class="callout callout-cyan">
+            <div class="callout-title">Resolution Strategy</div>
+            <p>
+              Adopt upstream's formal <code>resolveAntigravityUserHome</code> helper while
+              preserving all local enhancements (cached models JSON read/write, live quota
+              streaming, and fast non-spawning probe).
+            </p>
+          </div>
+
+          <h3>Hotspot C: ChatComposer & Resting Behavior</h3>
+          <p>
+            Upstream eliminated <code>composerCollapseOnBlur</code> in favor of scroll-only resting
+            (<code>composerCollapseOnScroll</code>) and added SnapShot attachment frames and
+            question attachment staging. Local added the <code>isBtwCommand</code> check to allow
+            sending ephemeral questions while a thread is running.
+          </p>
+          <div class="callout callout-cyan">
+            <div class="callout-title">Resolution Strategy</div>
+            <p>
+              Accept upstream's improved resting composer layout and SnapShot frames. Re-inject
+              local's <code>parseBtwCommand(prompt)</code> handling and connecting phase indicators.
+            </p>
+          </div>
+        </section>
+
+        <section>
+          <h2>4. Step-by-Step Merge Execution Plan</h2>
+          <ol class="step-list">
+            <li class="step-item">
+              <div class="step-title">Create Dedicated Integration Branch</div>
+              <div class="step-desc">
+                Isolate the merge operation from <code>main</code> to prevent disruption.
+              </div>
+              <pre><code>git checkout -b chore/merge-upstream-main
+git merge --no-commit --no-ff upstream/main</code></pre>
+            </li>
+            <li class="step-item">
+              <div class="step-title">Delete Obsolete Scripts</div>
+              <div class="step-desc">Accept upstream deletion of dead maintenance scripts.</div>
+              <pre><code>git rm scripts/clean-tsgo-backups.mjs</code></pre>
+            </li>
+            <li class="step-item">
+              <div class="step-title">Resolve Contracts & RPC Schemas</div>
+              <div class="step-desc">
+                Reconcile <code>packages/contracts/src/rpc.ts</code>, <code>provider.ts</code>, and
+                <code>settings.ts</code>. Update tagged error classes to Effect rc.112 syntax.
+                Preserve local ephemeral query and subagent schemas alongside upstream SnapShot and
+                Load Balancing fields.
+              </div>
+            </li>
+            <li class="step-item">
+              <div class="step-title">Resolve Server & Antigravity Handlers</div>
+              <div class="step-desc">
+                Reconcile <code>apps/server/src/ws.ts</code> by keeping local subagent transcript,
+                subagent kill, and ephemeral query RPC handlers. In
+                <code>AntigravityDriver.ts</code> and <code>AntigravityProvider.ts</code>, combine
+                upstream's user home skill discovery with local live quota telemetry and cached
+                models.
+              </div>
+            </li>
+            <li class="step-item">
+              <div class="step-title">Resolve Web UI & Chat Components</div>
+              <div class="step-desc">
+                In <code>ChatComposer.tsx</code> and <code>ChatView.tsx</code>, accept upstream
+                SnapShot attachment frames and scroll collapse logic while retaining local
+                <code>isBtwCommand</code> support and stalled activity advisories.
+              </div>
+            </li>
+            <li class="step-item">
+              <div class="step-title">Resolve Desktop & Mobile Conflicts</div>
+              <div class="step-desc">
+                Align desktop window options and mobile thread list/usage limits sections with new
+                Material You tokens.
+              </div>
+            </li>
+            <li class="step-item">
+              <div class="step-title">Synchronize Package Dependencies & Typecheck</div>
+              <div class="step-desc">
+                Install dependencies against TypeScript 7.0.2 and Effect rc.112, then run workspace
+                type checking.
+              </div>
+              <pre><code>pnpm install
+pnpm typecheck</code></pre>
+            </li>
+            <li class="step-item">
+              <div class="step-title">Run Integration & Unit Tests</div>
+              <div class="step-desc">
+                Execute test suites to verify provider session management, orchestration, and
+                desktop lifecycle.
+              </div>
+              <pre><code>pnpm test:contracts
+pnpm test:server
+pnpm test:web</code></pre>
+            </li>
+            <li class="step-item">
+              <div class="step-title">Commit & Merge to Main</div>
+              <div class="step-desc">
+                Finalize the merge commit, verify on Windows workstation, and push to origin.
+              </div>
+              <pre><code>git commit -m "chore: merge upstream/main (TS 7.0.2, Effect rc.112, SnapShot, Load Balancing)"
+git checkout main
+git merge --ff-only chore/merge-upstream-main
+git push origin main</code></pre>
+            </li>
+          </ol>
+        </section>
+
+        <section>
+          <h2>5. Architectural Benefits Post-Merge</h2>
+          <div class="feature-grid">
+            <div class="feature-card">
+              <h4>Modern TypeScript 7 Ecosystem</h4>
+              <p>
+                Full alignment with latest TypeScript 7.0.2 type inference, faster typechecking
+                cycles, and cleaner codebase hygiene via Knip gates.
+              </p>
+            </div>
+            <div class="feature-card">
+              <h4>Native Visual SnapShot Capability</h4>
+              <p>
+                Agents gain cross-platform screenshot taking and UI inspection capabilities with
+                zero external dependencies.
+              </p>
+            </div>
+            <div class="feature-card">
+              <h4>Multi-Machine Scaling</h4>
+              <p>
+                Seamless thread dispatching across LAN and cloud servers with configurable weight
+                policies.
+              </p>
+            </div>
+            <div class="feature-card">
+              <h4>Cleaner Composer UX</h4>
+              <p>
+                Eliminates abrupt composer blur-collapses on desktop and allows attaching files
+                directly to agent questions.
+              </p>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

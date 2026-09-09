@@ -115,6 +115,9 @@ export class ElectronWindow extends Context.Service<
     readonly main: Effect.Effect<Option.Option<Electron.BrowserWindow>>;
     readonly currentMainOrFirst: Effect.Effect<Option.Option<Electron.BrowserWindow>>;
     readonly focusedMainOrFirst: Effect.Effect<Option.Option<Electron.BrowserWindow>>;
+    readonly findByWebContentsId: (
+      webContentsId: number,
+    ) => Effect.Effect<Option.Option<Electron.BrowserWindow>>;
     readonly setMain: (window: Electron.BrowserWindow) => Effect.Effect<void>;
     readonly clearMain: (window: Option.Option<Electron.BrowserWindow>) => Effect.Effect<void>;
     readonly prepareReveal: (window: Electron.BrowserWindow) => Effect.Effect<boolean>;
@@ -241,6 +244,22 @@ export const make = Effect.gen(function* () {
     main: liveMain,
     currentMainOrFirst,
     focusedMainOrFirst,
+    findByWebContentsId: (webContentsId) =>
+      Effect.gen(function* () {
+        const main = yield* liveMain;
+        if (Option.isSome(main) && main.value.webContents?.id === webContentsId) {
+          return main;
+        }
+        for (const window of yield* listWindows) {
+          if (yield* isWindowDestroyed(window)) {
+            continue;
+          }
+          if (window.webContents?.id === webContentsId) {
+            return Option.some(window);
+          }
+        }
+        return Option.none<Electron.BrowserWindow>();
+      }),
     setMain: (window) => Ref.set(mainWindowRef, Option.some(window)),
     clearMain: (window) =>
       Ref.update(mainWindowRef, (current) => {

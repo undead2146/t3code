@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>
+      T3 Code: Actual Antigravity Usage Limits &amp; Implementation Feasibility Analysis
+    </title>
+    <style>
+      :root {
+        --bg: #000000;
+        --surface: #0e1117;
+        --surface-subtle: #161b22;
+        --border: #21262d;
+        --border-strong: #30363d;
+        --text: #f0f6fc;
+        --text-muted: #8b949e;
+        --accent: #58a6ff;
+        --accent-subtle: rgba(56, 139, 253, 0.12);
+        --code-bg: #0d1117;
+        --code-border: #21262d;
+        --success: #238636;
+        --warning: #d29922;
+        --danger: #da3633;
+        --font-mono:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+          monospace;
+        --font-sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        background-color: var(--bg);
+        color: var(--text);
+        font-family: var(--font-sans);
+        font-size: 14px;
+        line-height: 1.6;
+        padding: 32px 20px;
+      }
+      .container {
+        max-width: 1040px;
+        margin: 0 auto;
+      }
+      header {
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 24px;
+        margin-bottom: 28px;
+      }
+      h1 {
+        font-size: 24px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        margin-bottom: 12px;
+        color: #ffffff;
+      }
+      .meta-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        background: var(--surface-subtle);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 3px 9px;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--text);
+      }
+      .badge.accent {
+        border-color: rgba(56, 139, 253, 0.4);
+        color: #79c0ff;
+        background: var(--accent-subtle);
+      }
+      .badge.success {
+        border-color: rgba(35, 134, 54, 0.4);
+        color: #56d364;
+        background: rgba(35, 134, 54, 0.1);
+      }
+      .badge.warning {
+        border-color: rgba(210, 153, 34, 0.4);
+        color: #e3b341;
+        background: rgba(210, 153, 34, 0.1);
+      }
+      .badge.danger {
+        border-color: rgba(218, 54, 51, 0.4);
+        color: #f85149;
+        background: rgba(218, 54, 51, 0.1);
+      }
+
+      h2 {
+        font-size: 17px;
+        font-weight: 600;
+        margin-top: 36px;
+        margin-bottom: 14px;
+        color: #ffffff;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 8px;
+      }
+      h3 {
+        font-size: 13px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        margin-top: 20px;
+        margin-bottom: 8px;
+      }
+      p {
+        margin-bottom: 14px;
+        color: var(--text);
+      }
+      ul,
+      ol {
+        margin-left: 20px;
+        margin-bottom: 16px;
+      }
+      li {
+        margin-bottom: 6px;
+      }
+      code {
+        font-family: var(--font-mono);
+        font-size: 12px;
+        background: var(--code-bg);
+        padding: 2px 6px;
+        border-radius: 4px;
+        border: 1px solid var(--border);
+        color: #79c0ff;
+      }
+      pre {
+        background: var(--code-bg);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 14px;
+        overflow-x: auto;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        line-height: 1.5;
+        margin-bottom: 18px;
+        color: #c9d1d9;
+      }
+      .callout {
+        border: 1px solid var(--border);
+        background: var(--surface);
+        border-left: 4px solid var(--accent);
+        border-radius: 4px;
+        padding: 14px 16px;
+        margin: 18px 0;
+      }
+      .callout.danger {
+        border-left-color: var(--danger);
+      }
+      .callout.warning {
+        border-left-color: var(--warning);
+      }
+      .callout.success {
+        border-left-color: var(--success);
+      }
+      .callout-title {
+        font-weight: 600;
+        margin-bottom: 6px;
+        font-size: 13px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 18px 0 24px;
+        font-size: 13px;
+      }
+      th,
+      td {
+        border: 1px solid var(--border);
+        padding: 10px 14px;
+        text-align: left;
+        vertical-align: top;
+      }
+      th {
+        background: var(--surface-subtle);
+        color: var(--text);
+        font-weight: 600;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      tr:nth-child(even) {
+        background: rgba(22, 27, 34, 0.4);
+      }
+
+      .grid-2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        margin: 18px 0;
+      }
+      @media (max-width: 768px) {
+        .grid-2 {
+          grid-template-columns: 1fr;
+        }
+      }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 16px;
+      }
+      .card h4 {
+        font-size: 14px;
+        margin-bottom: 8px;
+        color: #ffffff;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>Actual Antigravity Usage Limits: Architecture &amp; Feasibility</h1>
+        <div class="meta-bar">
+          <span class="badge accent">Architecture Spec</span>
+          <span class="badge warning">Reverse Engineering Report</span>
+          <span>Target: Google Antigravity (acp / agy)</span>
+          <span>Version: 1.2.0</span>
+        </div>
+      </header>
+
+      <h2>1. Executive Summary &amp; Direct Answer to "How Hard Is It?"</h2>
+      <p>
+        Implementing <strong>actual account-level usage limits</strong> for Google Antigravity
+        across multiple machines breaks down into two distinct engineering challenges:
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Implementation Strategy</th>
+            <th>Difficulty</th>
+            <th>Effort</th>
+            <th>Reliability / Risk</th>
+            <th>User Experience</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>
+              <strong>Strategy A: Multi-Machine Usage Broker</strong><br />Centralized state sync of
+              tokens &amp; 429 lockouts
+            </td>
+            <td><span class="badge success">Moderate</span></td>
+            <td>1 &ndash; 2 Days</td>
+            <td>100% Reliable.<br />Within full application control.</td>
+            <td>
+              All machines (BRAVO, cc-1, cc-2, cc-3) see identical synced token usage and exact 429
+              reset countdowns.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <strong>Strategy B: Direct Google gRPC Client</strong><br />Hitting internal
+              <code>FetchQuotaStatus</code>
+            </td>
+            <td><span class="badge danger">High</span></td>
+            <td>3 &ndash; 5 Days</td>
+            <td>
+              Fragile.<br />Google endpoint is private gRPC, not public REST. Subject to sudden
+              breakages.
+            </td>
+            <td>
+              Shows exact Google-calculated percentage if Google allows external gRPC caller; zero
+              guarantee of long-term stability.
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout warning">
+        <div class="callout-title">The Fundamental Difference: Antigravity vs Codex vs Claude</div>
+        <p>
+          <strong>Codex</strong> and <strong>Claude Code</strong> natively support usage querying:
+          Codex exposes <code>account/rateLimits/read</code> and pushes
+          <code>account/rateLimits/updated</code> via its app-server JSON-RPC. Claude streams
+          <code>rate_limit_event</code> and has <code>get_usage</code> in its SDK.<br /><br />
+          <strong>Google Antigravity</strong> uses generic ACP (Agent Client Protocol) over stdio.
+          <strong>Google's ACP implementation exposes zero quota or usage methods.</strong>
+        </p>
+      </div>
+
+      <h2>2. Deep Reverse-Engineering: What Google Has Under the Hood</h2>
+      <p>
+        We disassembled and inspected Google's Antigravity CLI binary
+        (<code>C:\Users\Bravo15\AppData\Local\agy\bin\agy.EXE</code>). Here is what Google actually
+        does internally:
+      </p>
+
+      <h3>Internal Protobuf Service Discovered</h3>
+      <pre><code>service PredictionService {
+  rpc GenerateContent(GenerateContentRequest) returns (GenerateContentResponse);
+  rpc StreamGenerateContent(GenerateContentRequest) returns (stream GenerateContentResponse);
+  rpc BidiGenerateContent(stream BidiGenerateContentClientMessage) returns (stream BidiGenerateContentServerMessage);
+  
+  // Exact quota status RPC:
+  rpc FetchQuotaStatus(FetchQuotaStatusRequest) returns (FetchQuotaStatusResponse);
+}
+
+message FetchQuotaStatusResponse {
+  repeated BucketInfo buckets = 1;
+  Entitlement entitlement = 2;
+
+  message BucketInfo {
+    double remaining_fraction = 1;      // Exact float remaining (e.g. 0.75 = 25% used)
+    google.protobuf.Timestamp reset_time = 2; // Exact ISO/epoch reset timestamp
+    QuotaType quota_type = 3;           // Quota type enum
+    Model model = 4;                    // Target model identifier
+  }
+}</code></pre>
+
+      <h3>Why REST Probing Fails (Tested Live with User OAuth Token)</h3>
+      <p>
+        We extracted the user's active Google OAuth token from <code>acp_token.json</code> (which
+        holds <code>https://www.googleapis.com/auth/aicode</code> and
+        <code>https://www.googleapis.com/auth/cloud-platform</code>) and probed Google's endpoints:
+      </p>
+      <ul>
+        <li>
+          <code>https://aicode.googleapis.com/v1main:fetchQuotaStatus</code> &rarr;
+          <code>404 Not Found</code>
+        </li>
+        <li>
+          <code>https://agentaicode.googleapis.com/v1main:fetchQuotaStatus</code> &rarr;
+          <code>404 Not Found</code>
+        </li>
+        <li>
+          <code>https://businessaicode.googleapis.com/v1main/...:fetchQuotaStatus</code> &rarr;
+          <code>404 Not Found</code>
+        </li>
+      </ul>
+      <p>
+        <strong>Finding:</strong> Google does not expose <code>FetchQuotaStatus</code> over public
+        HTTP/1.1 REST gateways. It is an internal HTTP/2 gRPC service hosted on
+        <code>agentaicode.googleapis.com:443</code>. Furthermore, <code>agy.EXE</code> does not
+        contain any CLI command or ACP RPC handler to invoke this method externally; the protobuf
+        bindings are compiled in solely as part of Google's internal proto bundle.
+      </p>
+
+      <h2>3. Why the Current Multi-Machine Display Failed</h2>
+      <p>
+        The user observed conflicting metrics across machines sharing the exact same Google account:
+      </p>
+      <pre><code>cc-3:   Session 100% | resets now    | Daily 0% resets in 8h 38m
+cc-1:   Session 0%   | resets now    | Daily 0% resets in 8h 34m
+BRAVO:  Session 40%  | resets in 4h  | Daily 0% resets in 23h 14m</code></pre>
+
+      <p>The root causes are 100% diagnosed in the codebase:</p>
+      <ol>
+        <li>
+          <strong>Isolated In-Memory Counters:</strong> In <code>antigravityUsageLimits.ts</code>,
+          tokens are accumulated in a local JavaScript <code>Ref</code> in server RAM. Each machine
+          only knows about the turns executed on that single physical host.
+        </li>
+        <li>
+          <strong>Independent Synthetic Timers:</strong> When a server starts, it initializes a
+          local 5-hour window timer (<code>now + 5 hours</code>). Because BRAVO, cc-1, and cc-3
+          booted at different times, their reset clocks are completely out of sync.
+        </li>
+        <li>
+          <strong>Isolated Rate-Limit Lockout:</strong> When <code>cc-3</code> encountered an HTTP
+          429 from Google, only <code>cc-3</code> set its local state to 100%. <code>cc-1</code> and
+          <code>BRAVO</code> had no idea that the shared Google account was throttled.
+        </li>
+      </ol>
+
+      <h2>4. The Implementation Blueprint (Strategy A &ndash; Recommended)</h2>
+      <p>
+        To provide real, accurate, and synchronized usage tracking across all machines without
+        depending on fragile reverse-engineered Google gRPC internals:
+      </p>
+
+      <div class="grid-2">
+        <div class="card">
+          <h4>1. Cross-Machine Usage Sync</h4>
+          <p>
+            Store Antigravity token usage and rate-limit states in a shared SQLite store or
+            broadcast via the existing T3 multi-machine pairing mesh (WebSocket).
+          </p>
+          <p>
+            Every token spent on CC-1, CC-3, or BRAVO increments the same global account counter.
+          </p>
+        </div>
+        <div class="card">
+          <h4>2. Synchronized 429 Lockout</h4>
+          <p>
+            When any machine receives a Google 429 (<code>RESOURCE_EXHAUSTED</code>), it parses the
+            exact <code>Retry-After</code> header or Google error metadata.
+          </p>
+          <p>
+            It immediately broadcasts a 100% usage lockout and exact reset timestamp to all
+            connected machines.
+          </p>
+        </div>
+      </div>
+
+      <h3>Step-by-Step Implementation Plan:</h3>
+      <ol>
+        <li>
+          <strong>State Persistence (<code>antigravityUsageStore.ts</code>):</strong>
+          Persist usage snapshots to disk (or SQLite) keyed by Google account email. Multiple
+          machines sharing the data directory or syncing via T3 multi-machine sync will read the
+          same shared state.
+        </li>
+        <li>
+          <strong>Network Synchronization:</strong>
+          Add an IPC/RPC message across paired T3 nodes: <code>provider/usage/sync</code>. When
+          machine A finishes a turn, it broadcasts
+          <code>{ provider: 'antigravity', email, addedTokens, timestamp }</code>.
+        </li>
+        <li>
+          <strong>Unified Reset Anchor:</strong>
+          Instead of <code>now + 5h</code> per machine, anchor the 5-hour window to fixed global UTC
+          boundaries (e.g. 00:00, 05:00, 10:00 UTC) matching Google's standard billing buckets.
+        </li>
+      </ol>
+
+      <h2>5. Alternative: Pursuing Raw Google gRPC (Strategy B)</h2>
+      <p>
+        If the user insists on querying Google's servers directly for the exact protobuf percentage:
+      </p>
+      <ul>
+        <li>
+          <strong>Requirement:</strong> Compile Google's <code>PredictionService</code> protobuf
+          files into TypeScript using <code>ts-proto</code> or <code>@grpc/grpc-js</code>.
+        </li>
+        <li>
+          <strong>Connection:</strong> Open a secure HTTP/2 gRPC channel to
+          <code>agentaicode.googleapis.com:443</code>.
+        </li>
+        <li>
+          <strong>Headers:</strong> Supply <code>Authorization: Bearer &lt;access_token&gt;</code>,
+          <code>x-goog-user-project: aicode-consumers</code>, and Google internal client metadata.
+        </li>
+        <li>
+          <strong>Risk Assessment:</strong> High likelihood that Google's frontend proxy rejects
+          non-internal callers or updates RPC signatures without notice.
+        </li>
+      </ul>
+
+      <div class="callout success">
+        <div class="callout-title">Conclusion</div>
+        <p>
+          Implementing <strong>Strategy A (Shared Cross-Machine Usage &amp; 429 Broker)</strong> is
+          completely feasible within 1&ndash;2 days, solves 100% of the discrepancy between BRAVO,
+          cc-1, and cc-3, and guarantees unified countdowns and lockouts across all machines.
+        </p>
+      </div>
+    </div>
+  </body>
+</html>

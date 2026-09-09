@@ -4,6 +4,7 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import type * as Electron from "electron";
 import { beforeEach, vi } from "vite-plus/test";
 
@@ -62,10 +63,17 @@ const testLayer = (platform: NodeJS.Platform) =>
 
 const TestLayer = testLayer("linux");
 
-function makeBrowserWindow(input: { readonly id: number; readonly destroyed: boolean }) {
+function makeBrowserWindow(input: {
+  readonly id: number;
+  readonly destroyed: boolean;
+  readonly webContentsId?: number;
+}) {
   return {
     id: input.id,
     isDestroyed: vi.fn(() => input.destroyed),
+    webContents: {
+      id: input.webContentsId ?? input.id * 10,
+    },
   } as unknown as Electron.BrowserWindow;
 }
 
@@ -88,6 +96,53 @@ function makeWindowsRevealWindow() {
 }
 
 describe("ElectronWindow", () => {
+  describe("findByWebContentsId", () => {
+    it.effect("finds the main window by its webContents id", () =>
+      Effect.gen(function* () {
+        const mainWindow = makeBrowserWindow({ id: 1, destroyed: false, webContentsId: 101 });
+        const electronWindow = yield* ElectronWindow.ElectronWindow;
+        yield* electronWindow.setMain(mainWindow);
+
+        const found = yield* electronWindow.findByWebContentsId(101);
+
+        assert.isTrue(Option.isSome(found));
+        if (Option.isSome(found)) {
+          assert.strictEqual(found.value, mainWindow);
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
+    it.effect("finds a secondary window from all windows by its webContents id", () =>
+      Effect.gen(function* () {
+        const mainWindow = makeBrowserWindow({ id: 1, destroyed: false, webContentsId: 101 });
+        const secondaryWindow = makeBrowserWindow({ id: 2, destroyed: false, webContentsId: 102 });
+        getAllWindowsMock.mockReturnValue([mainWindow, secondaryWindow]);
+        const electronWindow = yield* ElectronWindow.ElectronWindow;
+
+        const found = yield* electronWindow.findByWebContentsId(102);
+
+        assert.isTrue(Option.isSome(found));
+        if (Option.isSome(found)) {
+          assert.strictEqual(found.value, secondaryWindow);
+        }
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
+    it.effect("returns none when the window is destroyed or does not match", () =>
+      Effect.gen(function* () {
+        const destroyedWindow = makeBrowserWindow({ id: 3, destroyed: true, webContentsId: 103 });
+        getAllWindowsMock.mockReturnValue([destroyedWindow]);
+        const electronWindow = yield* ElectronWindow.ElectronWindow;
+
+        const foundDestroyed = yield* electronWindow.findByWebContentsId(103);
+        const foundMissing = yield* electronWindow.findByWebContentsId(999);
+
+        assert.isTrue(Option.isNone(foundDestroyed));
+        assert.isTrue(Option.isNone(foundMissing));
+      }).pipe(Effect.provide(TestLayer)),
+    );
+  });
+
   beforeEach(() => {
     activateWindowsForegroundMock.mockReset().mockResolvedValue(undefined);
     appFocusMock.mockReset();

@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>T3 Code: /btw Support for Antigravity Provider Spec & Architecture</title>
+    <style>
+      :root {
+        --bg: #000000;
+        --surface: #0e0e11;
+        --surface-border: #1f1f26;
+        --text: #ffffff;
+        --text-muted: #9999a5;
+        --accent: #4285f4;
+        --accent-muted: #1d3557;
+        --tag-bg: #16161c;
+        --tag-border: #262633;
+        --code-bg: #111116;
+        --code-border: #22222b;
+        --success: #34a853;
+        --warning: #fbbc05;
+        --danger: #ea4335;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        background-color: var(--bg);
+        color: var(--text);
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+        padding: 24px 16px;
+      }
+      .container {
+        max-width: 960px;
+        margin: 0 auto;
+      }
+      header {
+        border-bottom: 1px solid var(--surface-border);
+        padding-bottom: 16px;
+        margin-bottom: 24px;
+      }
+      h1 {
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        margin-bottom: 6px;
+      }
+      .meta {
+        display: flex;
+        gap: 12px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .meta span {
+        display: inline-flex;
+        align-items: center;
+      }
+      h2 {
+        font-size: 15px;
+        font-weight: 600;
+        margin: 28px 0 12px 0;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        border-left: 3px solid var(--accent);
+        padding-left: 8px;
+      }
+      p {
+        margin-bottom: 12px;
+        color: #d0d0d8;
+      }
+      ul,
+      ol {
+        margin-left: 20px;
+        margin-bottom: 12px;
+        color: #d0d0d8;
+      }
+      li {
+        margin-bottom: 4px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 16px 0;
+        background: var(--surface);
+        border: 1px solid var(--surface-border);
+        border-radius: 4px;
+        overflow: hidden;
+      }
+      th,
+      td {
+        padding: 10px 12px;
+        text-align: left;
+        border-bottom: 1px solid var(--surface-border);
+        font-size: 13px;
+      }
+      th {
+        background: #14141a;
+        color: var(--text);
+        font-weight: 600;
+      }
+      tr:last-child td {
+        border-bottom: none;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12px;
+        background: var(--code-bg);
+        border: 1px solid var(--code-border);
+        padding: 1px 4px;
+        border-radius: 3px;
+        color: #e5e5f0;
+      }
+      pre {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12px;
+        background: var(--code-bg);
+        border: 1px solid var(--code-border);
+        padding: 12px;
+        border-radius: 4px;
+        overflow-x: auto;
+        margin: 12px 0;
+        color: #e0e0ea;
+      }
+      .grid-2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        margin: 16px 0;
+      }
+      @media (max-width: 768px) {
+        .grid-2 {
+          grid-template-columns: 1fr;
+        }
+      }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--surface-border);
+        border-radius: 6px;
+        padding: 16px;
+      }
+      .card-title {
+        font-weight: 600;
+        font-size: 13px;
+        margin-bottom: 8px;
+        color: var(--text);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .badge {
+        display: inline-block;
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-size: 11px;
+        font-weight: 600;
+      }
+      .badge-blue {
+        background: #162438;
+        color: #6ba4f8;
+        border: 1px solid #23426e;
+      }
+      .badge-gray {
+        background: #202027;
+        color: #a0a0b0;
+        border: 1px solid #30303d;
+      }
+      .badge-green {
+        background: #122818;
+        color: #4cd964;
+        border: 1px solid #1c4b26;
+      }
+
+      /* Mock UI preview styles */
+      .mock-viewport {
+        background: #09090b;
+        border: 1px solid var(--surface-border);
+        border-radius: 8px;
+        padding: 16px;
+        margin: 16px 0;
+        position: relative;
+      }
+      .mock-chat-bubble {
+        background: #18181f;
+        border: 1px solid #282834;
+        border-radius: 6px;
+        padding: 10px 14px;
+        margin-bottom: 12px;
+        max-width: 70%;
+      }
+      .mock-running-indicator {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: #9ba1a6;
+        margin-bottom: 24px;
+      }
+      .pulse-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--accent);
+        animation: pulse 1.5s infinite ease-in-out;
+      }
+      @keyframes pulse {
+        0% {
+          transform: scale(0.9);
+          opacity: 0.6;
+        }
+        50% {
+          transform: scale(1.1);
+          opacity: 1;
+        }
+        100% {
+          transform: scale(0.9);
+          opacity: 0.6;
+        }
+      }
+      .mock-hud-overlay {
+        background: #121217;
+        border: 1px solid #363644;
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.7);
+        border-radius: 6px;
+        padding: 14px;
+        margin-bottom: 16px;
+      }
+      .mock-hud-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
+        border-bottom: 1px solid #23232c;
+        padding-bottom: 8px;
+      }
+      .mock-composer {
+        background: #131318;
+        border: 1px solid #282834;
+        border-radius: 6px;
+        padding: 10px 14px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        color: #707080;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>T3 Code: /btw Ephemeral Side-Question Support for Antigravity</h1>
+        <div class="meta">
+          <span>Provider: Google Antigravity</span>
+          <span>Harness: ACP / Gemini Flash</span>
+          <span>Spec Status: Architecture & Implementation Plan</span>
+        </div>
+      </header>
+
+      <h2>1. Motivation & Feature Concept</h2>
+      <p>
+        In agentic coding workflows, users frequently have quick contextual questions mid-turn (e.g.
+        <em>"What port does Vite run on?"</em>,
+        <em>"Did we define the user session schema with email?"</em>). Currently, asking any
+        question in T3 Code appends a turn to the active session, which either interrupts the
+        running turn or waits for completion and irreversibly inflates the session token window.
+      </p>
+      <p>
+        The <code>/btw</code> (<em>"by the way"</em>) command is a dedicated mechanism originating
+        in CLI agents (Claude Code, Google Antigravity CLI <code>agy</code>) to execute an
+        out-of-band, single-turn query that:
+      </p>
+      <ul>
+        <li>
+          <strong>Causes Zero Context Drift:</strong> Dismissing the response leaves no record in
+          <code>state.sqlite</code> or the model's message history.
+        </li>
+        <li>
+          <strong>Executes Mid-Task Without Interruptions:</strong> Runs concurrently even when the
+          main agent is compiling, editing files, or running bash commands.
+        </li>
+        <li>
+          <strong>Operates Purely Ephemeral:</strong> Read-only, no tool execution, fast latency via
+          Gemini Flash.
+        </li>
+      </ul>
+
+      <h2>2. Architectural Comparison</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Attribute</th>
+            <th>Standard Turn (Enter / /plan)</th>
+            <th>Ephemeral Turn (/btw &lt;query&gt;)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Session State Lock</strong></td>
+            <td>Acquires and holds <code>promptLock</code> in <code>AntigravityAdapter</code></td>
+            <td>Bypasses <code>promptLock</code> using isolated disposable text runtime</td>
+          </tr>
+          <tr>
+            <td><strong>Persistence</strong></td>
+            <td>Stored in <code>state.sqlite</code>, turns table, conversation history</td>
+            <td>100% in-memory; discarded immediately on dismiss</td>
+          </tr>
+          <tr>
+            <td><strong>Tool Execution</strong></td>
+            <td>Enabled (File I/O, bash commands, browser previews, MCP)</td>
+            <td>Disabled (Zero side-effects, pure reasoning/retrieval)</td>
+          </tr>
+          <tr>
+            <td><strong>Model Target</strong></td>
+            <td>User-selected thread model (Gemini Pro, Ultra, etc.)</td>
+            <td>Fast tier default (Gemini Flash)</td>
+          </tr>
+          <tr>
+            <td><strong>UI Placement</strong></td>
+            <td>Main conversation timeline stream</td>
+            <td>Transient floating HUD / popover anchored above composer</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>3. T3 Code UI Experience</h2>
+      <div class="mock-viewport">
+        <div class="mock-chat-bubble">
+          <strong>User:</strong> Refactor all database queries to use Effect SQL.
+        </div>
+        <div class="mock-running-indicator">
+          <div class="pulse-dot"></div>
+          <span
+            >Antigravity is editing
+            <code>apps/server/src/provider/Layers/AntigravityAdapter.ts</code>...</span
+          >
+        </div>
+
+        <!-- Floating /btw HUD -->
+        <div class="mock-hud-overlay">
+          <div class="mock-hud-header">
+            <div style="display: flex; align-items: center; gap: 8px">
+              <span class="badge badge-blue">/btw side question</span>
+              <span style="color: #bbb; font-size: 12px; font-weight: 500"
+                >What was the SQLite database path for Antigravity?</span
+              >
+            </div>
+            <span style="font-size: 11px; color: #777">Press [Esc] to dismiss</span>
+          </div>
+          <div style="font-size: 13px; color: #ddd; margin-bottom: 12px">
+            Antigravity sessions store SQLite databases under the user data profile directory at:<br />
+            <code
+              >~/.t3/userdata/providers/antigravity/&lt;instanceId&gt;/antigravity-acp/conversations/&lt;sessionId&gt;.db</code
+            >.
+          </div>
+          <div style="display: flex; justify-content: flex-end; gap: 8px">
+            <button
+              style="
+                background: #22222b;
+                border: 1px solid #333340;
+                color: #ccc;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 11px;
+                cursor: pointer;
+              "
+            >
+              Copy Text
+            </button>
+            <button
+              style="
+                background: #1b263b;
+                border: 1px solid #273b5c;
+                color: #6ba4f8;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 11px;
+                cursor: pointer;
+              "
+            >
+              Insert to Composer
+            </button>
+            <button
+              style="
+                background: #2b1b1b;
+                border: 1px solid #4a2828;
+                color: #f28b82;
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 11px;
+                cursor: pointer;
+              "
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+
+        <div class="mock-composer">
+          <span>Type a message or /command... (Composer remains active while turn runs)</span>
+          <span class="badge badge-gray">Full Access</span>
+        </div>
+      </div>
+
+      <h2>4. Implementation Plan</h2>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">
+            <span class="badge badge-blue">Phase 1</span>
+            <span>Contracts & Protocols</span>
+          </div>
+          <ul>
+            <li>
+              Add <code>ProviderEphemeralQueryInput</code> and
+              <code>ProviderEphemeralQueryEvent</code> to <code>@t3tools/contracts</code>.
+            </li>
+            <li>
+              Register <code>BTW_SLASH_COMMAND</code> in <code>providerSnapshot.ts</code> with input
+              hint <code>"your question"</code>.
+            </li>
+            <li>
+              Update <code>composerSlashCommandSearch.ts</code> to index and autocomplete
+              <code>/btw</code>.
+            </li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            <span class="badge badge-blue">Phase 2</span>
+            <span>Server & Provider Layer</span>
+          </div>
+          <ul>
+            <li>
+              In <code>AntigravityAdapter.ts</code>, implement
+              <code>sendEphemeralQuery(threadId, prompt)</code>.
+            </li>
+            <li>
+              Extract recent turns & working context from active thread without acquiring
+              <code>promptLock</code>.
+            </li>
+            <li>
+              Dispatch to disposable runtime (leveraging
+              <code>AntigravityTextGeneration.ts</code> infrastructure).
+            </li>
+            <li>
+              Stream back chunks over WebSocket via <code>ProviderService.sendEphemeralQuery</code>.
+            </li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            <span class="badge badge-blue">Phase 3</span>
+            <span>Web & Desktop Client UI</span>
+          </div>
+          <ul>
+            <li>
+              Modify <code>ChatComposer.tsx</code> so typing <code>/btw ...</code> is not disabled
+              during <code>phase === "running"</code>.
+            </li>
+            <li>
+              Build <code>BtwOverlayHUD.tsx</code> floating card component anchored above the
+              composer.
+            </li>
+            <li>
+              Handle <code>Esc</code> dismissal, copy-to-clipboard, and insert-into-composer
+              actions.
+            </li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            <span class="badge badge-blue">Phase 4</span>
+            <span>Verification & Tests</span>
+          </div>
+          <ul>
+            <li>
+              Unit test <code>AntigravityAdapter.test.ts</code>: verify ephemeral query executes
+              concurrently while an active turn is locked.
+            </li>
+            <li>Unit test <code>ChatComposer</code> command parsing and submit interception.</li>
+            <li>End-to-end verification during an ongoing Antigravity turn.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h2>5. Detailed Execution Flow</h2>
+      <pre>
+1. User types: /btw What port was chosen in vite.config.ts?
+2. ChatComposer detects leading "/btw " command on submit.
+3. ChatComposer opens BtwOverlayHUD in loading state and clears input.
+4. Client issues RPC call: provider.sendEphemeralQuery({ threadId, prompt })
+5. ProviderService dispatches to AntigravityAdapter.sendEphemeralQuery.
+6. AntigravityAdapter reads recent thread context and cwd from session cache.
+7. Adapter spawns lightweight Gemini Flash prompt (clientFileSystem=false, no terminal).
+8. Streamed chunks emit as "provider.ephemeral-delta" events over WebSocket.
+9. BtwOverlayHUD streams Markdown in real time.
+10. User reads answer, hits Esc -> HUD unmounts -> Zero DB changes recorded.
+  </pre>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>T3 Code: AGCP Fast Startup & Resilient Session Continuation Plan</title>
+    <style>
+      :root {
+        --bg: #000000;
+        --surface: #0a0a0d;
+        --surface-subtle: #111116;
+        --border: #1f1f27;
+        --border-strong: #2e2e3a;
+        --text: #ededed;
+        --text-muted: #8e8ea0;
+        --accent: #4285f4;
+        --accent-muted: #1a2a44;
+        --tag-bg: #15151b;
+        --code-bg: #0e0e13;
+        --code-border: #23232f;
+        --success: #34a853;
+        --warning: #fbbc05;
+        --danger: #ea4335;
+        --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        --font-sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        background-color: var(--bg);
+        color: var(--text);
+        font-family: var(--font-sans);
+        font-size: 14px;
+        line-height: 1.5;
+        padding: 24px 16px;
+      }
+      .container {
+        max-width: 980px;
+        margin: 0 auto;
+      }
+      header {
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 18px;
+        margin-bottom: 24px;
+      }
+      h1 {
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        margin-bottom: 8px;
+        color: #ffffff;
+      }
+      .meta-bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        background: var(--tag-bg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 2px 8px;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--text);
+      }
+      .badge.success {
+        border-color: rgba(52, 168, 83, 0.4);
+        color: #81c995;
+        background: rgba(52, 168, 83, 0.1);
+      }
+      .badge.warning {
+        border-color: rgba(251, 188, 5, 0.4);
+        color: #fdd663;
+        background: rgba(251, 188, 5, 0.1);
+      }
+      .badge.danger {
+        border-color: rgba(234, 67, 53, 0.4);
+        color: #f28b82;
+        background: rgba(234, 67, 53, 0.1);
+      }
+      .badge.accent {
+        border-color: rgba(66, 133, 244, 0.4);
+        color: #8ab4f8;
+        background: rgba(66, 133, 244, 0.1);
+      }
+
+      h2 {
+        font-size: 16px;
+        font-weight: 600;
+        margin-top: 28px;
+        margin-bottom: 12px;
+        color: #ffffff;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 6px;
+      }
+      h3 {
+        font-size: 13px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--text-muted);
+        margin-top: 18px;
+        margin-bottom: 8px;
+      }
+      p {
+        margin-bottom: 12px;
+        color: var(--text);
+      }
+      ul,
+      ol {
+        margin-left: 20px;
+        margin-bottom: 14px;
+      }
+      li {
+        margin-bottom: 6px;
+      }
+      code {
+        font-family: var(--font-mono);
+        font-size: 12px;
+        background: var(--code-bg);
+        padding: 2px 5px;
+        border-radius: 3px;
+        border: 1px solid var(--code-border);
+        color: #e0e0e0;
+      }
+      pre {
+        background: var(--code-bg);
+        border: 1px solid var(--code-border);
+        border-radius: 6px;
+        padding: 12px 14px;
+        overflow-x: auto;
+        margin-bottom: 16px;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        line-height: 1.45;
+        color: #d1d5db;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        margin-bottom: 16px;
+      }
+      @media (max-width: 720px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 14px;
+      }
+      .card-title {
+        font-size: 13px;
+        font-weight: 600;
+        margin-bottom: 8px;
+        color: #ffffff;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .card-content {
+        font-size: 12.5px;
+        color: var(--text-muted);
+        line-height: 1.45;
+      }
+      .comparison-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 18px;
+        font-size: 12.5px;
+      }
+      .comparison-table th,
+      .comparison-table td {
+        border: 1px solid var(--border);
+        padding: 8px 10px;
+        text-align: left;
+      }
+      .comparison-table th {
+        background: var(--surface-subtle);
+        color: #ffffff;
+        font-weight: 600;
+      }
+      .comparison-table td {
+        background: var(--surface);
+      }
+      .highlight-box {
+        border-left: 3px solid var(--accent);
+        background: rgba(66, 133, 244, 0.06);
+        padding: 12px 14px;
+        border-radius: 0 4px 4px 0;
+        margin-bottom: 16px;
+        font-size: 13px;
+      }
+      .danger-box {
+        border-left: 3px solid var(--danger);
+        background: rgba(234, 67, 53, 0.06);
+        padding: 12px 14px;
+        border-radius: 0 4px 4px 0;
+        margin-bottom: 16px;
+        font-size: 13px;
+      }
+      .success-box {
+        border-left: 3px solid var(--success);
+        background: rgba(52, 168, 83, 0.06);
+        padding: 12px 14px;
+        border-radius: 0 4px 4px 0;
+        margin-bottom: 16px;
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>AGCP (Antigravity ACP) Fast Startup & Resilient Session Continuation</h1>
+        <div class="meta-bar">
+          <span class="badge accent">Architecture & Implementation Plan</span>
+          <span class="badge warning">Subsystem: Server / Providers</span>
+          <span class="badge">Target: Windows / Electron & Server</span>
+          <span class="badge success">Zero 40s Delay</span>
+        </div>
+      </header>
+
+      <div class="highlight-box">
+        <strong>Executive Summary:</strong> Migrating from the legacy native CLI
+        (<code>agy.exe</code>) to the Agent Client Protocol (<code>agy_acp_server.exe</code>)
+        introduced a 40-second cold launch delay and caused running threads to instantly fail upon
+        server restart. This plan details the root causes—PyInstaller cold-unpack overhead,
+        disposable probe spawns, pessimistic initial drafts, and ungated session reconciliation—and
+        provides an amicable 4-step architectural remedy.
+      </div>
+
+      <h2>1. The Problem: Legacy CLI vs. AGCP Protocol</h2>
+      <table class="comparison-table">
+        <thead>
+          <tr>
+            <th>Metric / Characteristic</th>
+            <th>Legacy <code>agy.exe</code> (CLI)</th>
+            <th>Current <code>agy_acp_server.exe</code> (AGCP)</th>
+            <th>Optimized Target State</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Executable Size & Nature</strong></td>
+            <td>~15MB native compiled Go/Rust binary</td>
+            <td>297MB PyInstaller bundle + 122MB localharness</td>
+            <td>Same binary, but instant caching & lazy spawn</td>
+          </tr>
+          <tr>
+            <td><strong>Startup / Probe Delay</strong></td>
+            <td>&lt;50ms (<code>agy --version</code> stdout)</td>
+            <td><strong>25s &ndash; 45s</strong> (throwaway RPC probe)</td>
+            <td><strong>&lt;5ms</strong> (optimistic disk validation)</td>
+          </tr>
+          <tr>
+            <td><strong>Initial Provider Status</strong></td>
+            <td>Instantly <code>ready</code> if found</td>
+            <td>Starts as <code>warning</code> ("Checking...")</td>
+            <td>Starts as <code>ready</code> if token & models cached</td>
+          </tr>
+          <tr>
+            <td><strong>Thread Survival on Restart</strong></td>
+            <td>Clean process spawn</td>
+            <td><strong>Fails immediately</strong> due to probe thrashing</td>
+            <td><strong>100% resilient</strong> with readiness gating & retry</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>2. Root Cause Analysis</h2>
+      <div class="grid">
+        <div class="card">
+          <div class="card-title">
+            <span class="badge danger">Cause 1</span>
+            Disposable Probe Spawns
+          </div>
+          <div class="card-content">
+            On boot, <code>AntigravityDriver.probe</code> cold-spawns a 300MB PyInstaller binary in
+            <code>stateDir</code> just to run <code>runtime.initialize()</code>. Once initialized,
+            it <em>immediately terminates the process</em>. This throwaway spawn burns 30-40 seconds
+            of disk I/O and Windows Defender inspection for zero ongoing utility.
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">
+            <span class="badge danger">Cause 2</span>
+            Pessimistic Initial Draft
+          </div>
+          <div class="card-content">
+            In <code>makeAntigravityProvider</code>, the initial snapshot hardcodes
+            <code>status: "warning"</code>, <code>installed: false</code>, and
+            <code>auth.status: "unknown"</code>. It ignores the fact that
+            <code>.install-complete.json</code>, <code>acp_token.json</code>, and
+            <code>models.json</code> already exist on disk, forcing the UI to lock up in a waiting
+            state.
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">
+            <span class="badge danger">Cause 3</span>
+            Startup Process Thrashing
+          </div>
+          <div class="card-content">
+            When restarting with running threads, T3 Code simultaneously spawns: (1) The disposable
+            probe process, (2) A session process for the continuing thread, and (3) A standby
+            prewarm process. Three 300MB PyInstaller binaries compete for
+            <code>%TEMP%</code> unpacking locks, spiking disk and CPU to 100%.
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">
+            <span class="badge danger">Cause 4</span>
+            Ungated Session Reconciliation
+          </div>
+          <div class="card-content">
+            <code>reconcileProviderSessions</code> immediately fires
+            <code>providerService.sendTurn</code> without waiting for provider readiness. If
+            <code>sendTurn</code> hits a timeout during the concurrency storm, it immediately calls
+            <code>settleAsError</code>, killing the thread forever with
+            <em>"Could not continue this thread after the server restart"</em>.
+          </div>
+        </div>
+      </div>
+
+      <h2>3. Implementation Solution Architecture</h2>
+
+      <h3>Phase 1: Instant Optimistic Readiness on Startup (&lt;5ms)</h3>
+      <p>
+        Eliminate the 40-second blank waiting state by validating cached assets synchronously on
+        boot before publishing the initial provider snapshot.
+      </p>
+      <ul>
+        <li>
+          <strong>File:</strong>
+          <code>apps/server/src/provider/Layers/AntigravityProvider.ts</code> &
+          <code>apps/server/src/provider/Drivers/AntigravityDriver.ts</code>
+        </li>
+        <li>
+          Check synchronously on disk:
+          <ol>
+            <li>
+              <code>installation.resolve()</code> verifies <code>.install-complete.json</code> and
+              binary existence (&lt;1ms).
+            </li>
+            <li>
+              <code>fileSystem.exists(acp_token.json)</code> verifies authentication (&lt;1ms).
+            </li>
+            <li>
+              <code>readCachedModels(models.json)</code> supplies discovered model list (&lt;1ms).
+            </li>
+          </ol>
+        </li>
+        <li>
+          When all 3 are present, <code>initialDraft</code> initializes directly with:
+          <pre><code>installed: true,
+status: "ready",
+auth: { status: "authenticated", type: "oauth-personal", label: "Google account" },
+models: cachedModels,
+version: release.version</code></pre>
+        </li>
+        <li>
+          <strong>Impact:</strong> Antigravity is <strong>connected and ready on Frame 1</strong> of
+          launching T3 Code. No 40s waiting bar.
+        </li>
+      </ul>
+
+      <h3>Phase 2: Bypass Disposable Startup Health Probes</h3>
+      <p>
+        Avoid spawning disposable throwaway PyInstaller instances when the environment is already
+        known to be sound.
+      </p>
+      <ul>
+        <li>
+          <strong>File:</strong> <code>apps/server/src/provider/Drivers/AntigravityDriver.ts</code>
+        </li>
+        <li>
+          If the binary and valid auth token exist on disk, the startup probe returns immediate
+          success using the resolved installation release metadata.
+        </li>
+        <li>
+          A live ACP session is only spawned when the user actually sends a turn or continues a
+          thread, eliminating redundant cold-boots.
+        </li>
+        <li>
+          <strong>Cache Browser Preflight:</strong> In <code>prepareAntigravityProfile</code>, cache
+          the <code>t3code.exe -e ...</code> browser suppression verification per process lifetime
+          so subsequent session launches don't re-spawn helper processes.
+        </li>
+      </ul>
+
+      <h3>Phase 3: Prewarm Throttling & Concurrency Protection</h3>
+      <p>Prevent PyInstaller spawn pile-ups on Windows.</p>
+      <ul>
+        <li>
+          <strong>File:</strong> <code>apps/server/src/provider/Layers/AntigravityAdapter.ts</code>
+        </li>
+        <li>
+          Guard <code>prewarm(cwd)</code> so that it does <em>not</em> trigger concurrently while an
+          active session is recovering or starting.
+        </li>
+        <li>
+          Defer prewarming until the main session has successfully completed initialization and
+          settled into an idle state.
+        </li>
+      </ul>
+
+      <h3>Phase 4: Provider Readiness Gating & Resilient Retry in Session Reconciliation</h3>
+      <p>
+        Ensure that active turns survive server restarts and restarts do not corrupt running
+        threads.
+      </p>
+      <ul>
+        <li>
+          <strong>File:</strong> <code>apps/server/src/serverRuntimeStartup.ts</code> (in
+          <code>reconcileProviderSessions</code>)
+        </li>
+        <li>
+          <strong>Readiness Await:</strong> Before triggering <code>providerService.sendTurn</code>,
+          await provider readiness with a grace period (e.g., up to 30s timeout) instead of
+          dispatching into a cold provider immediately.
+        </li>
+        <li>
+          <strong>Continuation Retry Policy:</strong> Wrap the continuation dispatch with a retry
+          loop (3 attempts with exponential backoff: 2s, 4s, 8s) if a transient connection error
+          occurs.
+        </li>
+        <li>
+          <strong>Graceful Fallback:</strong> If continuation still fails after retries, preserve
+          the thread's message history and set the session to <code>"stopped"</code> or
+          <code>"ready"</code> rather than a destructive permanent <code>"error"</code>.
+        </li>
+      </ul>
+
+      <h2>4. Phased Verification & Validation Plan</h2>
+      <div class="success-box">
+        <strong>Verification Strategy:</strong>
+        <ul>
+          <li>
+            <strong>Unit Test:</strong> Test <code>AntigravityProvider</code> initial snapshot
+            generation with cached token and models in <code>AntigravityProvider.test.ts</code>.
+          </li>
+          <li>
+            <strong>Reconciliation Test:</strong> Add a test case in
+            <code>serverRuntimeStartup.reconcile.test.ts</code> simulating a provider that becomes
+            ready asynchronously after boot, verifying continuation succeeds without error.
+          </li>
+          <li>
+            <strong>End-to-End Latency:</strong> Measure server boot time to provider
+            <code>ready</code> state (expected drop from ~42s down to ~15ms).
+          </li>
+          <li>
+            <strong>Full Typecheck & Vitest:</strong> Run
+            <code>pnpm --filter @t3tools/server test</code> and project-wide typecheck.
+          </li>
+        </ul>
+      </div>
+
+      <h2>5. Files Involved in Implementation</h2>
+      <ul>
+        <li>
+          <code>apps/server/src/provider/Layers/AntigravityProvider.ts</code> &mdash; Optimistic
+          initial draft & disk checks
+        </li>
+        <li>
+          <code>apps/server/src/provider/Drivers/AntigravityDriver.ts</code> &mdash; Probe bypass &
+          cached preflight
+        </li>
+        <li>
+          <code>apps/server/src/provider/Layers/AntigravityAdapter.ts</code> &mdash; Prewarm
+          concurrency gating
+        </li>
+        <li>
+          <code>apps/server/src/serverRuntimeStartup.ts</code> &mdash; Provider readiness gating &
+          continuation retry
+        </li>
+        <li>
+          <code>apps/server/src/provider/antigravityAuthSupport.ts</code> &mdash; Browser preflight
+          process caching
+        </li>
+      </ul>
+    </div>
+  </body>
+</html>

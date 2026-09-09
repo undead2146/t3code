@@ -18,6 +18,7 @@ import {
   setSnapShotShortcutSuppressed,
   snapShotScreenFrame,
   snapShotRelativeFrame,
+  listPendingSnapShots,
 } from "./snapShot.ts";
 
 describe("window capture IPC", () => {
@@ -339,6 +340,61 @@ describe("window capture IPC", () => {
       assert.isTrue(suppressed);
     }).pipe(Effect.provide(layer));
   });
+
+  it.effect(
+    "authorizes snapshot requests from a secondary window (such as pull requests window)",
+    () => {
+      const prWindow = {
+        id: 2,
+        getContentBounds: () => ({ x: 100, y: 50, width: 800, height: 600 }),
+        webContents: {
+          id: 42,
+          getZoomFactor: () => 1,
+        },
+      };
+      let listPendingCalled = false;
+      const layer = Layer.mergeAll(
+        Layer.succeed(
+          ElectronWindow.ElectronWindow,
+          ElectronWindow.ElectronWindow.of({
+            main: Effect.succeed(Option.some({ webContents: { id: 7 } } as Electron.BrowserWindow)),
+            findByWebContentsId: (id) =>
+              Effect.succeed(
+                id === 42
+                  ? Option.some(prWindow as unknown as Electron.BrowserWindow)
+                  : Option.none(),
+              ),
+          } as ElectronWindow.ElectronWindow["Service"]),
+        ),
+        Layer.succeed(
+          DesktopSnapShot.DesktopSnapShot,
+          DesktopSnapShot.DesktopSnapShot.of({
+            listPending: Effect.sync(() => {
+              listPendingCalled = true;
+              return [];
+            }),
+          } as unknown as DesktopSnapShot.DesktopSnapShot["Service"]),
+        ),
+      );
+
+      return Effect.gen(function* () {
+        const pending = yield* listPendingSnapShots.handler(undefined, { sender: { id: 42 } });
+        assert.deepEqual(pending, []);
+        assert.isTrue(listPendingCalled);
+
+        const rejected = yield* Effect.exit(
+          listPendingSnapShots.handler(undefined, { sender: { id: 999 } }),
+        );
+        assert(Exit.isFailure(rejected));
+        const failure = Cause.findErrorOption(rejected.cause);
+        assert(Option.isSome(failure));
+        assert.equal(
+          (failure.value as { readonly _tag: string })._tag,
+          "SnapShotIpcUnauthorizedSenderError",
+        );
+      }).pipe(Effect.provide(layer));
+    },
+  );
 });
 
 it("normalizes Wayland attachment coordinates without trusting Electron's screen origin", () => {
