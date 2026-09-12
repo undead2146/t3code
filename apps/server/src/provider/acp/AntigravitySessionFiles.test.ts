@@ -103,4 +103,53 @@ describe("AntigravitySessionFiles", () => {
       expect(secondRun).toEqual({ repairedCheckpoints: 0, removedErrorSteps: 0 });
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+
+  it.effect("removes fatal executor construction and MCP failure crash steps", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+
+      const tempDir = yield* fs.makeTempDirectoryScoped();
+      const acpDir = path.join(tempDir, "antigravity-acp", "conversations");
+      yield* fs.makeDirectory(acpDir, { recursive: true });
+
+      const sessionId = "58b9fc5a-8f4b-4d24-a4dc-6e7a12260a32";
+      const dbPath = path.join(acpDir, `${sessionId}.db`);
+
+      const db = new NodeSqlite.DatabaseSync(dbPath);
+      db.exec(`
+        CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB);
+      `);
+
+      // Normal user message step
+      db.prepare("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)").run(
+        2770,
+        14,
+        Buffer.from("what is the status of this so far?"),
+      );
+      // Terminal failure step recorded by Antigravity Go harness on aborted MCP initialization
+      db.prepare("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)").run(
+        2771,
+        17,
+        Buffer.from(
+          '(Agent execution terminated due to error. failed to construct executor: MCP load failed for t3-code: context canceled client is closing: sending "notifications/cancelled": Bad Request',
+        ),
+      );
+      db.close();
+
+      const run = yield* sanitizeAntigravitySessionDatabase({
+        profileDirectory: tempDir,
+        sessionId,
+      });
+      expect(run).toEqual({ repairedCheckpoints: 0, removedErrorSteps: 1 });
+
+      const verifyDb = new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
+      const remainingSteps = verifyDb.prepare("SELECT idx, step_type FROM steps").all() as Array<{
+        idx: number;
+        step_type: number;
+      }>;
+      expect(remainingSteps).toEqual([{ idx: 2770, step_type: 14 }]);
+      verifyDb.close();
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 });

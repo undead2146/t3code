@@ -12,22 +12,30 @@ const decodeSessionMetadata = Schema.decodeEffect(
 
 /**
  * Repairs Antigravity SQLite conversation databases that were corrupted by an
- * interrupted context checkpoint.
+ * interrupted context checkpoint or fatal executor error.
  *
  * Root Cause & Prevention:
- * When an Antigravity ACP conversation approaches the context compaction threshold (~110k tokens),
- * the internal Go harness (localharness_external) registers an in-progress checkpoint in
- * `executor_metadata` (status = 1 / protobuf varint sequence 0x08 0x01) and sets up an in-memory
- * Go channel `doneCh`.
- * If concurrent tool calls or process exit interrupt this checkpoint, `status = 1` remains written to disk.
- * On every subsequent process boot or session resume, `checkpoint_validation.go` scans `executor_metadata`.
- * Seeing an active checkpoint without its ephemeral in-memory `doneCh`, it immediately panics with:
- *   "agent executor error: could not find doneCh for checkpoint"
+ * 1. Context Compaction Checkpoints:
+ *    When an Antigravity ACP conversation approaches the context compaction threshold (~110k tokens),
+ *    the internal Go harness (localharness_external) registers an in-progress checkpoint in
+ *    `executor_metadata` (status = 1 / protobuf varint sequence 0x08 0x01) and sets up an in-memory
+ *    Go channel `doneCh`.
+ *    If concurrent tool calls, crash, or PC reboot interrupt this checkpoint, `status = 1` remains written to disk.
+ *    On every subsequent process boot or session resume, `checkpoint_validation.go` scans `executor_metadata`.
+ *    Seeing an active checkpoint without its ephemeral in-memory `doneCh`, it immediately panics with:
+ *      "agent executor error: could not find doneCh for checkpoint"
+ *
+ * 2. Unhandled Fatal Executor / MCP Crash Steps:
+ *    If an executor construction or MCP initialization fails on reboot or cancellation, Antigravity records
+ *    a fatal terminal error step (`step_type == 17`) with payload like:
+ *      "(Agent execution terminated due to error. failed to construct executor: MCP load failed..."
+ *    Resuming a session with this trailing terminal step causes the internal Go executor to hang or stall
+ *    on subsequent `session/prompt` calls until the turn watchdog times out.
  *
  * This sanitizer neutralizes that poisoned state:
  * 1. Checks `executor_metadata` for any checkpoint row where status == 1 (IN_PROGRESS, 0x08 0x01).
  *    Transitions it to status == 2 (SKIPPED, 0x08 0x02) so the Go validation hook does not expect `doneCh`.
- * 2. Removes any trailing panic error step (step_type == 17) in `steps` caused by the unhandled checkpoint error.
+ * 2. Removes any trailing panic or fatal executor termination step (step_type == 17) in `steps`.
  */
 export const sanitizeAntigravitySessionDatabase = Effect.fn("sanitizeAntigravitySessionDatabase")(
   function* (input: { readonly profileDirectory: string; readonly sessionId: string | undefined }) {
@@ -97,7 +105,10 @@ export const sanitizeAntigravitySessionDatabase = Effect.fn("sanitizeAntigravity
                   : "";
                 if (
                   payloadStr.includes("could not find doneCh for checkpoint") ||
-                  payloadStr.includes("agent executor error")
+                  payloadStr.includes("agent executor error") ||
+                  payloadStr.includes("failed to construct executor") ||
+                  payloadStr.includes("Agent execution terminated due to error") ||
+                  payloadStr.includes("MCP load failed")
                 ) {
                   db.prepare("DELETE FROM steps WHERE idx = ?").run(step.idx);
                   removedErrorSteps++;

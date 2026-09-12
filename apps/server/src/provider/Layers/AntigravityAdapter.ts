@@ -634,6 +634,48 @@ interface OpenCommand {
   readonly promoted: boolean;
 }
 
+export function killRunningCommands(commands?: Iterable<OpenCommand>): void {
+  try {
+    const snippets: string[] = [];
+    if (commands) {
+      for (const cmd of commands) {
+        const toolData = (cmd.toolCall.data ?? {}) as Record<string, unknown>;
+        const rawCmd =
+          cmd.toolCall.command ??
+          (typeof toolData.command_line === "string" ? toolData.command_line : undefined) ??
+          (typeof toolData.CommandLine === "string" ? toolData.CommandLine : undefined) ??
+          (typeof toolData.command === "string" ? toolData.command : undefined) ??
+          cmd.toolCall.title;
+        if (!rawCmd || typeof rawCmd !== "string") continue;
+        const safeSnippet = rawCmd
+          .replace(/["'`$\\]/g, "")
+          .slice(0, 40)
+          .trim();
+        if (safeSnippet.length > 2) {
+          snippets.push(safeSnippet);
+        }
+      }
+    }
+
+    if (process.platform === "win32") {
+      const snippetFilters = snippets.map((s) => `$_.CommandLine -like '*${s}*'`).join(" -or ");
+      const filterClause = snippetFilters
+        ? `($_.Name -match '^(?:powershell|cmd|bash|gh|git)(?:\\.exe)?$' -or ${snippetFilters})`
+        : "$_.Name -match '^(?:powershell|cmd|bash|gh|git)(?:\\.exe)?$'";
+      const psKill = `$h = (Get-Process localharness_external, agy_acp_server -ErrorAction SilentlyContinue).Id; if ($h) { Get-CimInstance Win32_Process | Where-Object { $h -contains $_.ParentProcessId -and ${filterClause} } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }`;
+      NodeCP.exec(`powershell -NoProfile -Command "${psKill}"`, () => {});
+    } else {
+      for (const s of snippets) {
+        NodeCP.exec(`pkill -9 -f "${s}"`, () => {});
+      }
+      NodeCP.exec(
+        'pkill -9 -P $(pgrep -d, -f "localharness_external|agy_acp_server" 2>/dev/null) 2>/dev/null',
+        () => {},
+      );
+    }
+  } catch {}
+}
+
 interface OpenSubagent {
   readonly turnId: TurnId | undefined;
   readonly status: "pending" | "running" | undefined;
@@ -1065,7 +1107,6 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
     context.commandLock.withPermit(
       Effect.gen(function* () {
         for (const [id, command] of context.commands) {
-          if (!command.promoted) continue;
           yield* emit({
             type: "task.completed",
             ...(yield* stamp),
@@ -1080,6 +1121,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             },
           });
         }
+        killRunningCommands(context.commands.values());
         context.commands.clear();
       }),
     );
@@ -2222,7 +2264,11 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       if (turn.settled || context.stopped || context.generation !== turn.generation) return;
       turn.settled = true;
       context.activeTurnIntent = undefined;
-      yield* promoteBackgroundCommands(context);
+      if (payload.state === "cancelled" || payload.state === "failed") {
+        yield* finishBackgroundCommands(context);
+      } else {
+        yield* promoteBackgroundCommands(context);
+      }
       yield* finishSubagents(
         context,
         payload.state === "cancelled"
@@ -2639,6 +2685,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         yield* Fiber.interrupt(promptFiber);
       }
       yield* finishSubagents(context, "cancelled");
+      yield* finishBackgroundCommands(context);
       const turn = context.activeTurnIntent;
       if (turn && !turn.settled) {
         yield* finishSessionTurn(context, turn, {

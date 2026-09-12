@@ -85,6 +85,12 @@ const isCompactCommandMessage = (message: ThreadTitleMessage): boolean =>
   message.role === "user" &&
   (message.attachments?.length ?? 0) === 0 &&
   message.text.trim().toLowerCase() === "/compact";
+
+const isStopCommandMessage = (message: ThreadTitleMessage): boolean =>
+  message.role === "user" &&
+  (message.attachments?.length ?? 0) === 0 &&
+  /^(?:\/stop|\/cancel|\/abort|stop|cancel|abort)!?$/i.test(message.text.trim());
+
 function mapProviderSessionStatusToOrchestrationStatus(
   status: "connecting" | "ready" | "running" | "error" | "closed",
 ): OrchestrationSession["status"] {
@@ -1312,6 +1318,40 @@ const make = Effect.gen(function* () {
     }).pipe(Effect.catchCause((cause) => recoverTurnStartFailure(cause).pipe(Effect.as(true))));
     if (authCommandHandled) {
       return;
+    }
+
+    const isStopCommand = isStopCommandMessage(message);
+    if (isStopCommand) {
+      const latestThread = yield* resolveThreadShell(event.payload.threadId);
+      const isRunning =
+        latestThread?.session?.status === "starting" ||
+        latestThread?.session?.status === "running" ||
+        startingTurnFibers.has(event.payload.threadId);
+      if (isRunning) {
+        const inFlight = startingTurnFibers.get(event.payload.threadId);
+        if (inFlight) {
+          startingTurnFibers.delete(event.payload.threadId);
+          yield* Fiber.interrupt(inFlight);
+        }
+        yield* providerService
+          .interruptTurn({ threadId: event.payload.threadId })
+          .pipe(Effect.catchCause(recoverTurnStartFailure));
+        yield* appendProviderActivity({
+          threadId: event.payload.threadId,
+          activity: {
+            id: yield* serverEventId(),
+            tone: "info",
+            kind: "provider.turn.interrupted",
+            summary: "Turn stopped by user",
+            payload: { messageId: event.payload.messageId },
+            turnId: latestThread?.session?.activeTurnId ?? null,
+            createdAt: event.payload.createdAt,
+          },
+          createdAt: event.payload.createdAt,
+        });
+        return;
+      }
+      return yield* appendTurnStartFailure("Stop", "No active provider turn is running to stop.");
     }
 
     yield* ensureThreadWorktree(thread);
