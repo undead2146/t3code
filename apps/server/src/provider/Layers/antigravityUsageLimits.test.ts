@@ -218,6 +218,7 @@ describe("antigravityUsageLimits", () => {
       buckets: [
         {
           bucketId: "3p-weekly",
+          modelId: "3p-weekly",
           label: "Weekly Limit Remaining",
           groupName: "Claude and GPT models",
           window: "weekly",
