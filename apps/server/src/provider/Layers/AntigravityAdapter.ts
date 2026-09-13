@@ -634,6 +634,8 @@ interface OpenCommand {
   readonly promoted: boolean;
 }
 
+const PROTECTED_PROCESS_PATTERN = /(?:agy_acp_server|localharness|t3code|node)/i;
+
 export function killRunningCommands(commands?: Iterable<OpenCommand>): void {
   try {
     const snippets: string[] = [];
@@ -651,27 +653,26 @@ export function killRunningCommands(commands?: Iterable<OpenCommand>): void {
           .replace(/["'`$\\]/g, "")
           .slice(0, 40)
           .trim();
-        if (safeSnippet.length > 2) {
+        if (safeSnippet.length > 2 && !PROTECTED_PROCESS_PATTERN.test(safeSnippet)) {
           snippets.push(safeSnippet);
         }
       }
     }
 
+    if (snippets.length === 0) return;
+
     if (process.platform === "win32") {
       const snippetFilters = snippets.map((s) => `$_.CommandLine -like '*${s}*'`).join(" -or ");
-      const filterClause = snippetFilters
-        ? `($_.Name -match '^(?:powershell|cmd|bash|gh|git)(?:\\.exe)?$' -or ${snippetFilters})`
-        : "$_.Name -match '^(?:powershell|cmd|bash|gh|git)(?:\\.exe)?$'";
-      const psKill = `$h = (Get-Process localharness_external, agy_acp_server -ErrorAction SilentlyContinue).Id; if ($h) { Get-CimInstance Win32_Process | Where-Object { $h -contains $_.ParentProcessId -and ${filterClause} } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }`;
+      const filterClause = `($_.Name -match '^(?:powershell|cmd|bash|gh|git)(?:\\.exe)?$' -and (${snippetFilters}))`;
+      const psKill = `$h = (Get-Process localharness_external -ErrorAction SilentlyContinue).Id; if ($h) { Get-CimInstance Win32_Process | Where-Object { $h -contains $_.ParentProcessId -and ${filterClause} } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }`;
       NodeCP.exec(`powershell -NoProfile -Command "${psKill}"`, () => {});
     } else {
       for (const s of snippets) {
-        NodeCP.exec(`pkill -9 -f "${s}"`, () => {});
+        NodeCP.exec(
+          `pids=$(pgrep -d, -f "${s}" 2>/dev/null); if [ -n "$pids" ]; then pkill -9 -P "$pids" 2>/dev/null; pkill -9 -f "${s}" 2>/dev/null; fi`,
+          () => {},
+        );
       }
-      NodeCP.exec(
-        'pkill -9 -P $(pgrep -d, -f "localharness_external|agy_acp_server" 2>/dev/null) 2>/dev/null',
-        () => {},
-      );
     }
   } catch {}
 }
