@@ -457,6 +457,21 @@ it.layer(layer)("AntigravityAdapter", (it) => {
     }),
   );
 
+  it.effect("starts a fresh session when given an invalid or null resume cursor", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const session = yield* h.adapter.startSession({
+        threadId,
+        cwd: "/tmp",
+        runtimeMode: "auto-accept-edits",
+        resumeCursor: { invalid: true },
+      });
+      expect(session.status).toBe("ready");
+      expect(session.resumeCursor).toEqual({ schemaVersion: 1, sessionId: nativeSessionId });
+      expect(h.launches[0]?.resumeSessionId).toBeUndefined();
+    }),
+  );
+
   it.effect("keeps thoughts, native command results, and replies on the active turn", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness();
@@ -1372,7 +1387,7 @@ it.layer(layer)("AntigravityAdapter", (it) => {
       }).pipe(Effect.scoped),
   );
 
-  it.effect("does not launch a process for a disabled instance or invalid resume cursor", () =>
+  it.effect("does not launch a process for a disabled instance", () =>
     Effect.gen(function* () {
       const disabled = yield* makeHarness({ enabled: false });
       const rejected = yield* disabled.adapter
@@ -1380,17 +1395,6 @@ it.layer(layer)("AntigravityAdapter", (it) => {
         .pipe(Effect.exit);
       expect(Exit.isFailure(rejected)).toBe(true);
       expect(disabled.launches).toHaveLength(0);
-      const active = yield* makeHarness();
-      const stale = yield* active.adapter
-        .startSession({
-          threadId,
-          cwd: process.cwd(),
-          runtimeMode: "approval-required",
-          resumeCursor: { sessionId: nativeSessionId },
-        })
-        .pipe(Effect.exit);
-      expect(Exit.isFailure(stale)).toBe(true);
-      expect(active.launches).toHaveLength(0);
     }),
   );
   it.effect(

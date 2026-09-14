@@ -1959,11 +1959,10 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         }
         const cursor = decodeResumeCursor(input.resumeCursor);
         if (input.resumeCursor !== undefined && Option.isNone(cursor)) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "startSession",
-            issue: "The saved Antigravity session is invalid. Start a new thread.",
-          });
+          yield* Effect.logWarning(
+            "The saved Antigravity session cursor is invalid; starting a fresh session instead.",
+            { threadId: input.threadId },
+          );
         }
         const previous = sessions.get(input.threadId);
         if (previous) yield* stopContext(previous);
