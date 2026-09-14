@@ -15,7 +15,7 @@
   ],
   "type": "module",
   "scripts": {
-    "dev": "node --watch-path=src src/bin.ts",
+    "dev": "node --watch-path=src src/bin.ts --no-auto-bootstrap-project-from-cwd",
     "build:bundle": "vp pack && vp pack src/service-launcher.ts --out-dir dist --no-clean",
     "start": "node dist/bin.mjs",
     "typecheck": "tsc --noEmit",

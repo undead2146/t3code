@@ -200,7 +200,13 @@ export const resolveAutoBootstrapWelcomeTargets = Effect.gen(function* () {
   let bootstrapProjectCreated = false;
   let bootstrapThreadCreated = false;
 
-  if (serverConfig.autoBootstrapProjectFromCwd) {
+  const normalizedCwd = serverConfig.cwd.replace(/\\/g, "/");
+  const isInternalServerPackage =
+    normalizedCwd.endsWith("/apps/server") ||
+    normalizedCwd.endsWith("/apps/web") ||
+    normalizedCwd.endsWith("/apps/desktop");
+
+  if (serverConfig.autoBootstrapProjectFromCwd && !isInternalServerPackage) {
     const settings = yield* (yield* ServerSettings.ServerSettingsService).getSettings;
     const defaultModelSelection =
       settings.defaultModelSelection ?? getAutoBootstrapThreadModelSelection();

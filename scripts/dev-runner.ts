@@ -404,7 +404,7 @@ export function createDevRunnerEnv({
     if (autoBootstrapProjectFromCwd !== undefined) {
       output.T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD = autoBootstrapProjectFromCwd ? "1" : "0";
     } else {
-      delete output.T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD;
+      output.T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD = "0";
     }
 
     if (logWebSocketEvents !== undefined) {

@@ -513,3 +513,55 @@ it.effect("completeAutoBootstrapWelcome settles an empty bootstrap result", () =
     assert.deepStrictEqual(completion, { bootstrapStatus: "complete" });
   }),
 );
+
+it.effect("resolveAutoBootstrapWelcomeTargets skips internal server package cwd", () =>
+  Effect.gen(function* () {
+    const dispatchCalls = yield* Ref.make<ReadonlyArray<string>>([]);
+    const targets = yield* ServerRuntimeStartup.resolveAutoBootstrapWelcomeTargets.pipe(
+      Effect.provide(ServerSettings.layerTest()),
+      Effect.provideService(ServerConfig.ServerConfig, {
+        cwd: "/home/ubuntu/t3code/apps/server",
+        autoBootstrapProjectFromCwd: true,
+      } as never),
+      Effect.provideService(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+        getUserInputActivity: () => Effect.die("unused"),
+        getCommandReadModel: () => Effect.die("unused"),
+        getSnapshot: () => Effect.die("unused"),
+        getShellSnapshot: () => Effect.die("unused"),
+        getArchivedShellSnapshot: () => Effect.die("unused"),
+        getSnapshotSequence: () => Effect.die("unused"),
+        getCounts: () => Effect.die("unused"),
+        getEventReplayStats: () => Effect.die("unused"),
+        getActiveProjectByWorkspaceRoot: () => Effect.die("should not be called"),
+        getProjectShells: () => Effect.die("unused"),
+        getProjectShellById: () => Effect.die("unused"),
+        getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
+        getImportedAgentSessionSources: () => Effect.die("unused"),
+        getThreadCheckpointContext: () => Effect.die("unused"),
+        getFullThreadDiffContext: () => Effect.die("unused"),
+        getThreadRuntimeContext: () => Effect.die("unused"),
+        getTurnStartMessage: () => Effect.die("unused"),
+        getThreadShellById: () => Effect.die("unused"),
+        getThreadDetailById: () => Effect.die("unused"),
+        getThreadDetailSnapshot: () => Effect.die("unused"),
+        searchThreads: () => Effect.die("unused"),
+      }),
+      Effect.provideService(OrchestrationEngine.OrchestrationEngineService, {
+        readEvents: () => Stream.empty,
+        readThreadEvents: () => Stream.empty,
+        getThreadReplayStats: () => Effect.die("unused"),
+        dispatch: (command) =>
+          Ref.update(dispatchCalls, (calls) => [...calls, command.type]).pipe(
+            Effect.as({ sequence: 1 }),
+          ),
+        streamDomainEvents: Stream.empty,
+        subscribeDomainEvents: Effect.succeed(Stream.empty),
+        latestSequence: Effect.succeed(0),
+      } satisfies OrchestrationEngine.OrchestrationEngineService["Service"]),
+      Effect.provide(NodeServices.layer),
+    );
+
+    assert.deepStrictEqual(targets, {});
+    assert.deepStrictEqual(yield* Ref.get(dispatchCalls), []);
+  }),
+);
