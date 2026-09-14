@@ -33,7 +33,14 @@ import {
   parseSessionUpdateEvent,
   type AcpToolCallState,
 } from "../acp/AcpRuntimeModel.ts";
-import { makeAntigravityAdapter, type AntigravityAdapterOptions } from "./AntigravityAdapter.ts";
+import {
+  escapeRegexForShell,
+  isFatalAntigravityHarnessError,
+  isRetryableAntigravityError,
+  makeAntigravityAdapter,
+  sanitizeCommandForKill,
+  type AntigravityAdapterOptions,
+} from "./AntigravityAdapter.ts";
 
 const instanceId = ProviderInstanceId.make("antigravity-test");
 const threadId = ThreadId.make("antigravity-thread");
@@ -230,6 +237,7 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
       instanceId,
       turnInactivityTimeoutMs: options?.turnInactivityTimeoutMs,
       activeToolInactivityTimeoutMs: options?.activeToolInactivityTimeoutMs,
+      turnRetryBaseDelayMs: 0,
       userHome: options?.userHome,
       profileDirectory: options?.profileDirectory,
       makeRuntime: (input) =>
@@ -1590,5 +1598,223 @@ it.layer(layer)("AntigravityAdapter", (it) => {
       const session = sessions.find((s) => s.threadId === threadId);
       expect(session?.status).toBe("error");
     }),
+  );
+
+  it("identifies retryable capacity, rate limit, and network errors", () => {
+    expect(
+      isRetryableAntigravityError(
+        undefined,
+        "Agent execution error: request failed (code 503): No capacity available for model gemini-3.8-flash-high on the server",
+      ),
+    ).toBe(true);
+    expect(
+      isRetryableAntigravityError(
+        'Encountered retryable error from model provider: Agent execution terminated due to error. ("request failed (code 503): No capacity available for model gemini-3.8-flash-high on the server")',
+      ),
+    ).toBe(true);
+    expect(isRetryableAntigravityError(new Error("RESOURCE_EXHAUSTED: Rate limit exceeded"))).toBe(
+      true,
+    );
+    expect(isRetryableAntigravityError(new Error("code 429: Too Many Requests"))).toBe(true);
+    expect(isRetryableAntigravityError(new Error("fetch failed: ECONNRESET"))).toBe(true);
+    expect(
+      isRetryableAntigravityError(
+        undefined,
+        'Agent execution error: MCP load failed for t3-code: calling "initialize": Unauthorized',
+      ),
+    ).toBe(false);
+    expect(isRetryableAntigravityError(new Error("Invalid API key"))).toBe(false);
+  });
+
+  it.effect(
+    "retries turn when encountering upstream 503 capacity error and completes when recovered",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        yield* h.adapter.startSession({
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+        });
+
+        const sending = yield* h.adapter
+          .sendTurn({ threadId, input: "Long running operation" })
+          .pipe(Effect.forkChild);
+
+        const firstPrompt = yield* h.nextPrompt;
+
+        yield* h.emitNative({
+          _tag: "ContentDelta",
+          text: "Agent execution error: request failed (code 503): No capacity available for model gemini-3.8-flash-high on the server",
+          rawPayload: null,
+        });
+
+        const retryState = yield* h.waitForEvent(
+          (event): event is ProviderRuntimeEvent & { type: "session.state.changed" } =>
+            event.type === "session.state.changed" &&
+            Boolean((event.payload as any)?.reason?.includes("api_retry:1/")),
+        );
+        expect((retryState.payload as any).reason).toContain("api_retry:1/");
+
+        const retryPrompt = yield* h.nextPrompt;
+
+        // Now capacity is restored, complete the prompt
+        yield* Deferred.succeed(retryPrompt.result, { stopReason: "end_turn" });
+
+        const result = yield* Fiber.join(sending);
+
+        const completed = yield* h.waitForEvent((event) => event.type === "turn.completed");
+        expect(completed.payload.state).toBe("completed");
+        expect(yield* h.adapter.hasSession(threadId)).toBe(true);
+      }),
+  );
+
+  it.effect("settles turn as failed with 503 capacity error when retries are exhausted", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      yield* h.adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+
+      const sending = yield* h.adapter
+        .sendTurn({ threadId, input: "Long running operation" })
+        .pipe(Effect.forkChild);
+
+      // Initial prompt + 3 retries = 4 prompts
+      for (let attempt = 0; attempt <= 3; attempt++) {
+        const prompt = yield* h.nextPrompt;
+        yield* h.emitNative({
+          _tag: "ContentDelta",
+          text: "Agent execution error: request failed (code 503): No capacity available for model gemini-3.8-flash-high on the server",
+          rawPayload: null,
+        });
+      }
+
+      const turnExit = yield* Fiber.await(sending);
+      expect(Exit.isFailure(turnExit)).toBe(true);
+
+      const completed = yield* h.waitForEvent((event) => event.type === "turn.completed");
+      expect(completed.payload.state).toBe("failed");
+      expect(completed.payload.errorMessage).toMatch(/503|capacity/i);
+
+      const exited = yield* h.waitForEvent((event) => event.type === "session.exited");
+      expect(exited.payload.exitKind).toBe("error");
+    }),
+  );
+  it("properly sanitizes commands and escapes regex characters for safe process termination", () => {
+    // 1. Alternation with pipes (the lethal bug) must have pipes stripped and not produce empty branches
+    const lethal = sanitizeCommandForKill("pkill -f VBCSCompiler || true");
+    expect(lethal).toBe("pkill -f VBCSCompiler true");
+    const escapedLethal = escapeRegexForShell(lethal!);
+    expect(escapedLethal).not.toContain("||");
+    expect(escapedLethal).not.toContain("|");
+
+    // 2. Shell injection and chaining symbols are stripped
+    const chained = sanitizeCommandForKill("echo hello && rm -rf / ; cat foo");
+    expect(chained).toBe("echo hello rm -rf / cat foo");
+
+    // 3. Protected processes are never targeted
+    expect(sanitizeCommandForKill("node scripts/dev-runner.ts")).toBeUndefined();
+    expect(sanitizeCommandForKill("systemd --user")).toBeUndefined();
+    expect(sanitizeCommandForKill("bash -c something")).toBeUndefined();
+    expect(sanitizeCommandForKill("agy_acp_server --port 1234")).toBeUndefined();
+    expect(sanitizeCommandForKill("t3code-server")).toBeUndefined();
+
+    // 4. Short commands are ignored
+    expect(sanitizeCommandForKill("ls")).toBeUndefined();
+    expect(sanitizeCommandForKill("")).toBeUndefined();
+    expect(sanitizeCommandForKill(undefined)).toBeUndefined();
+
+    // 5. Regex metacharacters are escaped for shell
+    const escaped = escapeRegexForShell("dotnet run --filter (Unit|Integration) [v1.*]");
+    expect(escaped).toBe(String.raw`dotnet\ run\ \-\-filter\ \(Unit\|Integration\)\ \[v1\.\*\]`);
+  });
+
+  it("identifies fatal Antigravity harness and compaction race errors", () => {
+    expect(
+      isFatalAntigravityHarnessError(
+        undefined,
+        'Agent execution terminated due to error. ("agent executor error: could not find doneCh for checkpoint")',
+      ),
+    ).toBe(true);
+    expect(isFatalAntigravityHarnessError("could not find doneCh for checkpoint")).toBe(true);
+    expect(
+      isFatalAntigravityHarnessError(new Error("agent executor error: fatal executor error")),
+    ).toBe(true);
+    expect(
+      isFatalAntigravityHarnessError(undefined, "checkpoint validation failed: corrupt index"),
+    ).toBe(true);
+    expect(isFatalAntigravityHarnessError(new Error("File not found: /foo/bar.txt"))).toBe(false);
+    expect(isFatalAntigravityHarnessError(undefined, "Command failed with exit code 1")).toBe(
+      false,
+    );
+    expect(
+      isFatalAntigravityHarnessError(
+        undefined,
+        "Agent execution error: request failed (code 503): No capacity available",
+      ),
+    ).toBe(false);
+  });
+
+  it.effect(
+    "detects fatal harness checkpoint error in tool execution and settles turn as failed",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        yield* h.adapter.startSession({
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+        });
+
+        const sending = yield* h.adapter
+          .sendTurn({ threadId, input: "Do complex parallel tasks" })
+          .pipe(Effect.forkChild);
+
+        const prompt = yield* h.nextPrompt;
+
+        // Tool call starts
+        yield* h.emitNative({
+          _tag: "ToolCallUpdated",
+          toolCall: {
+            toolCallId: "call_123",
+            title: "read_file",
+            status: "inProgress",
+            data: {},
+          },
+          rawPayload: null,
+        });
+
+        // Tool call fails due to internal harness compaction error
+        yield* h.emitNative({
+          _tag: "ToolCallUpdated",
+          toolCall: {
+            toolCallId: "call_123",
+            title: "read_file",
+            status: "failed",
+            data: {
+              rawOutput:
+                'Agent execution terminated due to error. ("agent executor error: could not find doneCh for checkpoint")',
+            },
+          },
+          rawPayload: null,
+        });
+
+        // Harness returns false end_turn stop reason
+        yield* Deferred.succeed(prompt.result, { stopReason: "end_turn" });
+
+        const turnExit = yield* Fiber.await(sending);
+        expect(Exit.isFailure(turnExit)).toBe(true);
+
+        const completed = yield* h.waitForEvent((event) => event.type === "turn.completed");
+        expect(completed.payload.state).toBe("failed");
+        expect(completed.payload.stopReason).toBe("error");
+        expect(completed.payload.errorMessage).toContain("could not find doneCh for checkpoint");
+
+        const exited = yield* h.waitForEvent((event) => event.type === "session.exited");
+        expect(exited.payload.exitKind).toBe("error");
+      }),
   );
 });

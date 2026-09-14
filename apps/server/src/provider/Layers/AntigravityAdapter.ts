@@ -152,6 +152,26 @@ export function findChildPidsOfHarness(): Promise<number[]> {
   });
 }
 
+export const PROTECTED_PROCESS_PATTERN =
+  /(?:agy_acp_server|localharness|t3code|node|systemd|dev-runner|sshd|bash|sh|tailscaled)/i;
+
+export function escapeRegexForShell(pattern: string): string {
+  return pattern.replace(/[-\[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+}
+
+export function sanitizeCommandForKill(rawCmd?: unknown, maxLen = 40): string | undefined {
+  if (!rawCmd || typeof rawCmd !== "string") return undefined;
+  const safeSnippet = rawCmd
+    .replace(/["'`$\\|;&><]/g, " ")
+    .replace(/\s+/g, " ")
+    .slice(0, maxLen)
+    .trim();
+  if (safeSnippet.length > 3 && !PROTECTED_PROCESS_PATTERN.test(safeSnippet)) {
+    return safeSnippet;
+  }
+  return undefined;
+}
+
 export function registerKilledSubagent(conversationId: string): void {
   if (!conversationId || typeof conversationId !== "string" || conversationId.length < 5) return;
   KILLED_SUBAGENT_IDS.add(conversationId);
@@ -174,15 +194,17 @@ export function registerKilledSubagent(conversationId: string): void {
         );
       }
       if (activeCmd) {
-        const safeSnippet = activeCmd.replace(/["'`$\\]/g, "").slice(0, 35);
-        if (safeSnippet.length > 3) {
+        const safeSnippet = sanitizeCommandForKill(activeCmd, 35);
+        if (safeSnippet) {
           const psKill = `$h = (Get-Process localharness_external, agy_acp_server -ErrorAction SilentlyContinue).Id; if ($h) { Get-CimInstance Win32_Process | Where-Object { $h -contains $_.ParentProcessId -and $_.CommandLine -like '*${safeSnippet}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }`;
           NodeCP.exec(`powershell -NoProfile -Command "${psKill}"`, () => {});
         }
       }
-      const safeId = conversationId.replace(/["'`$\\]/g, "");
-      const psIdKill = `Get-CimInstance Win32_Process | Where-Object CommandLine -like "*${safeId}*" | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
-      NodeCP.exec(`powershell -NoProfile -Command "${psIdKill}"`, () => {});
+      const safeId = conversationId.replace(/[^a-zA-Z0-9-]/g, "");
+      if (safeId.length > 5) {
+        const psIdKill = `Get-CimInstance Win32_Process | Where-Object CommandLine -like "*${safeId}*" | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`;
+        NodeCP.exec(`powershell -NoProfile -Command "${psIdKill}"`, () => {});
+      }
     } else {
       if (pids && pids.size > 0) {
         for (const pid of pids) {
@@ -190,12 +212,16 @@ export function registerKilledSubagent(conversationId: string): void {
         }
       }
       if (activeCmd) {
-        const safeSnippet = activeCmd.replace(/["'`$\\]/g, "").slice(0, 35);
-        if (safeSnippet.length > 3) {
-          NodeCP.exec(`pkill -9 -f "${safeSnippet}"`, () => {});
+        const safeSnippet = sanitizeCommandForKill(activeCmd, 35);
+        if (safeSnippet) {
+          const escaped = escapeRegexForShell(safeSnippet);
+          NodeCP.exec(`pkill -9 -f "${escaped}"`, () => {});
         }
       }
-      NodeCP.exec(`pkill -9 -f "${conversationId}"`, () => {});
+      const safeId = conversationId.replace(/[^a-zA-Z0-9-]/g, "");
+      if (safeId.length > 5) {
+        NodeCP.exec(`pkill -9 -f "${safeId}"`, () => {});
+      }
     }
   } catch {}
 }
@@ -610,6 +636,7 @@ export interface AntigravityAdapterOptions {
   /** Override turn inactivity watchdog in focused tests. */
   readonly turnInactivityTimeoutMs?: number | undefined;
   readonly activeToolInactivityTimeoutMs?: number | undefined;
+  readonly turnRetryBaseDelayMs?: number | undefined;
 }
 
 interface PendingApproval {
@@ -634,8 +661,6 @@ interface OpenCommand {
   readonly promoted: boolean;
 }
 
-const PROTECTED_PROCESS_PATTERN = /(?:agy_acp_server|localharness|t3code|node)/i;
-
 export function killRunningCommands(commands?: Iterable<OpenCommand>): void {
   try {
     const snippets: string[] = [];
@@ -648,12 +673,8 @@ export function killRunningCommands(commands?: Iterable<OpenCommand>): void {
           (typeof toolData.CommandLine === "string" ? toolData.CommandLine : undefined) ??
           (typeof toolData.command === "string" ? toolData.command : undefined) ??
           cmd.toolCall.title;
-        if (!rawCmd || typeof rawCmd !== "string") continue;
-        const safeSnippet = rawCmd
-          .replace(/["'`$\\]/g, "")
-          .slice(0, 40)
-          .trim();
-        if (safeSnippet.length > 2 && !PROTECTED_PROCESS_PATTERN.test(safeSnippet)) {
+        const safeSnippet = sanitizeCommandForKill(rawCmd, 40);
+        if (safeSnippet) {
           snippets.push(safeSnippet);
         }
       }
@@ -668,8 +689,9 @@ export function killRunningCommands(commands?: Iterable<OpenCommand>): void {
       NodeCP.exec(`powershell -NoProfile -Command "${psKill}"`, () => {});
     } else {
       for (const s of snippets) {
+        const escaped = escapeRegexForShell(s);
         NodeCP.exec(
-          `pids=$(pgrep -d, -f "${s}" 2>/dev/null); if [ -n "$pids" ]; then pkill -9 -P "$pids" 2>/dev/null; pkill -9 -f "${s}" 2>/dev/null; fi`,
+          `pids=$(pgrep -d, -f "${escaped}" 2>/dev/null); if [ -n "$pids" ]; then pkill -9 -P "$pids" 2>/dev/null; pkill -9 -f "${escaped}" 2>/dev/null; fi`,
           () => {},
         );
       }
@@ -696,6 +718,95 @@ interface TurnIntent {
   readonly turnId: TurnId;
   readonly generation: number;
   settled: boolean;
+}
+
+export function isFatalAntigravityHarnessError(error?: unknown, text?: string): boolean {
+  const check = (str: string): boolean => {
+    const s = str.toLowerCase();
+    return (
+      s.includes("could not find donech for checkpoint") ||
+      s.includes("agent execution terminated due to error") ||
+      s.includes("agent executor error:") ||
+      s.includes("fatal executor error") ||
+      s.includes("checkpoint validation failed")
+    );
+  };
+
+  if (typeof text === "string" && check(text)) return true;
+  if (typeof error === "string" && check(error)) return true;
+  if (error instanceof Error && check(error.message)) return true;
+  if (error && typeof error === "object") {
+    if (
+      "message" in error &&
+      typeof (error as any).message === "string" &&
+      check((error as any).message)
+    ) {
+      return true;
+    }
+    if (
+      "detail" in error &&
+      typeof (error as any).detail === "string" &&
+      check((error as any).detail)
+    ) {
+      return true;
+    }
+    for (const val of Object.values(error as Record<string, unknown>)) {
+      if (typeof val === "string" && check(val)) return true;
+      if (val && typeof val === "object") {
+        for (const nested of Object.values(val as Record<string, unknown>)) {
+          if (typeof nested === "string" && check(nested)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+export function isRetryableAntigravityError(error?: unknown, text?: string): boolean {
+  const check = (str: string): boolean => {
+    const s = str.toLowerCase();
+    return (
+      s.includes("503") ||
+      s.includes("no capacity available") ||
+      s.includes("capacity available") ||
+      s.includes("resource_exhausted") ||
+      s.includes("rate limit") ||
+      s.includes("rate_limit") ||
+      s.includes("429") ||
+      s.includes("quota exceeded") ||
+      s.includes("temporarily unavailable") ||
+      s.includes("retryable error") ||
+      s.includes("high demand") ||
+      s.includes("overloaded") ||
+      s.includes("econnreset") ||
+      s.includes("etimedout") ||
+      s.includes("socket hang up") ||
+      s.includes("fetch failed")
+    );
+  };
+
+  if (typeof text === "string" && check(text)) return true;
+  if (typeof error === "string" && check(error)) return true;
+  if (error && typeof error === "object") {
+    if (
+      "message" in error &&
+      typeof (error as any).message === "string" &&
+      check((error as any).message)
+    ) {
+      return true;
+    }
+    if (
+      "detail" in error &&
+      typeof (error as any).detail === "string" &&
+      check((error as any).detail)
+    ) {
+      return true;
+    }
+    if ("text" in error && typeof (error as any).text === "string" && check((error as any).text)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 interface SessionContext {
@@ -727,6 +838,8 @@ interface SessionContext {
   disconnected: boolean;
   lastActivityAtMillis: number;
   activeToolCalls: Set<string>;
+  pendingRetry?: { readonly error: string } | undefined;
+  fatalHarnessError?: string | undefined;
 }
 
 const CLIENT_FILE_MAX_BYTES = 8 * 1024 * 1024;
@@ -1165,6 +1278,13 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         Effect.gen(function* () {
           if (context.closed) return;
           context.stopped = true;
+          if (context.activeTurnIntent && !context.activeTurnIntent.settled) {
+            yield* finishSessionTurn(context, context.activeTurnIntent, {
+              state: context.disconnected ? "failed" : "cancelled",
+              stopReason: context.disconnected ? "error" : "cancelled",
+              ...(context.disconnected ? { errorMessage: "Antigravity process stopped." } : {}),
+            });
+          }
           yield* Effect.gen(function* () {
             yield* cancelRequests(context);
             if (context.promptFiber && !context.disconnected) {
@@ -1180,7 +1300,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             context.disconnected ? "Antigravity process stopped." : undefined,
           );
           context.subagents.clear();
-          if (context.disconnected && context.nativeSessionId) {
+          if (context.nativeSessionId) {
             yield* sanitizeAntigravitySessionDatabase({
               profileDirectory: options.profileDirectory ?? serverConfig.stateDir,
               sessionId: context.nativeSessionId,
@@ -1190,7 +1310,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               Effect.tap(({ repairedCheckpoints, removedErrorSteps }) =>
                 repairedCheckpoints > 0 || removedErrorSteps > 0
                   ? Effect.logWarning(
-                      "Sanitized corrupt Antigravity session database after process disconnect",
+                      "Sanitized corrupt Antigravity session database after session stop",
                       {
                         threadId: context.threadId,
                         sessionId: context.nativeSessionId,
@@ -1331,6 +1451,12 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         yield* options.onConfigOptionsUpdated?.(event.configOptions) ?? Effect.void;
         return;
       case "ConnectionTerminated":
+        if (context.activeTurnIntent && !context.activeTurnIntent.settled) {
+          yield* finishSessionTurn(context, context.activeTurnIntent, {
+            state: "failed",
+            errorMessage: "Antigravity process stopped unexpectedly.",
+          });
+        }
         context.stopped = true;
         context.disconnected = true;
         yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
@@ -1366,7 +1492,31 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             rawPayload: sanitizeAntigravityToolPayload(event.rawPayload),
           }),
         );
-        if (event._tag === "ContentDelta" && event.text?.includes("Agent execution error:")) {
+        if (
+          (event._tag === "ContentDelta" || event._tag === "ThoughtDelta") &&
+          (event.text?.includes("Agent execution error:") ||
+            isFatalAntigravityHarnessError(undefined, event.text))
+        ) {
+          const isRetryable = isRetryableAntigravityError(undefined, event.text);
+          if (
+            isRetryable &&
+            context.activeTurnIntent &&
+            !context.activeTurnIntent.settled &&
+            !context.stopped
+          ) {
+            context.pendingRetry = { error: event.text };
+            if (context.promptFiber) {
+              yield* Fiber.interrupt(context.promptFiber).pipe(Effect.forkIn(context.scope));
+              context.promptFiber = undefined;
+            }
+            return;
+          }
+          if (context.activeTurnIntent && !context.activeTurnIntent.settled) {
+            yield* finishSessionTurn(context, context.activeTurnIntent, {
+              state: "failed",
+              errorMessage: event.text,
+            });
+          }
           context.stopped = true;
           context.disconnected = true;
           if (context.promptFiber) {
@@ -1398,6 +1548,24 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               context.activeToolCalls.delete(toolCall.toolCallId);
             } else {
               context.activeToolCalls.add(toolCall.toolCallId);
+            }
+            if (toolCall.status === "failed") {
+              const rawOut = toolCall.data?.rawOutput;
+              const toolOutput =
+                toolCall.detail ??
+                (typeof rawOut === "string"
+                  ? rawOut
+                  : typeof (rawOut as Record<string, unknown> | null | undefined)
+                        ?.combinedOutput === "string"
+                    ? ((rawOut as Record<string, unknown>).combinedOutput as string)
+                    : undefined);
+              if (
+                isFatalAntigravityHarnessError(toolCall.data) ||
+                isFatalAntigravityHarnessError(undefined, toolOutput)
+              ) {
+                context.fatalHarnessError =
+                  toolOutput ?? "Agent execution terminated due to internal harness error";
+              }
             }
             const tracked = context.subagents.get(toolCall.toolCallId);
             if (tracked === "finished") return;
@@ -2448,7 +2616,8 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           );
           context.lastActivityAtMillis = yield* Clock.currentTimeMillis;
           context.activeToolCalls.clear();
-          return { turn, fiber };
+          context.fatalHarnessError = undefined;
+          return { turn, fiber, model };
         }),
       );
       const turnTimeout =
@@ -2457,41 +2626,162 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         options.activeToolInactivityTimeoutMs ??
         DEFAULT_ANTIGRAVITY_ACTIVE_TOOL_INACTIVITY_TIMEOUT_MS;
 
-      const watchdog = Effect.gen(function* () {
-        while (!intent?.settled && !context.stopped) {
-          if (context.approvals.size > 0 || context.questions.size > 0) {
-            context.lastActivityAtMillis = yield* Clock.currentTimeMillis;
-            yield* Effect.sleep("1 second");
-            continue;
+      const makeWatchdog = (
+        activeFiber: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>,
+      ) =>
+        Effect.gen(function* () {
+          while (!intent?.settled && !context.stopped) {
+            if (context.approvals.size > 0 || context.questions.size > 0) {
+              context.lastActivityAtMillis = yield* Clock.currentTimeMillis;
+              yield* Effect.sleep("1 second");
+              continue;
+            }
+            const limit = context.activeToolCalls.size > 0 ? toolTimeout : turnTimeout;
+            const now = yield* Clock.currentTimeMillis;
+            const elapsed = now - context.lastActivityAtMillis;
+            const remaining = limit - elapsed;
+            if (remaining <= 0) {
+              const errorMessage = `Antigravity response timed out after ${Math.max(1, Math.round(limit / 60000))} minutes of inactivity. The connection to the model may have stalled.`;
+              yield* context.promptLock.withPermit(
+                finishTurn(launch.turn, {
+                  state: "failed",
+                  errorMessage,
+                }),
+              );
+              yield* Fiber.interrupt(activeFiber).pipe(Effect.ignore);
+              yield* context.runtime.cancel.pipe(Effect.timeoutOption("3 seconds"), Effect.ignore);
+              return yield* new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session/prompt",
+                detail: errorMessage,
+              });
+            }
+            const sleepDuration = Math.max(10, Math.min(remaining, 3_000));
+            yield* Effect.sleep(Duration.millis(sleepDuration));
           }
-          const limit = context.activeToolCalls.size > 0 ? toolTimeout : turnTimeout;
-          const now = yield* Clock.currentTimeMillis;
-          const elapsed = now - context.lastActivityAtMillis;
-          const remaining = limit - elapsed;
-          if (remaining <= 0) {
-            const errorMessage = `Antigravity response timed out after ${Math.max(1, Math.round(limit / 60000))} minutes of inactivity. The connection to the model may have stalled.`;
-            yield* context.promptLock.withPermit(
-              finishTurn(launch.turn, {
-                state: "failed",
-                errorMessage,
-              }),
-            );
-            yield* Fiber.interrupt(launch.fiber).pipe(Effect.ignore);
-            yield* context.runtime.cancel.pipe(Effect.timeoutOption("3 seconds"), Effect.ignore);
-            return yield* new ProviderAdapterRequestError({
-              provider: PROVIDER,
-              method: "session/prompt",
-              detail: errorMessage,
-            });
-          }
-          const sleepDuration = Math.max(10, Math.min(remaining, 3_000));
-          yield* Effect.sleep(Duration.millis(sleepDuration));
-        }
-        return yield* Effect.never;
-      });
+          return yield* Effect.never;
+        });
 
-      const promptEffect = Fiber.await(launch.fiber).pipe(Effect.flatMap((exit) => exit));
-      const result = yield* Effect.raceFirst(promptEffect, watchdog);
+      let currentFiber = launch.fiber;
+      let promptResult: EffectAcpSchema.PromptResponse | undefined;
+      const MAX_TURN_RETRIES = 3;
+      let turnRetryCount = 0;
+      let lastRetryError: string | undefined;
+
+      while (turnRetryCount <= MAX_TURN_RETRIES) {
+        if (context.stopped) break;
+
+        if (turnRetryCount > 0) {
+          const baseDelay = options.turnRetryBaseDelayMs ?? 2_000;
+          const delayMs = Math.min(baseDelay * Math.pow(2, turnRetryCount - 1), 10_000);
+          yield* Effect.logWarning(
+            `Antigravity turn ${launch.turn.turnId} retrying after capacity/provider error (attempt ${turnRetryCount}/${MAX_TURN_RETRIES}) in ${delayMs}ms`,
+            {
+              threadId: input.threadId,
+              turnId: launch.turn.turnId,
+              error: lastRetryError,
+            },
+          );
+          yield* emit({
+            type: "session.state.changed",
+            ...(yield* stamp),
+            provider: PROVIDER,
+            threadId: input.threadId,
+            payload: {
+              state: "running",
+              reason: `api_retry:${turnRetryCount}/${MAX_TURN_RETRIES}`,
+            },
+          });
+          if (delayMs > 0) {
+            yield* Effect.sleep(Duration.millis(delayMs));
+          }
+
+          const continuationPrompt: ReadonlyArray<EffectAcpSchema.ContentBlock> = [
+            {
+              type: "text",
+              text: "Please continue where you left off. The previous operation encountered a transient upstream model capacity error (503).",
+            },
+            {
+              type: "text",
+              text: buildRuntimeInstructions({ harness: "Antigravity", model: launch.model }),
+            },
+          ];
+          const dispatched = yield* Deferred.make<void>();
+          currentFiber = yield* context.runtime
+            .prompt({ prompt: continuationPrompt }, { dispatched })
+            .pipe(Effect.forkIn(context.scope));
+          context.promptFiber = currentFiber;
+          yield* Effect.raceFirst(
+            Deferred.await(dispatched),
+            Fiber.await(currentFiber).pipe(
+              Effect.flatMap((exit) => exit),
+              Effect.asVoid,
+            ),
+          );
+          context.lastActivityAtMillis = yield* Clock.currentTimeMillis;
+          context.activeToolCalls.clear();
+        }
+
+        const watchdogFiber = yield* Effect.forkChild(makeWatchdog(currentFiber));
+        const promptOutcome = yield* Fiber.await(currentFiber);
+        yield* Fiber.interrupt(watchdogFiber);
+
+        if (Exit.isSuccess(promptOutcome)) {
+          promptResult = promptOutcome.value;
+          break;
+        }
+
+        const failureCause = Exit.isFailure(promptOutcome) ? promptOutcome.cause : undefined;
+        const failureError = failureCause ? Cause.squash(failureCause) : undefined;
+        const isFailureRetryable = failureError ? isRetryableAntigravityError(failureError) : false;
+
+        const retryInfo =
+          context.pendingRetry ??
+          (isFailureRetryable && failureError ? { error: String(failureError) } : undefined);
+        context.pendingRetry = undefined;
+
+        if (retryInfo && turnRetryCount < MAX_TURN_RETRIES && !context.stopped) {
+          turnRetryCount++;
+          lastRetryError = retryInfo.error;
+          continue;
+        }
+
+        if (retryInfo) {
+          lastRetryError = retryInfo.error;
+          yield* context.promptLock.withPermit(
+            finishTurn(launch.turn, {
+              state: "failed",
+              errorMessage: `Antigravity model provider capacity error (503) exhausted ${MAX_TURN_RETRIES} retries: ${retryInfo.error}`,
+            }),
+          );
+          context.stopped = true;
+          context.disconnected = true;
+          yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session/prompt",
+            detail: retryInfo.error,
+          });
+        }
+
+        if (failureCause) return yield* Effect.failCause(failureCause);
+        break;
+      }
+
+      const result = promptResult;
+      if (!result) {
+        if (context.stopped) {
+          return yield* new ProviderAdapterSessionClosedError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+          });
+        }
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "session/prompt",
+          detail: lastRetryError ?? "Antigravity turn failed to produce a response.",
+        });
+      }
       yield* context.runtime.drainEvents.pipe(Effect.timeoutOption("3 seconds"), Effect.ignore);
       if (context.stopped) {
         return yield* new ProviderAdapterSessionClosedError({
@@ -2614,12 +2904,35 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
 
       yield* emitTokenUsage(context, launch.turn.turnId);
 
+      if (context.fatalHarnessError) {
+        const fatalMessage = `Antigravity harness execution terminated: ${context.fatalHarnessError}`;
+        yield* context.promptLock.withPermit(
+          finishTurn(launch.turn, {
+            state: "failed",
+            stopReason: "error",
+            errorMessage: fatalMessage,
+          }),
+        );
+        context.stopped = true;
+        context.disconnected = true;
+        yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "session/prompt",
+          detail: fatalMessage,
+        });
+      }
+
       yield* context.promptLock.withPermit(
         finishTurn(launch.turn, {
           state: result.stopReason === "cancelled" ? "cancelled" : "completed",
           stopReason: result.stopReason,
         }),
       );
+      if (result.stopReason === "cancelled") {
+        yield* finishBackgroundCommands(context);
+        yield* finishSubagents(context, "cancelled");
+      }
       return {
         threadId: input.threadId,
         turnId: launch.turn.turnId,
@@ -2636,24 +2949,41 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       ),
       Effect.tapError((cause) =>
         Effect.suspend(() =>
-          intent
-            ? context.promptLock.withPermit(
+          Effect.gen(function* () {
+            if (intent) {
+              yield* context.promptLock.withPermit(
                 finishTurn(intent, { state: "failed", errorMessage: cause.message }),
-              )
-            : Effect.void,
+              );
+            }
+            const isFatalAcp =
+              context.stopped ||
+              context.disconnected ||
+              isAcpError(cause) ||
+              cause.message?.toLowerCase().includes("receive_steps") ||
+              cause.message?.toLowerCase().includes("connection was lost") ||
+              cause.message?.toLowerCase().includes("connection closed");
+            if (isFatalAcp) {
+              context.stopped = true;
+              context.disconnected = true;
+              yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
+            }
+          }),
         ),
       ),
       Effect.onInterrupt(() =>
         context.promptLock.withPermit(
           Effect.gen(function* () {
             const turn = intent;
-            if (!turn || turn.settled || context.stopped || context.generation !== turn.generation)
-              return;
+            if (!turn || turn.settled || context.generation !== turn.generation) return;
             const promptFiber = context.promptFiber;
             yield* cancelRequests(context);
             yield* Effect.ignore(context.runtime.cancel);
             if (promptFiber) yield* Fiber.interrupt(promptFiber);
-            yield* finishTurn(turn, { state: "cancelled", stopReason: "cancelled" });
+            yield* finishTurn(turn, {
+              state: context.stopped ? "failed" : "cancelled",
+              stopReason: context.stopped ? "error" : "cancelled",
+              ...(context.stopped ? { errorMessage: "Antigravity process stopped." } : {}),
+            });
           }),
         ),
       ),

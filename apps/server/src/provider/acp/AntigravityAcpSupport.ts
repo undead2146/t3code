@@ -7,6 +7,7 @@ import {
   type RuntimeMode,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -29,6 +30,7 @@ export interface AntigravityAcpRuntimeInput extends Omit<
   AcpSessionRuntime.AcpSessionRuntimeOptions,
   | "authMethodId"
   | "cancelBehavior"
+  | "cancelTimeout"
   | "clientCapabilities"
   | "onStderr"
   | "resumeMethod"
@@ -64,7 +66,8 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
       ...input,
       authMethodId: input.authMethod ?? "oauth-personal",
       resumeMethod: "resume",
-      cancelBehavior: "interrupt",
+      cancelBehavior: "wait-for-prompt",
+      cancelTimeout: Duration.seconds(5),
       clientCapabilities: {
         fs: {
           readTextFile: input.clientFileSystem === true,

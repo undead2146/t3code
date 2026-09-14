@@ -1429,7 +1429,8 @@ const make = Effect.gen(function* () {
         latestThread?.session?.status === "starting" ||
         latestThread?.session?.status === "running" ||
         startingTurnFibers.has(event.payload.threadId);
-      if (isRunning) {
+      const hasSession = Boolean(latestThread?.session);
+      if (isRunning || hasSession) {
         const inFlight = startingTurnFibers.get(event.payload.threadId);
         if (inFlight) {
           startingTurnFibers.delete(event.payload.threadId);
@@ -1438,13 +1439,18 @@ const make = Effect.gen(function* () {
         yield* providerService
           .interruptTurn({ threadId: event.payload.threadId })
           .pipe(Effect.catchCause(recoverTurnStartFailure));
+        if (!isRunning) {
+          yield* providerService
+            .stopSession({ threadId: event.payload.threadId })
+            .pipe(Effect.catchCause(recoverTurnStartFailure));
+        }
         yield* appendProviderActivity({
           threadId: event.payload.threadId,
           activity: {
             id: yield* serverEventId(),
             tone: "info",
             kind: "provider.turn.interrupted",
-            summary: "Turn stopped by user",
+            summary: isRunning ? "Turn stopped by user" : "Session stopped by user",
             payload: { messageId: event.payload.messageId },
             turnId: latestThread?.session?.activeTurnId ?? null,
             createdAt: event.payload.createdAt,
