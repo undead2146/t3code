@@ -59,7 +59,9 @@ function accountKey(driver: ServerProvider["driver"], email: string | undefined)
     ? `${driver}:${normalizedEmail}`
     : driver === "antigravity"
       ? "antigravity"
-      : null;
+      : driver === "cursor"
+        ? "cursor"
+        : null;
 }
 
 /**

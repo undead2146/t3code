@@ -201,6 +201,38 @@ describe("pools", () => {
     expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(55);
   });
 
+  it("merges cursor account without email by driver key", () => {
+    const cursor = ProviderDriverKind.make("cursor");
+    const nativeA = provider({
+      driver: cursor,
+      instanceId: ProviderInstanceId.make("cursor"),
+      auth: { status: "authenticated" },
+      usageLimits: { checkedAt, windows: [{ ...window, usedPercent: 40 }] },
+    });
+    const nativeB = provider({
+      driver: cursor,
+      instanceId: ProviderInstanceId.make("cursor"),
+      auth: { status: "authenticated" },
+      usageLimits: {
+        checkedAt: "2026-09-03T11:30:00.000Z",
+        windows: [{ ...window, usedPercent: 60 }],
+      },
+    });
+    const input = new Map([
+      [EnvironmentId.make("env-a"), { ...laptop, serverConfig: { providers: [nativeA] } }],
+      [
+        EnvironmentId.make("env-b"),
+        {
+          entry: { target: { label: "Desktop" } },
+          serverConfig: { providers: [nativeB] },
+        },
+      ],
+    ]);
+    const accounts = collectLimitAccounts(input);
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.limits.windows[0]?.usedPercent).toBe(60);
+  });
+
   it("takes windows from a fresher hub read but credits and redeem from the native instance", () => {
     const native = provider({
       driver: claude,

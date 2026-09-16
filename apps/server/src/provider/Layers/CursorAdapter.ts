@@ -78,6 +78,7 @@ import {
 } from "../acp/CursorAcpExtension.ts";
 import { type CursorAdapterShape } from "../Services/CursorAdapter.ts";
 import { resolveCursorAcpBaseModelId } from "./CursorProvider.ts";
+import { getLiveCursorUsageLimitsUpdate } from "./cursorUsageLimits.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import {
   discoverCursorSkills,
@@ -1136,6 +1137,29 @@ export function makeCursorAdapter(
                 stopReason: result.stopReason ?? null,
               },
             });
+
+            if (options?.instanceId) {
+              yield* Effect.gen(function* () {
+                const limitsUpdate = yield* Effect.promise(() =>
+                  getLiveCursorUsageLimitsUpdate({
+                    ...(options.environment ? { environment: options.environment } : {}),
+                    forceRefresh: true,
+                  }),
+                ).pipe(Effect.orElseSucceed(() => null));
+                if (limitsUpdate && limitsUpdate.windows.length > 0) {
+                  yield* offerRuntimeEvent({
+                    type: "account.rate-limits.updated",
+                    ...(yield* makeEventStamp()),
+                    provider: PROVIDER,
+                    providerInstanceId: options.instanceId,
+                    threadId: input.threadId,
+                    payload: {
+                      limits: limitsUpdate,
+                    },
+                  });
+                }
+              }).pipe(Effect.forkIn(ctx.scope));
+            }
           }
 
           return {

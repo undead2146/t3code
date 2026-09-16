@@ -7,6 +7,7 @@ import type {
   ServerProviderAuth,
   ServerProviderModel,
   ServerProviderState,
+  ServerProviderUsageLimits,
 } from "@t3tools/contracts";
 import type * as EffectAcpSchema from "effect-acp/schema";
 import { causeErrorTag } from "@t3tools/shared/observability";
@@ -32,6 +33,7 @@ import {
 } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
+import { getLiveCursorUsageLimits } from "./cursorUsageLimits.ts";
 import {
   buildBooleanOptionDescriptor,
   buildSelectOptionDescriptor,
@@ -649,6 +651,7 @@ export function buildCursorProviderSnapshot(input: {
   readonly parsed: CursorAboutResult;
   readonly discoveredModels?: ReadonlyArray<ServerProviderModel>;
   readonly discoveryWarning?: string;
+  readonly usageLimits?: ServerProviderUsageLimits;
 }): ServerProviderDraft {
   const message = joinProviderMessages(input.parsed.message, input.discoveryWarning);
   return buildServerProvider({
@@ -668,6 +671,7 @@ export function buildCursorProviderSnapshot(input: {
         input.discoveryWarning && input.parsed.status === "ready" ? "warning" : input.parsed.status,
       auth: input.parsed.auth,
       ...(message ? { message } : {}),
+      ...(input.usageLimits ? { usageLimits: input.usageLimits } : {}),
     },
   });
 }
@@ -1125,6 +1129,15 @@ export const checkCursorProviderStatus = Effect.fn("checkCursorProviderStatus")(
       discoveredModels = discoveryExit.value;
     }
   }
+  let usageLimits: ServerProviderUsageLimits | undefined;
+  if (parsed.status === "ready" && parsed.auth.status === "authenticated") {
+    usageLimits = yield* Effect.promise(() =>
+      getLiveCursorUsageLimits({
+        ...(environment ? { environment } : {}),
+        checkedAt,
+      }),
+    ).pipe(Effect.orElseSucceed(() => undefined));
+  }
   return buildCursorProviderSnapshot({
     checkedAt,
     cursorSettings,
@@ -1134,6 +1147,7 @@ export const checkCursorProviderStatus = Effect.fn("checkCursorProviderStatus")(
       () => [] as const,
     ),
     ...(discoveryWarning ? { discoveryWarning } : {}),
+    ...(usageLimits ? { usageLimits } : {}),
   });
 });
 

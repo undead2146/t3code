@@ -523,6 +523,34 @@ describe("buildCursorProviderSnapshot", () => {
       ],
     });
   });
+
+  it("forwards usage limits to probe when provided", () => {
+    const usageLimits = {
+      checkedAt: "2026-01-01T00:00:00.000Z",
+      windows: [
+        {
+          id: "cursor_pro_included",
+          kind: "monthly" as const,
+          label: "Included in Pro",
+          usedPercent: 40,
+        },
+      ],
+    };
+    expect(
+      buildCursorProviderSnapshot({
+        checkedAt: "2026-01-01T00:00:00.000Z",
+        cursorSettings: baseCursorSettings,
+        parsed: {
+          version: "2026.04.09-f2b0fcd",
+          status: "ready",
+          auth: { status: "authenticated", type: "Pro", label: "Cursor Pro Subscription" },
+        },
+        usageLimits,
+      }),
+    ).toMatchObject({
+      usageLimits,
+    });
+  });
 });
 
 describe("buildCursorCapabilitiesFromConfigOptions", () => {
