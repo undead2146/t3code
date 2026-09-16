@@ -784,12 +784,37 @@ const makeServerLayer = Layer.unwrap(
       disableLogger: !config.logWebSocketEvents,
       routerConfig: HTTP_ROUTER_CONFIG,
     }).pipe(Layer.tap(() => Deferred.succeed(routesReady, undefined).pipe(Effect.orDie)));
+
+    const runningSessionContinuationLayer = Layer.scopedDiscard(
+      Effect.gen(function* () {
+        const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
+        yield* Effect.addFinalizer(() =>
+          startup.markRunningProviderSessionsForContinuation.pipe(
+            Effect.tap((marked) =>
+              marked.length > 0
+                ? Effect.logInfo("Marked running provider sessions for continuation on shutdown", {
+                    markedCount: marked.length,
+                  })
+                : Effect.void,
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logWarning(
+                "Failed to mark running provider sessions for continuation on shutdown",
+                { cause },
+              ),
+            ),
+          ),
+        );
+      }),
+    );
+
     const serverApplicationLayer = Layer.mergeAll(
       routesLayer,
       httpListeningLayer,
       runtimeStateLayer.pipe(Layer.provide(launcherLayer)),
       tailscaleServeLayer,
       cloudDesiredLinkReconcileLayer,
+      runningSessionContinuationLayer,
     );
 
     return serverApplicationLayer.pipe(
