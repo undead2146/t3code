@@ -70,7 +70,15 @@ export function totalTokens(totals: UsageTokenTotals): number {
 export function mightCarryUsage(line: string, provider: UsageProviderKind): boolean {
   if (provider === "claude") return line.includes('"usage"');
   if (provider === "codex") return line.includes('"token_count"');
-  if (provider === "antigravity") return line.includes('"usage"') || line.includes('"tokens"');
+  if (provider === "antigravity") {
+    return (
+      line.includes('"usage"') ||
+      line.includes('"tokens"') ||
+      line.includes('"turn.completed"') ||
+      line.includes('"turn.started"') ||
+      line.includes('"session.exited"')
+    );
+  }
   if (provider === "grok") return line.includes('"turn_completed"');
   return line.includes('"token_count"');
 }
@@ -321,6 +329,15 @@ export interface AntigravityScanState {
   model: string;
   sessionId: string;
   lastUsageSignature: string | null;
+  activeTurnId: string | null;
+  lastCumulativeInputTokens: number;
+  lastCumulativeOutputTokens: number;
+  lastCumulativeReasoningTokens: number;
+  pendingTurnUsage: {
+    usageObj: Record<string, unknown>;
+    timestampMs: number;
+    turnId: string | null;
+  } | null;
 }
 
 export function initialAntigravityScanState(): AntigravityScanState {
@@ -328,14 +345,115 @@ export function initialAntigravityScanState(): AntigravityScanState {
     model: "",
     sessionId: "",
     lastUsageSignature: null,
+    activeTurnId: null,
+    lastCumulativeInputTokens: 0,
+    lastCumulativeOutputTokens: 0,
+    lastCumulativeReasoningTokens: 0,
+    pendingTurnUsage: null,
   };
+}
+
+function commitAntigravityPendingUsage(
+  state: AntigravityScanState,
+  turnId: string | null,
+  overrideTimestampMs?: number | null,
+): UsageRecord | null {
+  const pending = state.pendingTurnUsage;
+  if (!pending) return null;
+  state.pendingTurnUsage = null;
+
+  const usageObj = pending.usageObj;
+  const timestampMs = overrideTimestampMs ?? pending.timestampMs;
+
+  const rawInput = int(
+    usageObj["input_tokens"] ??
+      usageObj["prompt_tokens"] ??
+      usageObj["prompt_token_count"] ??
+      usageObj["inputTokens"],
+  );
+  const cachedInput = int(
+    usageObj["cache_read_tokens"] ??
+      usageObj["cache_read_input_tokens"] ??
+      usageObj["cached_tokens"] ??
+      usageObj["cached_content_token_count"] ??
+      usageObj["cachedInputTokens"],
+  );
+  const cacheCreation = int(
+    usageObj["cache_creation_tokens"] ??
+      usageObj["cache_creation_input_tokens"] ??
+      usageObj["cache_write_tokens"] ??
+      usageObj["cacheCreationTokens"],
+  );
+  const rawOutput = int(
+    usageObj["output_tokens"] ??
+      usageObj["candidates_tokens"] ??
+      usageObj["completion_tokens"] ??
+      usageObj["candidates_token_count"] ??
+      usageObj["outputTokens"],
+  );
+  const rawReasoning = int(
+    usageObj["thinking_tokens"] ??
+      usageObj["reasoning_tokens"] ??
+      usageObj["reasoning_output_tokens"] ??
+      usageObj["reasoningOutputTokens"],
+  );
+
+  let uncachedDelta = 0;
+  if (rawInput >= state.lastCumulativeInputTokens) {
+    uncachedDelta = rawInput - state.lastCumulativeInputTokens;
+  }
+  state.lastCumulativeInputTokens = rawInput;
+
+  let outputDelta = 0;
+  if (rawOutput >= state.lastCumulativeOutputTokens) {
+    outputDelta = rawOutput - state.lastCumulativeOutputTokens;
+  }
+  state.lastCumulativeOutputTokens = rawOutput;
+
+  let reasoningDelta = 0;
+  if (rawReasoning >= state.lastCumulativeReasoningTokens) {
+    reasoningDelta = rawReasoning - state.lastCumulativeReasoningTokens;
+  }
+  state.lastCumulativeReasoningTokens = rawReasoning;
+
+  const totals: UsageTokenTotals = {
+    uncachedInputTokens: uncachedDelta,
+    cachedInputTokens: cachedInput,
+    cacheCreationTokens: cacheCreation,
+    outputTokens: outputDelta,
+    reasoningTokens: Math.min(outputDelta, reasoningDelta),
+  };
+
+  if (totalTokens(totals) === 0) return null;
+
+  const cost = usageObj["costUSD"] ?? usageObj["cost_usd"];
+  const reportedCostUsd = typeof cost === "number" && Number.isFinite(cost) ? cost : null;
+
+  const dedupeKey = state.sessionId ? `${state.sessionId}:${turnId ?? timestampMs}` : null;
+
+  return {
+    provider: "antigravity",
+    timestampMs,
+    model: state.model || "gemini-3.8-flash",
+    sessionId: state.sessionId,
+    totals,
+    reportedCostUsd,
+    dedupeKey,
+  };
+}
+
+export function flushAntigravityPendingUsage(
+  state: AntigravityScanState,
+  overrideTimestampMs?: number | null,
+): UsageRecord | null {
+  return commitAntigravityPendingUsage(state, state.activeTurnId, overrideTimestampMs);
 }
 
 /**
  * Parses one line of an Antigravity transcript or provider log.
  *
  * Supports both raw stream-JSON/brain transcripts and T3 Code provider logs
- * prefixed with `[timestamp] NTIVE: {...}`.
+ * prefixed with `[timestamp] NTIVE: {...}` or `[timestamp] CANON: {...}`.
  */
 export function parseAntigravityLine(
   line: string,
@@ -376,23 +494,69 @@ export function parseAntigravityLine(
     return null;
   }
 
-  // Extract usage, step index, and model
-  let usageObj: Record<string, unknown> | null = null;
-  let stepIndex: number | null = null;
-  let eventModel: string | null = null;
+  // Handle provider event lifecycle
+  if (record["type"] === "turn.started") {
+    if (typeof record["threadId"] === "string") {
+      state.sessionId = record["threadId"];
+    }
+    let flushed: UsageRecord | null = null;
+    if (state.pendingTurnUsage !== null) {
+      flushed = commitAntigravityPendingUsage(state, state.pendingTurnUsage.turnId, timestampMs);
+    }
+    if (typeof record["turnId"] === "string") {
+      state.activeTurnId = record["turnId"];
+    }
+    return flushed;
+  }
 
   if (record["type"] === "thread.token-usage.updated") {
+    if (typeof record["threadId"] === "string") {
+      state.sessionId = record["threadId"];
+    }
+    if (typeof record["turnId"] === "string") {
+      state.activeTurnId = record["turnId"];
+    }
     const payload = record["payload"];
     if (typeof payload === "object" && payload !== null) {
       const payloadRecord = payload as Record<string, unknown>;
       if (typeof payloadRecord["usage"] === "object" && payloadRecord["usage"] !== null) {
-        usageObj = payloadRecord["usage"] as Record<string, unknown>;
+        state.pendingTurnUsage = {
+          usageObj: payloadRecord["usage"] as Record<string, unknown>,
+          timestampMs:
+            timestampMs ??
+            parseTimestampMs(record["createdAt"] ?? record["timestamp"]) ??
+            Date.now(),
+          turnId: state.activeTurnId,
+        };
       }
     }
+    return null;
+  }
+
+  if (record["type"] === "turn.completed") {
     if (typeof record["threadId"] === "string") {
       state.sessionId = record["threadId"];
     }
-  } else if (record["event"] === "step_update") {
+    const turnId =
+      (typeof record["turnId"] === "string" ? record["turnId"] : state.activeTurnId) ?? null;
+    const committed = commitAntigravityPendingUsage(state, turnId, timestampMs);
+    state.activeTurnId = null;
+    return committed;
+  }
+
+  if (record["type"] === "session.exited") {
+    if (typeof record["threadId"] === "string") {
+      state.sessionId = record["threadId"];
+    }
+    return flushAntigravityPendingUsage(state, timestampMs);
+  }
+
+  // Extract usage, step index, and model for legacy step_update / generic usage
+  let usageObj: Record<string, unknown> | null = null;
+  let stepIndex: number | null = null;
+  let eventModel: string | null = null;
+
+  if (record["event"] === "step_update") {
     const stepUpdate = record["step_update"];
     if (typeof stepUpdate === "object" && stepUpdate !== null) {
       const stepUpdateRecord = stepUpdate as Record<string, unknown>;

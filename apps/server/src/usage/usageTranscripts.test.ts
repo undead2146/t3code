@@ -318,6 +318,136 @@ describe("parseAntigravityLine", () => {
     expect(first).not.toBeNull();
     expect(second).toBeNull();
   });
+
+  it("aggregates multiple in-turn token usage updates and emits a single delta on turn.completed", () => {
+    const state = initialAntigravityScanState();
+    state.model = "gemini-3.8-flash";
+
+    // Turn 1 starts
+    expect(
+      parseAntigravityLine(
+        JSON.stringify({ type: "turn.started", threadId: "t-1", turnId: "turn-1" }),
+        state,
+      ),
+    ).toBeNull();
+
+    // Multiple token updates during tool execution in Turn 1
+    for (let i = 1; i <= 5; i++) {
+      const line = JSON.stringify({
+        type: "thread.token-usage.updated",
+        threadId: "t-1",
+        turnId: "turn-1",
+        payload: {
+          usage: {
+            input_tokens: 1000 + i * 100,
+            cache_read_tokens: 2000,
+            output_tokens: 50 + i * 10,
+            thinking_tokens: 10 + i * 2,
+          },
+        },
+        createdAt: "2026-08-17T19:00:00.000Z",
+      });
+      expect(parseAntigravityLine(line, state)).toBeNull();
+    }
+
+    // Turn 1 completes: should emit exactly ONE record with final turn numbers
+    const turn1Record = parseAntigravityLine(
+      JSON.stringify({
+        type: "turn.completed",
+        threadId: "t-1",
+        turnId: "turn-1",
+        createdAt: "2026-08-17T19:00:05.000Z",
+      }),
+      state,
+    );
+
+    expect(turn1Record).not.toBeNull();
+    expect(turn1Record?.sessionId).toBe("t-1");
+    expect(turn1Record?.dedupeKey).toBe("t-1:turn-1");
+    expect(turn1Record?.totals).toEqual({
+      uncachedInputTokens: 1500, // 1000 + 5 * 100
+      cachedInputTokens: 2000,
+      cacheCreationTokens: 0,
+      outputTokens: 100, // 50 + 5 * 10
+      reasoningTokens: 20, // 10 + 5 * 2
+    });
+
+    // Turn 2 starts
+    expect(
+      parseAntigravityLine(
+        JSON.stringify({ type: "turn.started", threadId: "t-1", turnId: "turn-2" }),
+        state,
+      ),
+    ).toBeNull();
+
+    // Turn 2 usage update with cumulative context (input grew from 1500 to 2500, output grew from 100 to 180)
+    expect(
+      parseAntigravityLine(
+        JSON.stringify({
+          type: "thread.token-usage.updated",
+          threadId: "t-1",
+          turnId: "turn-2",
+          payload: {
+            usage: {
+              input_tokens: 2500,
+              cache_read_tokens: 2000,
+              output_tokens: 180,
+              thinking_tokens: 40,
+            },
+          },
+          createdAt: "2026-08-17T19:01:00.000Z",
+        }),
+        state,
+      ),
+    ).toBeNull();
+
+    // Turn 2 completes: should emit ONLY the incremental delta
+    const turn2Record = parseAntigravityLine(
+      JSON.stringify({
+        type: "turn.completed",
+        threadId: "t-1",
+        turnId: "turn-2",
+        createdAt: "2026-08-17T19:01:05.000Z",
+      }),
+      state,
+    );
+
+    expect(turn2Record).not.toBeNull();
+    expect(turn2Record?.dedupeKey).toBe("t-1:turn-2");
+    expect(turn2Record?.totals).toEqual({
+      uncachedInputTokens: 1000, // 2500 - 1500
+      cachedInputTokens: 2000,
+      cacheCreationTokens: 0,
+      outputTokens: 80, // 180 - 100
+      reasoningTokens: 20, // 40 - 20
+    });
+  });
+
+  it("flushes pending usage on session.exited", () => {
+    const state = initialAntigravityScanState();
+    parseAntigravityLine(
+      JSON.stringify({ type: "turn.started", threadId: "t-2", turnId: "turn-1" }),
+      state,
+    );
+    parseAntigravityLine(
+      JSON.stringify({
+        type: "thread.token-usage.updated",
+        threadId: "t-2",
+        turnId: "turn-1",
+        payload: { usage: { input_tokens: 300, output_tokens: 50, cache_read_tokens: 100 } },
+        createdAt: "2026-08-17T19:00:00.000Z",
+      }),
+      state,
+    );
+
+    const flushed = parseAntigravityLine(
+      JSON.stringify({ type: "session.exited", threadId: "t-2" }),
+      state,
+    );
+    expect(flushed).not.toBeNull();
+    expect(flushed?.totals.uncachedInputTokens).toBe(300);
+    expect(flushed?.totals.outputTokens).toBe(50);
+  });
 });
 
 describe("totalTokens", () => {

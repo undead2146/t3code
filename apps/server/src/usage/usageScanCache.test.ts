@@ -35,6 +35,7 @@ function position(overrides: Partial<CachedFile["position"]> = {}): CachedFile["
     guardLength: 64,
     guardHash: 0xdeadbeef,
     codexState: null,
+    antigravityState: null,
     ...overrides,
   };
 }
@@ -87,14 +88,40 @@ describe("scan cache round trip", () => {
         },
       }),
     });
+    original.set("/antigravity.log", {
+      size: 100,
+      mtimeMs: 500,
+      provider: "antigravity",
+      records: [
+        record({
+          provider: "antigravity",
+          model: "gemini-3.8-flash",
+          dedupeKey: "session-d:turn-1",
+        }),
+      ],
+      tailRecords: [],
+      position: position({
+        antigravityState: {
+          model: "gemini-3.8-flash",
+          sessionId: "session-d",
+          lastUsageSignature: null,
+          activeTurnId: null,
+          lastCumulativeInputTokens: 5000,
+          lastCumulativeOutputTokens: 200,
+          lastCumulativeReasoningTokens: 0,
+          pendingTurnUsage: null,
+        },
+      }),
+    });
 
     const restored = decodeScanCache(JSON.parse(JSON.stringify(encodeScanCache(original))));
 
-    expect(restored.size).toBe(4);
+    expect(restored.size).toBe(5);
     expect(restored.get("/a.jsonl")).toEqual(original.get("/a.jsonl"));
     expect(restored.get("/b.jsonl")).toEqual(original.get("/b.jsonl"));
     expect(restored.get("/grok.jsonl")).toEqual(original.get("/grok.jsonl"));
     expect(restored.get("/codex.jsonl")).toEqual(original.get("/codex.jsonl"));
+    expect(restored.get("/antigravity.log")).toEqual(original.get("/antigravity.log"));
   });
 
   it("drops an entry whose persisted parse state is corrupt", () => {

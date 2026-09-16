@@ -61,6 +61,8 @@ export interface TranscriptParsePosition {
   readonly guardHash: number;
   /** Codex reducer state as of `resumeOffset`; `null` for stateless providers. */
   readonly codexState: CodexScanState | null;
+  /** Antigravity reducer state as of `resumeOffset`; `null` for other providers. */
+  readonly antigravityState?: AntigravityScanState | null;
 }
 
 export interface TranscriptParseResult {
@@ -217,9 +219,11 @@ export async function readTranscriptRecords(
       resumeFrom !== undefined &&
       resumeFrom.resumeOffset > 0 &&
       (provider !== "codex" || resumeFrom.codexState !== null) &&
+      (provider !== "antigravity" || (resumeFrom.antigravityState ?? null) !== null) &&
       (await guardMatches(handle, resumeFrom))
     ) {
       if (resumeFrom.codexState !== null) codexState = { ...resumeFrom.codexState };
+      if (resumeFrom.antigravityState) antigravityState = { ...resumeFrom.antigravityState };
       start = resumeFrom.resumeOffset;
       resumed = true;
     }
@@ -301,6 +305,11 @@ export async function readTranscriptRecords(
       if (pending.length > 0) parseLine(toLineString(pending), { ...codexState }, tailRecords);
     }
 
+    if (provider === "antigravity") {
+      const flushed = flushAntigravityPendingUsage(antigravityState);
+      if (flushed !== null) records.push(flushed);
+    }
+
     const guardLength = Math.min(GUARD_LENGTH, resumeOffset);
     let guardHash = 0;
     if (guardLength > 0) {
@@ -317,6 +326,7 @@ export async function readTranscriptRecords(
         guardLength,
         guardHash,
         codexState: provider === "codex" ? codexState : null,
+        antigravityState: provider === "antigravity" ? antigravityState : null,
       },
       resumed,
     };
