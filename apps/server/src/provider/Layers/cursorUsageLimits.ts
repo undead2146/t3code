@@ -40,22 +40,50 @@ export interface CursorPeriodUsageDetails {
   readonly maxTokenUsage?: number;
 }
 
+export interface CursorPlanUsage {
+  readonly totalSpend?: number;
+  readonly includedSpend?: number;
+  readonly remaining?: number;
+  readonly limit?: number;
+  readonly remainingBonus?: boolean;
+  readonly bonusTooltip?: string;
+  readonly autoPercentUsed?: number;
+  readonly apiPercentUsed?: number;
+  readonly totalPercentUsed?: number;
+}
+
+export interface CursorSpendLimitUsage {
+  readonly limitType?: string;
+  readonly totalSpend?: number;
+  readonly currentSpend?: number;
+  readonly spendLimit?: number;
+  readonly individualLimit?: number;
+  readonly pooledLimit?: number;
+}
+
 export interface CursorCurrentPeriodUsageResponse {
-  readonly startOfMonth?: string;
-  readonly endOfMonth?: string;
-  readonly billingCycleStart?: string;
-  readonly billingCycleEnd?: string;
+  readonly startOfMonth?: string | number;
+  readonly endOfMonth?: string | number;
+  readonly billingCycleStart?: string | number;
+  readonly billingCycleEnd?: string | number;
   readonly userEmail?: string;
   readonly membershipType?: string;
   readonly limitType?: string;
   readonly isUnlimited?: boolean;
+  readonly displayMessage?: string;
+  readonly enabled?: boolean;
+  readonly planUsage?: CursorPlanUsage;
+  readonly spendLimitUsage?: CursorSpendLimitUsage;
+  // Fallbacks / legacy flat fields
+  readonly totalSpend?: number;
+  readonly includedSpend?: number;
+  readonly remaining?: number;
+  readonly limit?: number;
   readonly individualLimit?: number;
   readonly pooledLimit?: number;
   readonly overallLimit?: number;
   readonly hardLimit?: number;
   readonly warningLimit?: number;
-  readonly totalSpend?: number;
-  readonly includedSpend?: number;
   readonly standardCreditLimit?: number;
   readonly fastCreditLimit?: number;
   readonly regularUsage?: CursorPeriodUsageDetails;
@@ -178,6 +206,31 @@ export async function fetchCursorCurrentPeriodUsage(
   }
 }
 
+function parseTimestampToMs(val: unknown): number | null {
+  if (val === undefined || val === null) return null;
+  if (typeof val === "number") {
+    return Number.isFinite(val) ? val : null;
+  }
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) return null;
+    if (/^\d+$/.test(trimmed)) {
+      const n = Number(trimmed);
+      return Number.isFinite(n) ? n : null;
+    }
+    const ms = Date.parse(trimmed);
+    return Number.isNaN(ms) ? null : ms;
+  }
+  return null;
+}
+
+function parseTimestampToIso(val: unknown): string | undefined {
+  const ms = parseTimestampToMs(val);
+  if (ms === null) return undefined;
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
+}
+
 /**
  * Computes ServerProviderUsageLimits from Cursor CurrentPeriodUsageResponse.
  */
@@ -198,22 +251,31 @@ export function makeCursorUsageLimits(input: {
 
   const windows: ServerProviderUsageWindow[] = [];
 
-  const resetsAt = quota.billingCycleEnd ?? quota.endOfMonth;
+  const rawResetsAt = quota.billingCycleEnd ?? quota.endOfMonth;
+  const resetsAt = parseTimestampToIso(rawResetsAt);
+
   let windowDurationMins: number | undefined;
-  const cycleStart = quota.billingCycleStart ?? quota.startOfMonth;
-  if (cycleStart && resetsAt) {
-    const startMs = Date.parse(cycleStart);
-    const endMs = Date.parse(resetsAt);
-    if (!Number.isNaN(startMs) && !Number.isNaN(endMs) && endMs > startMs) {
+  const rawCycleStart = quota.billingCycleStart ?? quota.startOfMonth;
+  if (rawCycleStart && rawResetsAt) {
+    const startMs = parseTimestampToMs(rawCycleStart);
+    const endMs = parseTimestampToMs(rawResetsAt);
+    if (startMs !== null && endMs !== null && endMs > startMs) {
       windowDurationMins = Math.round((endMs - startMs) / (60 * 1000));
     }
   }
 
   // 1. "Included in Pro" window
-  const includedSpend = quota.includedSpend ?? 0;
-  const standardLimit = quota.standardCreditLimit ?? 20;
-  const proUsedPercent =
-    standardLimit > 0 ? clampPercent((includedSpend / standardLimit) * 100) : 0;
+  const planUsage = quota.planUsage;
+  const includedSpend = planUsage?.includedSpend ?? quota.includedSpend ?? 0;
+  const standardLimit =
+    planUsage?.limit ??
+    quota.standardCreditLimit ??
+    (quota.limit !== undefined && quota.limit > 0 ? quota.limit : 2000);
+
+  let proUsedPercent = 0;
+  if (standardLimit > 0) {
+    proUsedPercent = clampPercent((includedSpend / standardLimit) * 100);
+  }
 
   windows.push({
     id: CURSOR_WINDOW_IDS.PRO_INCLUDED,
@@ -225,9 +287,24 @@ export function makeCursorUsageLimits(input: {
   });
 
   // 2. "On-Demand" usage window
-  const totalSpend = quota.totalSpend ?? 0;
-  const onDemandSpend = Math.max(0, totalSpend - includedSpend);
-  const onDemandLimit = quota.individualLimit ?? quota.overallLimit ?? quota.pooledLimit;
+  const spendLimitUsage = quota.spendLimitUsage;
+  const onDemandSpend =
+    spendLimitUsage?.totalSpend ??
+    (spendLimitUsage?.currentSpend !== undefined
+      ? spendLimitUsage.currentSpend
+      : planUsage?.totalSpend !== undefined && planUsage?.includedSpend !== undefined
+        ? Math.max(0, planUsage.totalSpend - planUsage.includedSpend)
+        : quota.totalSpend !== undefined && quota.includedSpend !== undefined
+          ? Math.max(0, quota.totalSpend - quota.includedSpend)
+          : 0);
+
+  const onDemandLimit =
+    spendLimitUsage?.spendLimit ??
+    spendLimitUsage?.individualLimit ??
+    spendLimitUsage?.pooledLimit ??
+    quota.individualLimit ??
+    quota.overallLimit ??
+    quota.pooledLimit;
 
   let onDemandUsedPercent = 0;
   if (onDemandLimit !== undefined && onDemandLimit > 0) {
@@ -339,9 +416,11 @@ export async function getLiveCursorUsageLimitsUpdate(input?: {
 }): Promise<ProviderUsageLimitsUpdate | null> {
   const limits = await getLiveCursorUsageLimits({
     ...(input?.environment ? { environment: input.environment } : {}),
-    ...(input?.forceRefresh !== undefined ? { forceRefresh: input.forceRefresh } : {}),
+    ...(input?.forceRefresh ? { forceRefresh: input.forceRefresh } : {}),
   });
-  if (!limits || limits.windows.length === 0) return null;
+  if (limits.windows.length === 0) {
+    return null;
+  }
   return {
     windows: limits.windows,
   };

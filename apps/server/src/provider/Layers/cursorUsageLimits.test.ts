@@ -10,7 +10,6 @@ import {
   fetchCursorCurrentPeriodUsage,
   findCursorAuthToken,
   getLiveCursorUsageLimits,
-  getLiveCursorUsageLimitsUpdate,
   makeCursorUsageLimits,
   makeCursorUsageLimitsUpdate,
   type CursorCurrentPeriodUsageResponse,
@@ -75,7 +74,68 @@ describe("cursorUsageLimits", () => {
     }
   });
 
-  it("calculates Pro included percentage correctly", () => {
+  it("calculates Pro included percentage correctly from nested planUsage in cents", () => {
+    const mockQuota: CursorCurrentPeriodUsageResponse = {
+      billingCycleStart: "1789245529000",
+      billingCycleEnd: "1791837529000",
+      planUsage: {
+        totalSpend: 1801,
+        includedSpend: 1801,
+        remaining: 199,
+        limit: 2000,
+        totalPercentUsed: 20.01,
+      },
+      spendLimitUsage: {
+        limitType: "user",
+      },
+      displayMessage: "You've used 90% of your included usage",
+    };
+
+    const limits = makeCursorUsageLimits({
+      quota: mockQuota,
+      checkedAt: "2026-09-16T20:00:00.000Z",
+    });
+
+    expect(limits.windows).toHaveLength(2);
+    const proWindow = limits.windows.find((w) => w.id === CURSOR_WINDOW_IDS.PRO_INCLUDED);
+    expect(proWindow).toBeDefined();
+    expect(proWindow?.kind).toBe("monthly");
+    expect(proWindow?.label).toBe("Included in Pro");
+    // 1801 / 2000 = 0.9005 = 90.05%
+    expect(proWindow?.usedPercent).toBeCloseTo(90.05, 1);
+    expect(proWindow?.resetsAt).toBe("2026-10-12T20:38:49.000Z");
+    expect(proWindow?.windowDurationMins).toBe(43200);
+
+    const onDemandWindow = limits.windows.find((w) => w.id === CURSOR_WINDOW_IDS.ON_DEMAND);
+    expect(onDemandWindow).toBeDefined();
+    expect(onDemandWindow?.usedPercent).toBe(0);
+  });
+
+  it("calculates on-demand percentage correctly when spendLimitUsage has limits", () => {
+    const mockQuota: CursorCurrentPeriodUsageResponse = {
+      billingCycleStart: "1789245529000",
+      billingCycleEnd: "1791837529000",
+      planUsage: {
+        includedSpend: 2000,
+        limit: 2000,
+      },
+      spendLimitUsage: {
+        totalSpend: 2500, // $25
+        individualLimit: 5000, // $50 limit -> 50%
+      },
+    };
+
+    const limits = makeCursorUsageLimits({
+      quota: mockQuota,
+      checkedAt: "2026-09-16T20:00:00.000Z",
+    });
+
+    const onDemandWindow = limits.windows.find((w) => w.id === CURSOR_WINDOW_IDS.ON_DEMAND);
+    expect(onDemandWindow).toBeDefined();
+    expect(onDemandWindow?.usedPercent).toBe(50);
+  });
+
+  it("handles legacy flat quota fields as fallback", () => {
     const mockQuota: CursorCurrentPeriodUsageResponse = {
       standardCreditLimit: 20,
       includedSpend: 10,
@@ -91,33 +151,8 @@ describe("cursorUsageLimits", () => {
 
     expect(limits.windows).toHaveLength(2);
     const proWindow = limits.windows.find((w) => w.id === CURSOR_WINDOW_IDS.PRO_INCLUDED);
-    expect(proWindow).toBeDefined();
-    expect(proWindow?.kind).toBe("monthly");
-    expect(proWindow?.label).toBe("Included in Pro");
     expect(proWindow?.usedPercent).toBe(50);
     expect(proWindow?.resetsAt).toBe("2026-05-01T00:00:00.000Z");
-  });
-
-  it("calculates on-demand percentage correctly when spend limit exists", () => {
-    const mockQuota: CursorCurrentPeriodUsageResponse = {
-      standardCreditLimit: 20,
-      includedSpend: 20,
-      totalSpend: 35, // 15 on-demand
-      individualLimit: 30, // 15 / 30 = 50%
-      billingCycleStart: "2026-04-01T00:00:00.000Z",
-      billingCycleEnd: "2026-05-01T00:00:00.000Z",
-    };
-
-    const limits = makeCursorUsageLimits({
-      quota: mockQuota,
-      checkedAt: "2026-04-15T00:00:00.000Z",
-    });
-
-    const onDemandWindow = limits.windows.find((w) => w.id === CURSOR_WINDOW_IDS.ON_DEMAND);
-    expect(onDemandWindow).toBeDefined();
-    expect(onDemandWindow?.kind).toBe("other");
-    expect(onDemandWindow?.label).toBe("On-Demand");
-    expect(onDemandWindow?.usedPercent).toBe(50);
   });
 
   it("sets on-demand to 0% when no limit set and 0 spend", () => {
@@ -161,9 +196,10 @@ describe("cursorUsageLimits", () => {
       return new Response(
         JSON.stringify({
           membershipType: "pro",
-          includedSpend: 18.01,
-          standardCreditLimit: 20.0,
-          totalSpend: 18.01,
+          planUsage: {
+            includedSpend: 1801,
+            limit: 2000,
+          },
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
@@ -181,7 +217,7 @@ describe("cursorUsageLimits", () => {
     );
     expect((capturedHeaders as Record<string, string>)["Connect-Protocol-Version"]).toBe("1");
     expect(capturedBody).toBe(JSON.stringify({}));
-    expect(data?.includedSpend).toBe(18.01);
+    expect(data?.planUsage?.includedSpend).toBe(1801);
   });
 
   it("caches live limits for 60 seconds", async () => {
@@ -190,9 +226,10 @@ describe("cursorUsageLimits", () => {
       callCount++;
       return new Response(
         JSON.stringify({
-          standardCreditLimit: 20,
-          includedSpend: 10,
-          totalSpend: 10,
+          planUsage: {
+            limit: 2000,
+            includedSpend: 1000,
+          },
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
@@ -220,29 +257,13 @@ describe("cursorUsageLimits", () => {
     expect(callCount).toBe(2); // Bypassed cache
   });
 
-  it("creates update payload with makeCursorUsageLimitsUpdate and getLiveCursorUsageLimitsUpdate", async () => {
-    const mockFetch = (async () => {
-      return new Response(
-        JSON.stringify({
-          standardCreditLimit: 20,
-          includedSpend: 12,
-          totalSpend: 12,
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }) as typeof fetch;
-
-    const update = await getLiveCursorUsageLimitsUpdate({
-      environment: { CURSOR_AUTH_TOKEN: "mock-token" } as NodeJS.ProcessEnv,
-      forceRefresh: true,
-    });
-    // Wait, getLiveCursorUsageLimits inside getLiveCursorUsageLimitsUpdate didn't receive mockFetch
-    // Let's test makeCursorUsageLimitsUpdate directly
+  it("creates update payload with makeCursorUsageLimitsUpdate", () => {
     const directUpdate = makeCursorUsageLimitsUpdate({
       quota: {
-        standardCreditLimit: 20,
-        includedSpend: 12,
-        totalSpend: 12,
+        planUsage: {
+          limit: 2000,
+          includedSpend: 1200,
+        },
       },
     });
     expect(directUpdate.windows).toHaveLength(2);
