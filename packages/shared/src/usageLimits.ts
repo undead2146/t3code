@@ -16,7 +16,6 @@ import {
   type ServerProvider,
   type ServerProviderUsageLimits,
   type ServerProviderUsageWindow,
-  type UsageLimitSourceSnapshot,
   type UsageLimitSourceSnapshots,
 } from "@t3tools/contracts";
 
@@ -43,174 +42,16 @@ export function providersWithLimits(
   );
 }
 
-export interface LimitsGroup {
-  readonly environmentId: EnvironmentId;
-  /** Null while only one environment is connected; there is nothing to tell apart. */
-  readonly environmentLabel: string | null;
-  readonly providers: readonly ServerProvider[];
-}
-
-function providerAccountKey(provider: ServerProvider): string | null {
-  if (provider.driver === "antigravity") {
-    return "antigravity";
+export type LimitPresentations = ReadonlyMap<
+  EnvironmentId,
+  {
+    readonly entry: { readonly target: { readonly label: string } };
+    readonly serverConfig: {
+      readonly providers?: readonly ServerProvider[] | undefined;
+      readonly usageLimitSources?: UsageLimitSourceSnapshots | undefined;
+    } | null;
   }
-  const normalizedEmail = provider.auth.email?.trim().toLowerCase();
-  if (normalizedEmail) {
-    return `${provider.driver}:${normalizedEmail}`;
-  }
-  return null;
-}
-
-function providerQualityScore(
-  environmentId: EnvironmentId,
-  label: string,
-  provider: ServerProvider,
-): number {
-  let score = 0;
-  const isPrimary =
-    environmentId === "primary" ||
-    label.toLowerCase() === "bravo" ||
-    label.toLowerCase() === "local";
-  if (isPrimary) {
-    score += 100;
-  }
-  if (provider.usageLimits && !provider.usageLimits.unavailable) {
-    score += 10;
-    const hasFutureReset = provider.usageLimits.windows.some((w) => {
-      if (!w.resetsAt) return false;
-      const t = Date.parse(w.resetsAt);
-      return !Number.isNaN(t) && t > Date.now();
-    });
-    if (hasFutureReset) {
-      score += 5;
-    }
-  }
-  return score;
-}
-
-/**
- * One group per connected environment with a provider reporting limits.
- * Provider snapshots come from the config stream every client already holds,
- * so opening the view costs no extra request.
- *
- * When multiple environments connect (e.g. workstation + remote fleet),
- * providers sharing the same subscription/account (such as Antigravity) are
- * deduplicated to prefer the primary local machine with valid live limits.
- */
-export function collectLimitsGroups(
-  presentations: ReadonlyMap<
-    EnvironmentId,
-    {
-      readonly entry: { readonly target: { readonly label: string } };
-      readonly serverConfig: {
-        readonly providers?: readonly ServerProvider[] | undefined;
-      } | null;
-    }
-  >,
-): readonly LimitsGroup[] {
-  const bestByAccountKey = new Map<
-    string,
-    { readonly environmentId: EnvironmentId; readonly score: number }
-  >();
-
-  for (const [environmentId, presentation] of presentations) {
-    const label = presentation.entry.target.label;
-    for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
-      const key = providerAccountKey(provider);
-      if (!key) continue;
-      const score = providerQualityScore(environmentId, label, provider);
-      const existing = bestByAccountKey.get(key);
-      if (!existing || score > existing.score) {
-        bestByAccountKey.set(key, { environmentId, score });
-      }
-    }
-  }
-
-  const groups: LimitsGroup[] = [];
-  for (const [environmentId, presentation] of presentations) {
-    const rawProviders = providersWithLimits(presentation.serverConfig?.providers ?? []);
-    const providers = rawProviders.filter((provider) => {
-      const key = providerAccountKey(provider);
-      if (!key) return true;
-      const best = bestByAccountKey.get(key);
-      return best?.environmentId === environmentId;
-    });
-    if (providers.length === 0) continue;
-    groups.push({ environmentId, environmentLabel: presentation.entry.target.label, providers });
-  }
-  return groups.length > 1 ? groups : groups.map((group) => ({ ...group, environmentLabel: null }));
-}
-
-/**
- * Every usage-limit source across connected environments, keyed so two
- * environments pointing at the same hub still get their own rows. The label
- * carries the environment only when more than one environment has sources.
- * A native provider with usable limits takes precedence over the same account
- * in a source, even when it belongs to another connected environment.
- */
-export function collectLimitSources(
-  presentations: ReadonlyMap<
-    EnvironmentId,
-    {
-      readonly entry: { readonly target: { readonly label: string } };
-      readonly serverConfig: {
-        readonly providers?: readonly ServerProvider[] | undefined;
-        readonly usageLimitSources?: UsageLimitSourceSnapshots | undefined;
-      } | null;
-    }
-  >,
-): ReadonlyArray<
-  UsageLimitSourceSnapshot & {
-    readonly key: string;
-    readonly environmentId: EnvironmentId;
-    readonly hiddenAccountCount: number;
-  }
-> {
-  const nativeAccounts = new Set<string>();
-  for (const presentation of presentations.values()) {
-    for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
-      const key = accountKey(provider.driver, provider.auth.email);
-      if (
-        key !== null &&
-        provider.usageLimits?.windows.length &&
-        !provider.usageLimits.unavailable
-      ) {
-        nativeAccounts.add(key);
-      }
-    }
-  }
-  const perEnvironment: Array<{
-    readonly environmentId: EnvironmentId;
-    readonly environmentLabel: string;
-    readonly sources: UsageLimitSourceSnapshots;
-  }> = [];
-  for (const [environmentId, presentation] of presentations) {
-    const sources = presentation.serverConfig?.usageLimitSources ?? [];
-    if (sources.length === 0) continue;
-    perEnvironment.push({
-      environmentId,
-      environmentLabel: presentation.entry.target.label,
-      sources,
-    });
-  }
-  const labelEnvironment = perEnvironment.length > 1;
-  return perEnvironment.flatMap(({ environmentId, environmentLabel, sources }) =>
-    sources.map((source) => {
-      const accounts = source.accounts.filter((account) => {
-        const key = accountKey(account.driver, account.email);
-        return key === null || !nativeAccounts.has(key);
-      });
-      return {
-        ...source,
-        accounts,
-        hiddenAccountCount: source.accounts.length - accounts.length,
-        environmentId,
-        key: `${environmentId}:${source.id}`,
-        label: labelEnvironment ? `${environmentLabel} · ${source.label}` : source.label,
-      };
-    }),
-  );
-}
+>;
 
 function accountKey(driver: ServerProvider["driver"], email: string | undefined): string | null {
   const normalizedEmail = email?.trim().toLowerCase();
@@ -255,9 +96,7 @@ export interface LimitAccount {
  * entry per distinct account. The freshest reads supply windows and credits;
  * native instances supply names and environment labels.
  */
-export function collectLimitAccounts(
-  presentations: Parameters<typeof collectLimitSources>[0],
-): readonly LimitAccount[] {
+export function collectLimitAccounts(presentations: LimitPresentations): readonly LimitAccount[] {
   const accounts = new Map<string, LimitAccount>();
   const creditSources = new Map<string, LimitAccount>();
   const hubRedeems = new Map<string, LimitAccount>();
@@ -386,9 +225,7 @@ export function collectLimitAccounts(
  * are left out; there is nothing for the user to act on. The environment
  * is named only when more than one is connected.
  */
-export function collectLimitNotices(
-  presentations: Parameters<typeof collectLimitSources>[0],
-): readonly string[] {
+export function collectLimitNotices(presentations: LimitPresentations): readonly string[] {
   const label = (environmentLabel: string, subject: string) =>
     presentations.size > 1 ? `${environmentLabel} · ${subject}` : subject;
   const notices: string[] = [];

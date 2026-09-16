@@ -102,6 +102,24 @@ function writeSettingsPatch(patch: typeof DesktopSettingsPatch.Type) {
 }
 
 describe("DesktopSettings", () => {
+  it.effect(
+    "persists disabling and re-enabling local execution without clearing backend settings",
+    () =>
+      withSettings(
+        Effect.gen(function* () {
+          const settings = yield* DesktopAppSettings.DesktopAppSettings;
+          yield* settings.setWslBackendEnabled(true);
+          yield* settings.setWslDistro("Ubuntu");
+          yield* settings.setServerExposureMode("network-accessible");
+          const before = yield* settings.get;
+          assert.isTrue((yield* settings.setLocalEnvironmentEnabled(false)).changed);
+          assert.deepEqual(yield* settings.load, { ...before, localEnvironmentEnabled: false });
+          assert.isFalse((yield* settings.setLocalEnvironmentEnabled(false)).changed);
+          yield* settings.setLocalEnvironmentEnabled(true);
+          assert.deepEqual(yield* settings.load, before);
+        }),
+      ),
+  );
   it.effect("loads defaults when no settings file exists", () =>
     withSettings(
       Effect.gen(function* () {
@@ -117,6 +135,7 @@ describe("DesktopSettings", () => {
       DesktopAppSettings.resolveDefaultDesktopSettings("0.0.17-nightly.20260415.1"),
       {
         linuxPasswordStore: "auto",
+        localEnvironmentEnabled: true,
         mainWindowBounds: null,
         mainWindowMaximized: false,
         pullRequestsWindowBounds: null,
@@ -148,6 +167,7 @@ describe("DesktopSettings", () => {
 
         assert.deepEqual(yield* settings.load, {
           linuxPasswordStore: "gnome-libsecret",
+          localEnvironmentEnabled: true,
           mainWindowBounds: null,
           mainWindowMaximized: false,
           pullRequestsWindowBounds: null,
@@ -257,6 +277,7 @@ describe("DesktopSettings", () => {
 
         assert.deepEqual(yield* settings.load, {
           linuxPasswordStore: "auto",
+          localEnvironmentEnabled: true,
           mainWindowBounds: { x: 120, y: 80, width: 1280, height: 900 },
           mainWindowMaximized: false,
           pullRequestsWindowBounds: null,
@@ -356,6 +377,7 @@ describe("DesktopSettings", () => {
 
           assert.deepEqual(yield* settings.load, {
             linuxPasswordStore: "auto",
+            localEnvironmentEnabled: true,
             mainWindowBounds: null,
             mainWindowMaximized: false,
             pullRequestsWindowBounds: null,
@@ -406,6 +428,7 @@ describe("DesktopSettings", () => {
 
         assert.deepEqual(yield* settings.load, {
           linuxPasswordStore: "auto",
+          localEnvironmentEnabled: true,
           mainWindowBounds: null,
           mainWindowMaximized: false,
           pullRequestsWindowBounds: null,
@@ -436,6 +459,7 @@ describe("DesktopSettings", () => {
 
         assert.deepEqual(yield* settings.load, {
           linuxPasswordStore: "auto",
+          localEnvironmentEnabled: true,
           mainWindowBounds: null,
           mainWindowMaximized: false,
           pullRequestsWindowBounds: null,
@@ -465,6 +489,7 @@ describe("DesktopSettings", () => {
 
         assert.deepEqual(yield* settings.load, {
           linuxPasswordStore: "auto",
+          localEnvironmentEnabled: true,
           mainWindowBounds: null,
           mainWindowMaximized: false,
           pullRequestsWindowBounds: null,
