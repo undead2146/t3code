@@ -37,6 +37,7 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Random from "effect/Random";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
@@ -637,6 +638,7 @@ export interface AntigravityAdapterOptions {
   readonly turnInactivityTimeoutMs?: number | undefined;
   readonly activeToolInactivityTimeoutMs?: number | undefined;
   readonly turnRetryBaseDelayMs?: number | undefined;
+  readonly maxTurnRetries?: number | undefined;
 }
 
 interface PendingApproval {
@@ -726,7 +728,13 @@ export function isFatalAntigravityHarnessError(error?: unknown, text?: string): 
     if (
       s.includes("503") ||
       s.includes("no capacity available") ||
-      s.includes("capacity available")
+      s.includes("capacity available") ||
+      s.includes("model_capacity_exhausted") ||
+      s.includes("capacity exhausted") ||
+      s.includes("currently unreachable") ||
+      s.includes("rate limit") ||
+      s.includes("rate_limit") ||
+      s.includes("resource_exhausted")
     ) {
       return false;
     }
@@ -772,9 +780,58 @@ export function isFatalAntigravityHarnessError(error?: unknown, text?: string): 
   return false;
 }
 
+export function isCapacityExhaustedError(error?: unknown, text?: string): boolean {
+  const check = (str: string): boolean => {
+    const s = str.toLowerCase();
+    return (
+      /\b503\b/.test(s) ||
+      s.includes("model_capacity_exhausted") ||
+      s.includes("no capacity available") ||
+      s.includes("capacity available") ||
+      s.includes("capacity exhausted") ||
+      s.includes("resource_exhausted") ||
+      s.includes("unavailable: no capacity") ||
+      s.includes("currently unreachable") ||
+      s.includes("model is unreachable") ||
+      s.includes("model is currently unreachable")
+    );
+  };
+
+  if (typeof text === "string" && check(text)) return true;
+  if (typeof error === "string" && check(error)) return true;
+  if (error && typeof error === "object") {
+    if (
+      "message" in error &&
+      typeof (error as any).message === "string" &&
+      check((error as any).message)
+    ) {
+      return true;
+    }
+    if (
+      "detail" in error &&
+      typeof (error as any).detail === "string" &&
+      check((error as any).detail)
+    ) {
+      return true;
+    }
+    for (const val of Object.values(error as Record<string, unknown>)) {
+      if (typeof val === "string" && check(val)) return true;
+      if (val && typeof val === "object") {
+        for (const nested of Object.values(val as Record<string, unknown>)) {
+          if (typeof nested === "string" && check(nested)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 export function isRetryableAntigravityError(error?: unknown, text?: string): boolean {
   if (isFatalAntigravityHarnessError(error, text)) {
     return false;
+  }
+  if (isCapacityExhaustedError(error, text)) {
+    return true;
   }
 
   const check = (str: string): boolean => {
@@ -790,7 +847,10 @@ export function isRetryableAntigravityError(error?: unknown, text?: string): boo
       /\b503\b/.test(s) ||
       s.includes("no capacity available") ||
       s.includes("capacity available") ||
+      s.includes("model_capacity_exhausted") ||
+      s.includes("capacity exhausted") ||
       s.includes("resource_exhausted") ||
+      s.includes("currently unreachable") ||
       s.includes("rate limit") ||
       s.includes("rate_limit") ||
       /\b429\b/.test(s) ||
@@ -841,10 +901,11 @@ interface SessionContext {
   readonly cwd: string;
   readonly nativeSessionId: string;
   readonly scope: Scope.Closeable;
-  readonly runtime: Runtime;
+  runtime: Runtime;
   readonly promptLock: Semaphore.Semaphore;
   readonly stopLock: Semaphore.Semaphore;
   readonly commandLock: Semaphore.Semaphore;
+  readonly respawnLock: Semaphore.Semaphore;
   readonly approvals: Map<ApprovalRequestId, PendingApproval>;
   readonly questions: Map<ApprovalRequestId, PendingQuestion>;
   readonly commands: Map<string, OpenCommand>;
@@ -867,6 +928,12 @@ interface SessionContext {
   activeToolCalls: Set<string>;
   pendingRetry?: { readonly error: string } | undefined;
   fatalHarnessError?: string | undefined;
+  createAndStartRuntime: (
+    targetSessionId: string | undefined,
+  ) => Effect.Effect<
+    { r: Runtime; s: AcpSessionRuntime.AcpSessionRuntimeStartResult },
+    ProviderAdapterError
+  >;
 }
 
 const CLIENT_FILE_MAX_BYTES = 8 * 1024 * 1024;
@@ -1458,6 +1525,8 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
     }).pipe(Effect.ensuring(Effect.sync(() => context.approvals.delete(requestId))));
   });
 
+  let respawnRuntime: (context: SessionContext) => Effect.Effect<Runtime, ProviderAdapterError>;
+
   const handleEvent = Effect.fn("AntigravityAdapter.handleEvent")(function* (
     context: SessionContext,
     event: AcpSessionRuntime.AcpSessionRuntimeEvent,
@@ -1478,6 +1547,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         yield* options.onConfigOptionsUpdated?.(event.configOptions) ?? Effect.void;
         return;
       case "ConnectionTerminated":
+        context.disconnected = true;
         if (context.activeTurnIntent && !context.activeTurnIntent.settled) {
           yield* finishSessionTurn(context, context.activeTurnIntent, {
             state: "failed",
@@ -1485,7 +1555,6 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           });
         }
         context.stopped = true;
-        context.disconnected = true;
         yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
         return;
       case "AssistantItemStarted":
@@ -1532,10 +1601,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             !context.stopped
           ) {
             context.pendingRetry = { error: event.text };
-            if (context.promptFiber) {
-              yield* Fiber.interrupt(context.promptFiber).pipe(Effect.forkIn(context.scope));
-              context.promptFiber = undefined;
-            }
+            yield* Effect.ignore(context.runtime.cancel).pipe(Effect.forkIn(context.scope));
             return;
           }
           if (context.activeTurnIntent && !context.activeTurnIntent.settled) {
@@ -2123,6 +2189,76 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
     }
   });
 
+  respawnRuntime = (context: SessionContext) =>
+    context.respawnLock.withPermit(
+      Effect.gen(function* () {
+        if (!context.disconnected && !context.stopped) {
+          return context.runtime;
+        }
+        const sessionId =
+          (context.session as any)?.providerSessionId ??
+          (context.session.resumeCursor as any)?.sessionId ??
+          context.nativeSessionId;
+
+        yield* Effect.logWarning(
+          `Respawning Antigravity runtime for thread ${context.threadId} (resuming session ${sessionId})`,
+          { threadId: context.threadId, sessionId },
+        );
+
+        const { r: newRuntime, s: started } = yield* context.createAndStartRuntime(sessionId);
+
+        const defaultModel = options.defaultModel ? yield* options.defaultModel : undefined;
+        yield* applyAntigravityAcpModelSelection({
+          runtime: newRuntime,
+          model: context.session.model,
+          defaultModel,
+          mapError: (cause) => cause,
+        }).pipe(
+          Effect.mapError((cause) =>
+            isAcpError(cause)
+              ? mapAntigravityError(context.threadId, "session/respawn", cause)
+              : new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "session/respawn",
+                  detail: "Could not apply Antigravity model selection on respawn.",
+                  cause,
+                }),
+          ),
+        );
+        yield* newRuntime.setMode(antigravityPermissionMode(context.session.runtimeMode)).pipe(
+          Effect.mapError((cause) =>
+            isAcpError(cause)
+              ? mapAntigravityError(context.threadId, "session/respawn", cause)
+              : new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "session/respawn",
+                  detail: "Could not set Antigravity mode on respawn.",
+                  cause,
+                }),
+          ),
+        );
+
+        context.runtime = newRuntime;
+        context.disconnected = false;
+        context.stopped = false;
+
+        yield* Stream.runForEach(newRuntime.getEvents(), (event) =>
+          handleEvent(context, event),
+        ).pipe(
+          Effect.catchCause(() =>
+            Effect.logError("Could not process an Antigravity runtime event on respawned runtime."),
+          ),
+          Effect.forkIn(context.scope),
+        );
+
+        yield* Effect.logInfo(
+          `Antigravity runtime respawned successfully for thread ${context.threadId} (session ${started.sessionId})`,
+        );
+
+        return newRuntime;
+      }),
+    );
+
   const startSession: Adapter["startSession"] = (input) =>
     withThreadLock(
       input.threadId,
@@ -2180,10 +2316,11 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           runtime = claimed.runtime;
           started = claimed.started;
           usedStandby = true;
-          yield* prewarm(cwd).pipe(Effect.forkIn(ownerScope));
         } else {
           sessionScope = yield* Scope.make("sequential");
         }
+
+        yield* prewarm(cwd).pipe(Effect.ignore, Effect.forkIn(ownerScope));
 
         let transferred = false;
         let context: SessionContext | undefined;
@@ -2358,6 +2495,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             promptLock: yield* Semaphore.make(1),
             stopLock: yield* Semaphore.make(1),
             commandLock: yield* Semaphore.make(1),
+            respawnLock: yield* Semaphore.make(1),
             approvals: new Map(),
             questions: new Map(),
             commands: new Map(),
@@ -2386,6 +2524,20 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             disconnected: false,
             lastActivityAtMillis: yield* Clock.currentTimeMillis,
             activeToolCalls: new Set(),
+            createAndStartRuntime: (targetSessionId) =>
+              createAndStartRuntime(targetSessionId).pipe(
+                Effect.provideService(Scope.Scope, sessionScope),
+                Effect.mapError((cause) =>
+                  isAcpError(cause)
+                    ? mapAntigravityError(input.threadId, "session/start", cause)
+                    : new ProviderAdapterRequestError({
+                        provider: PROVIDER,
+                        method: "session/start",
+                        detail: "Could not start Antigravity. Check the provider setup status.",
+                        cause,
+                      }),
+                ),
+              ),
           };
           const running = context;
           sessions.set(input.threadId, running);
@@ -2643,6 +2795,9 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             yield* Fiber.await(context.promptFiber);
             yield* finishSubagents(context, "cancelled");
           }
+          if (context.disconnected) {
+            yield* respawnRuntime(context);
+          }
           yield* applyAntigravityAcpModelSelection({
             runtime: context.runtime,
             model,
@@ -2731,7 +2886,10 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
 
       let currentFiber = launch.fiber;
       let promptResult: EffectAcpSchema.PromptResponse | undefined;
-      const MAX_TURN_RETRIES = 3;
+      const MAX_TURN_RETRIES = options.maxTurnRetries ?? 3;
+      const CAPACITY_BACKOFF_SCHEDULE_MS = [
+        3_000, 6_000, 12_000, 24_000, 30_000, 30_000, 30_000, 30_000,
+      ];
       let turnRetryCount = 0;
       let lastRetryError: string | undefined;
 
@@ -2739,16 +2897,32 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         if (context.stopped) break;
 
         if (turnRetryCount > 0) {
-          const baseDelay = options.turnRetryBaseDelayMs ?? 2_000;
-          const delayMs = Math.min(baseDelay * Math.pow(2, turnRetryCount - 1), 10_000);
+          const isCapacity = isCapacityExhaustedError(lastRetryError);
+          const baseDelay =
+            options.turnRetryBaseDelayMs === 0
+              ? 0
+              : isCapacity
+                ? (CAPACITY_BACKOFF_SCHEDULE_MS[turnRetryCount - 1] ?? 30_000)
+                : Math.min(
+                    (options.turnRetryBaseDelayMs ?? 2_000) * Math.pow(2, turnRetryCount - 1),
+                    10_000,
+                  );
+          const jitter =
+            options.turnRetryBaseDelayMs === 0 ? 0 : yield* Random.nextIntBetween(0, 1_000);
+          const delayMs = baseDelay + jitter;
+
           yield* Effect.logWarning(
             `Antigravity turn ${launch.turn.turnId} retrying after capacity/provider error (attempt ${turnRetryCount}/${MAX_TURN_RETRIES}) in ${delayMs}ms`,
             {
               threadId: input.threadId,
               turnId: launch.turn.turnId,
               error: lastRetryError,
+              isCapacity,
             },
           );
+          const retryReason = isCapacity
+            ? `api_retry:${turnRetryCount}/${MAX_TURN_RETRIES} (waiting for capacity)`
+            : `api_retry:${turnRetryCount}/${MAX_TURN_RETRIES}`;
           yield* emit({
             type: "session.state.changed",
             ...(yield* stamp),
@@ -2756,11 +2930,15 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             threadId: input.threadId,
             payload: {
               state: "running",
-              reason: `api_retry:${turnRetryCount}/${MAX_TURN_RETRIES}`,
+              reason: retryReason,
             },
           });
           if (delayMs > 0) {
             yield* Effect.sleep(Duration.millis(delayMs));
+          }
+
+          if (context.disconnected) {
+            yield* respawnRuntime(context);
           }
 
           const continuationPrompt: ReadonlyArray<EffectAcpSchema.ContentBlock> = [
@@ -2793,18 +2971,34 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         const promptOutcome = yield* Fiber.await(currentFiber);
         yield* Fiber.interrupt(watchdogFiber);
 
-        if (Exit.isSuccess(promptOutcome)) {
+        if (Exit.isSuccess(promptOutcome) && !context.pendingRetry) {
           promptResult = promptOutcome.value;
           break;
         }
 
         const failureCause = Exit.isFailure(promptOutcome) ? promptOutcome.cause : undefined;
         const failureError = failureCause ? Cause.squash(failureCause) : undefined;
+        const isProcessExit =
+          context.disconnected ||
+          (failureError != null &&
+            (String(failureError).includes("AcpProcessExitedError") ||
+              String(failureError).includes("ConnectionTerminated") ||
+              String(failureError).includes("process exited") ||
+              String(failureError).includes("transport operation failed") ||
+              String(failureError).includes("connection closed")));
         const isFailureRetryable = failureError ? isRetryableAntigravityError(failureError) : false;
 
         const retryInfo =
           context.pendingRetry ??
-          (isFailureRetryable && failureError ? { error: String(failureError) } : undefined);
+          (isFailureRetryable && failureError
+            ? { error: String(failureError) }
+            : isProcessExit
+              ? {
+                  error: failureError
+                    ? String(failureError)
+                    : "Antigravity process exited unexpectedly.",
+                }
+              : undefined);
         context.pendingRetry = undefined;
 
         if (retryInfo && turnRetryCount < MAX_TURN_RETRIES && !context.stopped) {
@@ -3026,11 +3220,13 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             }
             const isFatalAcp =
               context.stopped ||
-              context.disconnected ||
-              isAcpError(cause) ||
-              cause.message?.toLowerCase().includes("receive_steps") ||
-              cause.message?.toLowerCase().includes("connection was lost") ||
-              cause.message?.toLowerCase().includes("connection closed");
+              (!isRetryableAntigravityError(cause) &&
+                !isCapacityExhaustedError(cause) &&
+                (context.disconnected ||
+                  isAcpError(cause) ||
+                  cause.message?.toLowerCase().includes("receive_steps") ||
+                  cause.message?.toLowerCase().includes("connection was lost") ||
+                  cause.message?.toLowerCase().includes("connection closed")));
             if (isFatalAcp) {
               context.stopped = true;
               context.disconnected = true;
@@ -3389,7 +3585,32 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
   );
 
   // Pre-warm a standby Antigravity ACP runtime in the background on startup
-  yield* prewarm(path.resolve(".")).pipe(
+  const resolveInitialPrewarmCwd = Effect.sync(() => {
+    try {
+      if (serverConfig.dbPath && NodeFS.existsSync(serverConfig.dbPath)) {
+        const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
+        const db = new DatabaseSync(serverConfig.dbPath, { readOnly: true });
+        try {
+          const row = db
+            .prepare(
+              "SELECT workspace_root FROM projection_projects WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1",
+            )
+            .get() as { workspace_root?: string } | undefined;
+          if (row?.workspace_root && NodeFS.existsSync(row.workspace_root)) {
+            return row.workspace_root;
+          }
+        } finally {
+          db.close();
+        }
+      }
+    } catch {
+      // Fall back to current working directory
+    }
+    return path.resolve(".");
+  });
+
+  const initialPrewarmCwd = yield* resolveInitialPrewarmCwd;
+  yield* prewarm(initialPrewarmCwd).pipe(
     Effect.forkIn(ownerScope),
     Effect.catchCause(() => Effect.void),
   );

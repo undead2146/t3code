@@ -80,6 +80,10 @@ const removedEnvironmentKeys = new Set([
   "BROWSER",
   "PYTHONUNBUFFERED",
   "ELECTRON_RUN_AS_NODE",
+  "_PYI_APPLICATION_HOME_DIR",
+  "_PYI_ARCHIVE_FILE",
+  "_PYI_PARENT_PROCESS_LEVEL",
+  "_MEIPASS2",
 ]);
 
 export interface AntigravityProfile {
@@ -204,7 +208,7 @@ function quoteBrowserArgument(value: string, platform?: NodeJS.Platform): string
   if (platform === "win32") {
     return `"${value.replaceAll('"', '\\"')}"`;
   }
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
+  return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 function antigravityEnvironment(
@@ -216,7 +220,14 @@ function antigravityEnvironment(
   const environment: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(baseEnv)) {
     // Windows treats environment keys as case-insensitive. Remove aliases too.
-    if (!removedEnvironmentKeys.has(key.toUpperCase())) environment[key] = value;
+    const upper = key.toUpperCase();
+    if (
+      !removedEnvironmentKeys.has(upper) &&
+      !upper.startsWith("_PYI_") &&
+      !upper.startsWith("_MEI")
+    ) {
+      environment[key] = value;
+    }
   }
   // Only the configured method's credential reaches the agent. The agent
   // prefers GOOGLE_API_KEY over the GCP pair for Agent Platform, so the pair

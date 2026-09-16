@@ -1022,13 +1022,12 @@ export const make = (
                   Exit.isFailure(result) &&
                   Cause.hasInterrupts(result.cause)
                 ) {
-                  yield* retireRuntime(
-                    new EffectAcpErrors.AcpTransportError({
-                      method: "session/prompt",
-                      detail: "The ACP prompt stopped before the agent confirmed completion.",
-                      cause: undefined,
-                    }),
-                  );
+                  const started = yield* Effect.option(getStartedState);
+                  if (Option.isSome(started)) {
+                    yield* acp.agent
+                      .cancel({ sessionId: started.value.sessionId })
+                      .pipe(Effect.ignore);
+                  }
                 }
                 yield* Fiber.interrupt(activePrompt.fiber).pipe(Effect.ignore);
                 yield* Ref.set(activePromptRef, Option.none());
