@@ -1756,6 +1756,17 @@ it.layer(layer)("AntigravityAdapter", (it) => {
         "Agent execution error: request failed (code 503): No capacity available",
       ),
     ).toBe(false);
+    expect(
+      isFatalAntigravityHarnessError(
+        undefined,
+        'Encountered retryable error from model provider: Agent execution terminated due to error. ("request failed (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 6m26s.")',
+      ),
+    ).toBe(true);
+    expect(
+      isFatalAntigravityHarnessError(
+        new Error("request failed (code 429): Individual quota reached"),
+      ),
+    ).toBe(true);
   });
 
   it.effect(
@@ -1812,6 +1823,68 @@ it.layer(layer)("AntigravityAdapter", (it) => {
         expect(completed.payload.state).toBe("failed");
         expect(completed.payload.stopReason).toBe("error");
         expect(completed.payload.errorMessage).toContain("could not find doneCh for checkpoint");
+
+        const exited = yield* h.waitForEvent((event) => event.type === "session.exited");
+        expect(exited.payload.exitKind).toBe("error");
+      }),
+  );
+
+  it.effect(
+    "detects quota exhaustion 429 error during tool execution with shadowed file detail and settles turn as failed",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        yield* h.adapter.startSession({
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+        });
+
+        const sending = yield* h.adapter
+          .sendTurn({ threadId, input: "Read file and edit" })
+          .pipe(Effect.forkChild);
+
+        const prompt = yield* h.nextPrompt;
+
+        // Tool call starts with file path as detail
+        yield* h.emitNative({
+          _tag: "ToolCallUpdated",
+          toolCall: {
+            toolCallId: "call_quota_123",
+            title: "read_file",
+            detail: "/home/ubuntu/project/SomeFile.cs",
+            status: "inProgress",
+            data: {},
+          },
+          rawPayload: null,
+        });
+
+        // Tool call fails due to 429 individual quota limit
+        yield* h.emitNative({
+          _tag: "ToolCallUpdated",
+          toolCall: {
+            toolCallId: "call_quota_123",
+            title: "read_file",
+            detail: "/home/ubuntu/project/SomeFile.cs",
+            status: "failed",
+            data: {
+              rawOutput:
+                'Encountered retryable error from model provider: Agent execution terminated due to error. ("request failed (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 6m26s.")',
+            },
+          },
+          rawPayload: null,
+        });
+
+        // Harness returns false end_turn stop reason
+        yield* Deferred.succeed(prompt.result, { stopReason: "end_turn" });
+
+        const turnExit = yield* Fiber.await(sending);
+        expect(Exit.isFailure(turnExit)).toBe(true);
+
+        const completed = yield* h.waitForEvent((event) => event.type === "turn.completed");
+        expect(completed.payload.state).toBe("failed");
+        expect(completed.payload.stopReason).toBe("error");
+        expect(completed.payload.errorMessage).toContain("Individual quota reached");
 
         const exited = yield* h.waitForEvent((event) => event.type === "session.exited");
         expect(exited.payload.exitKind).toBe("error");

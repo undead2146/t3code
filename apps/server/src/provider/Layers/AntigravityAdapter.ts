@@ -226,6 +226,19 @@ export function registerKilledSubagent(conversationId: string): void {
   } catch {}
 }
 
+export function terminateHarnessProcesses(): void {
+  try {
+    if (process.platform === "win32") {
+      NodeCP.exec(
+        'powershell -NoProfile -Command "Stop-Process -Name localharness_external, agy_acp_server -Force -ErrorAction SilentlyContinue"',
+        () => {},
+      );
+    } else {
+      NodeCP.exec('pkill -9 -f "localharness_external|agy_acp_server"', () => {});
+    }
+  } catch {}
+}
+
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function extractSubagentConversationId(
@@ -728,7 +741,10 @@ export function isFatalAntigravityHarnessError(error?: unknown, text?: string): 
       s.includes("agent execution terminated due to error") ||
       s.includes("agent executor error:") ||
       s.includes("fatal executor error") ||
-      s.includes("checkpoint validation failed")
+      s.includes("checkpoint validation failed") ||
+      s.includes("individual quota reached") ||
+      s.includes("quota reached") ||
+      s.includes("request failed (code 429)")
     );
   };
 
@@ -1551,20 +1567,22 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             }
             if (toolCall.status === "failed") {
               const rawOut = toolCall.data?.rawOutput;
-              const toolOutput =
-                toolCall.detail ??
-                (typeof rawOut === "string"
+              const rawOutputStr =
+                typeof rawOut === "string"
                   ? rawOut
                   : typeof (rawOut as Record<string, unknown> | null | undefined)
                         ?.combinedOutput === "string"
                     ? ((rawOut as Record<string, unknown>).combinedOutput as string)
-                    : undefined);
+                    : undefined;
+              const toolErrorText = rawOutputStr ?? toolCall.detail;
               if (
                 isFatalAntigravityHarnessError(toolCall.data) ||
-                isFatalAntigravityHarnessError(undefined, toolOutput)
+                isFatalAntigravityHarnessError(undefined, rawOutputStr) ||
+                isFatalAntigravityHarnessError(undefined, toolCall.detail)
               ) {
                 context.fatalHarnessError =
-                  toolOutput ?? "Agent execution terminated due to internal harness error";
+                  toolErrorText ??
+                  "Agent execution terminated due to internal harness error or quota limits";
               }
             }
             const tracked = context.subagents.get(toolCall.toolCallId);
@@ -2184,81 +2202,120 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             profileDirectory: options.profileDirectory,
             path,
           });
-          if (!usedStandby) {
-            if (Option.isSome(cursor)) {
-              yield* sanitizeAntigravitySessionDatabase({
-                profileDirectory: options.profileDirectory ?? serverConfig.stateDir,
-                sessionId: cursor.value.sessionId,
-              }).pipe(
-                Effect.provideService(FileSystem.FileSystem, fileSystem),
-                Effect.provideService(Path.Path, path),
-                Effect.tap(({ repairedCheckpoints, removedErrorSteps }) =>
-                  repairedCheckpoints > 0 || removedErrorSteps > 0
-                    ? Effect.logWarning(
-                        "Sanitized corrupt Antigravity session database before resume",
-                        {
-                          threadId: input.threadId,
-                          sessionId: cursor.value.sessionId,
-                          repairedCheckpoints,
-                          removedErrorSteps,
-                        },
-                      )
-                    : Effect.void,
-                ),
-                Effect.ignore,
-              );
-            }
-            runtime = yield* options.makeRuntime({
-              cwd,
-              clientInfo: { name: "t3-code", version: "0.0.0" },
-              clientFileSystem: true,
-              ...(mcp?.agentDeviceEnvironment
-                ? { agentDeviceEnvironment: mcp.agentDeviceEnvironment }
-                : {}),
-              additionalDirectories,
-              ...(Option.isSome(cursor) ? { resumeSessionId: cursor.value.sessionId } : {}),
-              mcpServers: mcp
-                ? [
-                    {
-                      type: "http",
-                      name: "t3-code",
-                      url: mcp.endpoint,
-                      headers: [{ name: "Authorization", value: mcp.authorizationHeader }],
-                    },
-                  ]
-                : [],
-              ...makeNativeLoggers({
-                nativeEventLogger: options.nativeEventLogger,
-                provider: PROVIDER,
-                threadId: input.threadId,
-              }),
-            });
-          }
-
           const allowedRoots = [cwd, ...additionalDirectories];
-          yield* runtime.handleReadTextFile((request) =>
-            readClientTextFile({ fileSystem, path, allowedRoots, request }),
-          );
-          yield* runtime.handleWriteTextFile((request) =>
-            writeClientTextFile({ fileSystem, path, allowedRoots, request }),
-          );
-          yield* runtime.handleRequestPermission((request) =>
-            context
-              ? handlePermission(context, request).pipe(
-                  Effect.mapError((cause) =>
-                    EffectAcpErrors.AcpRequestError.internalError(
-                      "Could not process an Antigravity permission request.",
-                      undefined,
-                      { cause },
-                    ),
+          const bindHandlers = (r: Runtime) =>
+            Effect.gen(function* () {
+              yield* r.handleReadTextFile((request) =>
+                readClientTextFile({ fileSystem, path, allowedRoots, request }),
+              );
+              yield* r.handleWriteTextFile((request) =>
+                writeClientTextFile({ fileSystem, path, allowedRoots, request }),
+              );
+              yield* r.handleRequestPermission((request) =>
+                context
+                  ? handlePermission(context, request).pipe(
+                      Effect.mapError((cause) =>
+                        EffectAcpErrors.AcpRequestError.internalError(
+                          "Could not process an Antigravity permission request.",
+                          undefined,
+                          { cause },
+                        ),
+                      ),
+                    )
+                  : Effect.succeed({
+                      outcome: { outcome: "cancelled" },
+                    } satisfies NativePermissionResponse),
+              );
+            });
+
+          const createAndStartRuntime = (targetSessionId: string | undefined) =>
+            Effect.gen(function* () {
+              if (targetSessionId) {
+                yield* sanitizeAntigravitySessionDatabase({
+                  profileDirectory: options.profileDirectory ?? serverConfig.stateDir,
+                  sessionId: targetSessionId,
+                }).pipe(
+                  Effect.provideService(FileSystem.FileSystem, fileSystem),
+                  Effect.provideService(Path.Path, path),
+                  Effect.tap(({ repairedCheckpoints, removedErrorSteps }) =>
+                    repairedCheckpoints > 0 || removedErrorSteps > 0
+                      ? Effect.logWarning(
+                          "Sanitized corrupt Antigravity session database before resume",
+                          {
+                            threadId: input.threadId,
+                            sessionId: targetSessionId,
+                            repairedCheckpoints,
+                            removedErrorSteps,
+                          },
+                        )
+                      : Effect.void,
                   ),
-                )
-              : Effect.succeed({
-                  outcome: { outcome: "cancelled" },
-                } satisfies NativePermissionResponse),
-          );
+                  Effect.ignore,
+                );
+              }
+              const r = yield* options.makeRuntime({
+                cwd,
+                clientInfo: { name: "t3-code", version: "0.0.0" },
+                clientFileSystem: true,
+                ...(mcp?.agentDeviceEnvironment
+                  ? { agentDeviceEnvironment: mcp.agentDeviceEnvironment }
+                  : {}),
+                additionalDirectories,
+                ...(targetSessionId ? { resumeSessionId: targetSessionId } : {}),
+                mcpServers: mcp
+                  ? [
+                      {
+                        type: "http",
+                        name: "t3-code",
+                        url: mcp.endpoint,
+                        headers: [{ name: "Authorization", value: mcp.authorizationHeader }],
+                      },
+                    ]
+                  : [],
+                ...makeNativeLoggers({
+                  nativeEventLogger: options.nativeEventLogger,
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                }),
+              });
+              yield* bindHandlers(r);
+              const s = yield* r.start();
+              return { r, s };
+            });
+
           if (!usedStandby) {
-            started = yield* runtime.start();
+            const initialSessionId = Option.isSome(cursor) ? cursor.value.sessionId : undefined;
+            const bootResult = yield* createAndStartRuntime(initialSessionId).pipe(
+              Effect.catchIf(
+                (err) =>
+                  Option.isSome(cursor) &&
+                  (isAcpError(err) ||
+                    isRetryableAntigravityError(err) ||
+                    (err != null &&
+                      typeof (err as any).message === "string" &&
+                      ((err as any).message.includes("transport operation failed") ||
+                        (err as any).message.includes("connection closed") ||
+                        (err as any).message.includes("1006")))),
+                (err) =>
+                  Effect.gen(function* () {
+                    yield* Effect.logWarning(
+                      "Failed to resume Antigravity session from cursor; falling back to fresh session",
+                      {
+                        threadId: input.threadId,
+                        corruptSessionId: initialSessionId,
+                        error: String(err),
+                      },
+                    );
+                    terminateHarnessProcesses();
+                    yield* Effect.sleep(Duration.millis(500));
+                    return yield* createAndStartRuntime(undefined);
+                  }),
+              ),
+            );
+            runtime = bootResult.r;
+            started = bootResult.s;
+          } else {
+            yield* bindHandlers(runtime);
           }
           const defaultModel = options.defaultModel ? yield* options.defaultModel : undefined;
           const model = yield* applyAntigravityAcpModelSelection({
@@ -2913,6 +2970,9 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             errorMessage: fatalMessage,
           }),
         );
+        yield* finishBackgroundCommands(context);
+        yield* finishSubagents(context, "failed");
+        terminateHarnessProcesses();
         context.stopped = true;
         context.disconnected = true;
         yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
@@ -2965,6 +3025,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             if (isFatalAcp) {
               context.stopped = true;
               context.disconnected = true;
+              terminateHarnessProcesses();
               yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
             }
           }),
