@@ -166,9 +166,16 @@ const ANTIGRAVITY_CLIENT_SECRET = String.fromCharCode(
   65,
   102,
 );
-const CLOUDCODE_QUOTA_SUMMARY_URL =
-  "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
-const CLOUDCODE_MODELS_URL = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
+export const CLOUDCODE_QUOTA_SUMMARY_URLS = [
+  "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+  "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+] as const;
+export const CLOUDCODE_MODELS_URLS = [
+  "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+  "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+] as const;
+export const CLOUDCODE_QUOTA_SUMMARY_URL = CLOUDCODE_QUOTA_SUMMARY_URLS[0];
+export const CLOUDCODE_MODELS_URL = CLOUDCODE_MODELS_URLS[0];
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 export interface AntigravityModelQuota {
@@ -540,44 +547,48 @@ export async function fetchAntigravityLiveQuota(
     email?: string,
   ): Promise<AntigravityLiveQuotaData | null> => {
     // Priority A: retrieveUserQuotaSummary (exact rolling 5h and weekly quota per group)
-    try {
-      const summaryRes = await fetch(CLOUDCODE_QUOTA_SUMMARY_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-          "User-Agent": "antigravity/1.107.0 windows/amd64",
-        },
-        body: JSON.stringify(projectId ? { project: projectId } : {}),
-        signal: AbortSignal.timeout(4000),
-      });
-      if (summaryRes.ok) {
-        const summaryData = (await summaryRes.json()) as Record<string, unknown>;
-        const parsed = parseAntigravityQuotaPayload(summaryData, undefined, email);
-        if (parsed) return parsed;
+    for (const url of CLOUDCODE_QUOTA_SUMMARY_URLS) {
+      try {
+        const summaryRes = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+            "User-Agent": "antigravity/1.107.0 windows/amd64",
+          },
+          body: JSON.stringify(projectId ? { project: projectId } : {}),
+          signal: AbortSignal.timeout(4000),
+        });
+        if (summaryRes.ok) {
+          const summaryData = (await summaryRes.json()) as Record<string, unknown>;
+          const parsed = parseAntigravityQuotaPayload(summaryData, undefined, email);
+          if (parsed) return parsed;
+        }
+      } catch {
+        // Try next URL or fall through
       }
-    } catch {
-      // Fallback to fetchAvailableModels below
     }
 
     // Priority B: fetchAvailableModels
-    try {
-      const modelsRes = await fetch(CLOUDCODE_MODELS_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-          "User-Agent": "antigravity/1.107.0 windows/amd64",
-        },
-        body: JSON.stringify(projectId ? { project: projectId } : {}),
-        signal: AbortSignal.timeout(4000),
-      });
-      if (modelsRes.ok) {
-        const modelsData = (await modelsRes.json()) as Record<string, unknown>;
-        return parseAntigravityQuotaPayload(modelsData, undefined, email);
+    for (const url of CLOUDCODE_MODELS_URLS) {
+      try {
+        const modelsRes = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+            "User-Agent": "antigravity/1.107.0 windows/amd64",
+          },
+          body: JSON.stringify(projectId ? { project: projectId } : {}),
+          signal: AbortSignal.timeout(4000),
+        });
+        if (modelsRes.ok) {
+          const modelsData = (await modelsRes.json()) as Record<string, unknown>;
+          return parseAntigravityQuotaPayload(modelsData, undefined, email);
+        }
+      } catch {
+        // Try next URL or fall through
       }
-    } catch {
-      // Fall through
     }
 
     return null;
@@ -789,6 +800,21 @@ export function makeAntigravityUsageLimits(
       },
     ];
 
+    // If Claude & GPT 5h bucket exists and is distinct from primary, add it
+    const thirdPartySession = liveQuota.buckets?.find(
+      (b) => (b.bucketId === "3p-5h" || /3p|claude/i.test(b.groupName)) && b.window === "5h",
+    );
+    if (thirdPartySession && thirdPartySession.resetsAt) {
+      windows.push({
+        id: "antigravity_3p_session",
+        kind: "session",
+        label: "Session · Claude & GPT",
+        usedPercent: thirdPartySession.usedPercent,
+        windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.SESSION_MINS,
+        resetsAt: thirdPartySession.resetsAt,
+      });
+    }
+
     // If Claude & GPT weekly bucket exists and is distinct from primary, add it
     const thirdPartyWeekly = liveQuota.buckets?.find(
       (b) =>
@@ -934,6 +960,20 @@ export function makeAntigravityUsageLimitsUpdate(input: {
           : {}),
       },
     ];
+
+    const thirdPartySession = liveQuota.buckets?.find(
+      (b) => (b.bucketId === "3p-5h" || /3p|claude/i.test(b.groupName)) && b.window === "5h",
+    );
+    if (thirdPartySession && thirdPartySession.resetsAt) {
+      windows.push({
+        id: "antigravity_3p_session",
+        kind: "session",
+        label: "Session · Claude & GPT",
+        usedPercent: thirdPartySession.usedPercent,
+        windowDurationMins: ANTIGRAVITY_LIMIT_CONSTANTS.SESSION_MINS,
+        resetsAt: thirdPartySession.resetsAt,
+      });
+    }
 
     const thirdPartyWeekly = liveQuota.buckets?.find(
       (b) =>

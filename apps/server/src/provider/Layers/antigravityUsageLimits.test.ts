@@ -217,6 +217,16 @@ describe("antigravityUsageLimits", () => {
       },
       buckets: [
         {
+          bucketId: "3p-5h",
+          modelId: "3p-5h",
+          label: "Five Hour Limit Remaining",
+          groupName: "Claude and GPT models",
+          window: "5h",
+          remainingFraction: 0.8,
+          usedPercent: 20,
+          resetsAt: "2026-09-07T14:00:00Z",
+        },
+        {
           bucketId: "3p-weekly",
           modelId: "3p-weekly",
           label: "Weekly Limit Remaining",
@@ -248,6 +258,12 @@ describe("antigravityUsageLimits", () => {
     const weekly = limits.windows.find((w) => w.id === ANTIGRAVITY_WINDOW_IDS.WEEKLY);
     expect(weekly?.usedPercent).toBe(10);
     expect(weekly?.resetsAt).toBe("2026-09-10T10:00:00Z");
+
+    const thirdPartySession = limits.windows.find((w) => w.id === "antigravity_3p_session");
+    expect(thirdPartySession).toBeDefined();
+    expect(thirdPartySession?.label).toBe("Session · Claude & GPT");
+    expect(thirdPartySession?.usedPercent).toBe(20);
+    expect(thirdPartySession?.resetsAt).toBe("2026-09-07T14:00:00Z");
 
     const thirdParty = limits.windows.find((w) => w.id === "antigravity_3p_weekly");
     expect(thirdParty).toBeDefined();
