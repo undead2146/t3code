@@ -1624,6 +1624,23 @@ it.layer(layer)("AntigravityAdapter", (it) => {
       ),
     ).toBe(false);
     expect(isRetryableAntigravityError(new Error("Invalid API key"))).toBe(false);
+    expect(
+      isRetryableAntigravityError(
+        new Error("AcpProcessExitedError: ACP process exited with code 4294967295"),
+      ),
+    ).toBe(false);
+    expect(isRetryableAntigravityError(undefined, "ACP process exited with code 4294967295")).toBe(
+      false,
+    );
+    expect(
+      isRetryableAntigravityError(
+        undefined,
+        'Encountered retryable error from model provider: Agent execution terminated due to error. ("request failed (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 6m26s.")',
+      ),
+    ).toBe(false);
+    expect(
+      isRetryableAntigravityError(new Error("request failed (code 429): Rate limit exceeded")),
+    ).toBe(true);
   });
 
   it.effect(

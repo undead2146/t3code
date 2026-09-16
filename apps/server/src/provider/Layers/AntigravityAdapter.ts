@@ -226,19 +226,6 @@ export function registerKilledSubagent(conversationId: string): void {
   } catch {}
 }
 
-export function terminateHarnessProcesses(): void {
-  try {
-    if (process.platform === "win32") {
-      NodeCP.exec(
-        'powershell -NoProfile -Command "Stop-Process -Name localharness_external, agy_acp_server -Force -ErrorAction SilentlyContinue"',
-        () => {},
-      );
-    } else {
-      NodeCP.exec('pkill -9 -f "localharness_external|agy_acp_server"', () => {});
-    }
-  } catch {}
-}
-
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function extractSubagentConversationId(
@@ -736,6 +723,13 @@ interface TurnIntent {
 export function isFatalAntigravityHarnessError(error?: unknown, text?: string): boolean {
   const check = (str: string): boolean => {
     const s = str.toLowerCase();
+    if (
+      s.includes("503") ||
+      s.includes("no capacity available") ||
+      s.includes("capacity available")
+    ) {
+      return false;
+    }
     return (
       s.includes("could not find donech for checkpoint") ||
       s.includes("agent execution terminated due to error") ||
@@ -744,7 +738,7 @@ export function isFatalAntigravityHarnessError(error?: unknown, text?: string): 
       s.includes("checkpoint validation failed") ||
       s.includes("individual quota reached") ||
       s.includes("quota reached") ||
-      s.includes("request failed (code 429)")
+      (s.includes("request failed (code 429)") && (s.includes("quota") || s.includes("resets in")))
     );
   };
 
@@ -779,16 +773,27 @@ export function isFatalAntigravityHarnessError(error?: unknown, text?: string): 
 }
 
 export function isRetryableAntigravityError(error?: unknown, text?: string): boolean {
+  if (isFatalAntigravityHarnessError(error, text)) {
+    return false;
+  }
+
   const check = (str: string): boolean => {
     const s = str.toLowerCase();
+    if (
+      s.includes("acpprocessexitederror") ||
+      s.includes("process exited with code") ||
+      s.includes("4294967295")
+    ) {
+      return false;
+    }
     return (
-      s.includes("503") ||
+      /\b503\b/.test(s) ||
       s.includes("no capacity available") ||
       s.includes("capacity available") ||
       s.includes("resource_exhausted") ||
       s.includes("rate limit") ||
       s.includes("rate_limit") ||
-      s.includes("429") ||
+      /\b429\b/.test(s) ||
       s.includes("quota exceeded") ||
       s.includes("temporarily unavailable") ||
       s.includes("retryable error") ||
@@ -804,6 +809,12 @@ export function isRetryableAntigravityError(error?: unknown, text?: string): boo
   if (typeof text === "string" && check(text)) return true;
   if (typeof error === "string" && check(error)) return true;
   if (error && typeof error === "object") {
+    if (
+      ("_tag" in error && (error as any)._tag === "AcpProcessExitedError") ||
+      ("name" in error && (error as any).name === "AcpProcessExitedError")
+    ) {
+      return false;
+    }
     if (
       "message" in error &&
       typeof (error as any).message === "string" &&
@@ -2306,7 +2317,6 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                         error: String(err),
                       },
                     );
-                    terminateHarnessProcesses();
                     yield* Effect.sleep(Duration.millis(500));
                     return yield* createAndStartRuntime(undefined);
                   }),
@@ -2972,7 +2982,6 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         );
         yield* finishBackgroundCommands(context);
         yield* finishSubagents(context, "failed");
-        terminateHarnessProcesses();
         context.stopped = true;
         context.disconnected = true;
         yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
@@ -3025,7 +3034,6 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             if (isFatalAcp) {
               context.stopped = true;
               context.disconnected = true;
-              terminateHarnessProcesses();
               yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
             }
           }),
