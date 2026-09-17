@@ -785,7 +785,7 @@ const makeServerLayer = Layer.unwrap(
       routerConfig: HTTP_ROUTER_CONFIG,
     }).pipe(Layer.tap(() => Deferred.succeed(routesReady, undefined).pipe(Effect.orDie)));
 
-    const runningSessionContinuationLayer = Layer.scopedDiscard(
+    const runningSessionContinuationLayer = Layer.effectDiscard(
       Effect.gen(function* () {
         const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
         yield* Effect.addFinalizer(() =>

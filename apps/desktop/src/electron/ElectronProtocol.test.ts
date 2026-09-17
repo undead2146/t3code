@@ -68,6 +68,31 @@ describe("ElectronProtocol", () => {
     }).pipe(Effect.provide(Layer.merge(protocolLayer, NodeServices.layer)), Effect.scoped),
   );
 
+  it.effect("serves fallback HTML when index.html is missing", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const directory = yield* fileSystem.makeTempDirectoryScoped();
+      let handler: ((request: Request) => Promise<Response>) | undefined;
+      handleMock.mockImplementation((_scheme, nextHandler) => {
+        handler = nextHandler;
+      });
+      const protocol = yield* ElectronProtocol.ElectronProtocol;
+      yield* protocol.registerDesktopProtocol({
+        scheme: "t3code",
+        assetDirectory: directory,
+        clerkFrontendApiHostname: undefined,
+      });
+      const request = (pathname: string, init?: RequestInit) =>
+        Effect.promise(() => handler!(new Request(`t3code://app${pathname}`, init)));
+
+      const response = yield* request("/");
+      assert.equal(response.status, 404);
+      const text = yield* Effect.promise(() => response.text());
+      assert.include(text, "Web client bundle not found");
+      assert.include(response.headers.get("content-type") ?? "", "text/html");
+    }).pipe(Effect.provide(Layer.merge(protocolLayer, NodeServices.layer)), Effect.scoped),
+  );
+
   it.effect("proxies the stable renderer origin to the current app server", () =>
     Effect.gen(function* () {
       let handler: ((request: Request) => Promise<Response>) | undefined;

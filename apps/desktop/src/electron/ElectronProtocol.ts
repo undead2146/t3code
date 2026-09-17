@@ -225,7 +225,16 @@ const serveDesktopAsset = Effect.fn("desktop.protocol.serveAsset")(function* (
     filePath = path.join(root, "index.html");
   }
   const contents = yield* fileSystem.readFile(filePath).pipe(Effect.orElseSucceed(() => null));
-  if (contents === null) return new Response(null, { status: 404 });
+  if (contents === null) {
+    if (filePath.endsWith("index.html")) {
+      const fallbackHtml = `<!doctype html><html><head><meta charset="utf-8"><title>T3 Code - Client Not Found</title><style>body{background:#0a0a0a;color:#f87171;font-family:system-ui,-apple-system,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;padding:24px;box-sizing:border-box;text-align:center}h2{margin-bottom:8px}code{background:#18181b;color:#e4e4e7;padding:3px 8px;border-radius:4px;font-size:0.9em}p{color:#a1a1aa;max-width:540px;line-height:1.5}</style></head><body><h2>Web client bundle not found</h2><p>Expected client assets at <code>${root}</code>.</p><p>Build the desktop client with <code>pnpm build:desktop</code>, or start dev mode with <code>pnpm dev:desktop</code>.</p></body></html>`;
+      return new Response(request.method === "HEAD" ? null : fallbackHtml, {
+        status: 404,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+    return new Response(null, { status: 404 });
+  }
   return new Response(request.method === "HEAD" ? null : new Uint8Array(contents), {
     headers: { "content-type": Mime.getType(filePath) ?? "application/octet-stream" },
   });
