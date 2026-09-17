@@ -1,6 +1,6 @@
 import type { UsageProviderKind } from "@t3tools/contracts";
 
-import { AntigravityIcon, ClaudeAI, GrokIcon, type Icon, OpenAI } from "../Icons";
+import { AntigravityIcon, ClaudeAI, GrokIcon, type Icon, MetaIcon, OpenAI } from "../Icons";
 
 type UsageProviderPresentation = {
   readonly label: string;
@@ -34,6 +34,11 @@ export const PROVIDER_PRESENTATION = {
     label: "Antigravity",
     color: "#4285f4",
     mark: AntigravityIcon,
+  },
+  muse: {
+    label: "Muse Code",
+    color: "#6088d9",
+    mark: MetaIcon,
   },
 } satisfies Record<UsageProviderKind, UsageProviderPresentation>;
 

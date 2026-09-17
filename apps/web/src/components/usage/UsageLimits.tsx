@@ -53,7 +53,9 @@ export function barColor(driver: ServerProvider["driver"]): string {
         ? "claude"
         : driver === "antigravity"
           ? "antigravity"
-          : undefined;
+          : driver === "muse"
+            ? "muse"
+            : undefined;
   return kind ? PROVIDER_PRESENTATION[kind].color : "var(--foreground)";
 }
 

@@ -4,6 +4,7 @@ import {
   CodexSettings,
   CursorSettings,
   GrokSettings,
+  MuseSettings,
   OpenCodeSettings,
   ProviderDriverKind,
 } from "@t3tools/contracts";
@@ -14,6 +15,7 @@ import {
   CursorIcon,
   GrokIcon,
   type Icon,
+  MetaIcon,
   OpenAI,
   OpenCodeIcon,
 } from "../Icons";
@@ -81,6 +83,13 @@ const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
     label: "OpenCode",
     icon: OpenCodeIcon,
     settingsSchema: OpenCodeSettings,
+  },
+  {
+    value: ProviderDriverKind.make("muse"),
+    label: "Muse Code",
+    icon: MetaIcon,
+    badgeLabel: "Developer Preview",
+    settingsSchema: MuseSettings,
   },
 ];
 

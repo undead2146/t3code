@@ -22,12 +22,16 @@ import type { UsageProviderKind } from "@t3tools/contracts";
 
 import {
   initialAntigravityScanState,
+  flushAntigravityPendingUsage,
+  type AntigravityScanState,
   initialCodexScanState,
   mightCarryUsage,
   parseAntigravityLine,
   parseClaudeLine,
   parseCodexLine,
   parseGrokLine,
+  parseMuseLine,
+  type MuseScanState,
   type CodexScanState,
   type UsageRecord,
 } from "./usageTranscripts.ts";
@@ -61,6 +65,7 @@ export interface TranscriptParsePosition {
   readonly guardHash: number;
   /** Codex reducer state as of `resumeOffset`; `null` for stateless providers. */
   readonly codexState: CodexScanState | null;
+  readonly museState?: MuseScanState;
   /** Antigravity reducer state as of `resumeOffset`; `null` for other providers. */
   readonly antigravityState?: AntigravityScanState | null;
 }
@@ -213,6 +218,7 @@ export async function readTranscriptRecords(
   try {
     let codexState = initialCodexScanState();
     let antigravityState = initialAntigravityScanState();
+    let museState: MuseScanState = new Map();
     let resumed = false;
     let start = 0;
     if (
@@ -220,15 +226,22 @@ export async function readTranscriptRecords(
       resumeFrom.resumeOffset > 0 &&
       (provider !== "codex" || resumeFrom.codexState !== null) &&
       (provider !== "antigravity" || (resumeFrom.antigravityState ?? null) !== null) &&
+      (provider !== "muse" || resumeFrom.museState !== undefined) &&
       (await guardMatches(handle, resumeFrom))
     ) {
       if (resumeFrom.codexState !== null) codexState = { ...resumeFrom.codexState };
       if (resumeFrom.antigravityState) antigravityState = { ...resumeFrom.antigravityState };
+      if (resumeFrom.museState !== undefined) museState = new Map(resumeFrom.museState);
       start = resumeFrom.resumeOffset;
       resumed = true;
     }
 
-    const parseLine = (line: string, state: CodexScanState, out: UsageRecord[]): void => {
+    const parseLine = (
+      line: string,
+      state: CodexScanState,
+      museProviders: MuseScanState,
+      out: UsageRecord[],
+    ): void => {
       if (provider === "codex") {
         if (
           !mightCarryUsage(line, provider) &&
@@ -254,7 +267,8 @@ export async function readTranscriptRecords(
         for (const grokRecord of parseGrokLine(line)) out.push(grokRecord);
         return;
       }
-      const record = parseClaudeLine(line);
+      const record =
+        provider === "muse" ? parseMuseLine(line, museProviders) : parseClaudeLine(line);
       if (record !== null) out.push(record);
     };
 
@@ -289,7 +303,12 @@ export async function readTranscriptRecords(
       for (;;) {
         const newlineIndex = buffer.indexOf(NEWLINE, lineStart);
         if (newlineIndex === -1) break;
-        parseLine(toLineString(buffer.subarray(lineStart, newlineIndex)), codexState, records);
+        parseLine(
+          toLineString(buffer.subarray(lineStart, newlineIndex)),
+          codexState,
+          museState,
+          records,
+        );
         lineStart = newlineIndex + 1;
       }
       resumeOffset += lineStart;
@@ -302,7 +321,8 @@ export async function readTranscriptRecords(
     const tailRecords: UsageRecord[] = [];
     if (pendingChunks.length > 0) {
       const pending = pendingChunks.length === 1 ? pendingChunks[0]! : Buffer.concat(pendingChunks);
-      if (pending.length > 0) parseLine(toLineString(pending), { ...codexState }, tailRecords);
+      if (pending.length > 0)
+        parseLine(toLineString(pending), { ...codexState }, new Map(museState), tailRecords);
     }
 
     if (provider === "antigravity") {
@@ -327,6 +347,7 @@ export async function readTranscriptRecords(
         guardHash,
         codexState: provider === "codex" ? codexState : null,
         antigravityState: provider === "antigravity" ? antigravityState : null,
+        ...(provider === "muse" ? { museState } : {}),
       },
       resumed,
     };

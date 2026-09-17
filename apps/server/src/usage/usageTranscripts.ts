@@ -1,3 +1,4 @@
+// @effect-diagnostics globalDate:off
 /**
  * Pure parsers for the provider CLIs' on-disk session transcripts.
  *
@@ -80,6 +81,8 @@ export function mightCarryUsage(line: string, provider: UsageProviderKind): bool
     );
   }
   if (provider === "grok") return line.includes('"turn_completed"');
+  if (provider === "muse")
+    return line.includes('"model_completed"') || line.includes('"run.model.configured"');
   return line.includes('"token_count"');
 }
 
@@ -87,6 +90,63 @@ export function mightCarryUsage(line: string, provider: UsageProviderKind): bool
  * Grok reports cost in integer ticks where `1 USD = 10^10` ticks. See Grok
  * headless `total_cost_usd_ticks`. Convert to dollars for pricing.
  */
+export type MuseScanState = Map<string, string>;
+
+/** Muse retains raw provider counters; per-run routing determines cache overlap. */
+export function parseMuseLine(
+  line: string,
+  providers: MuseScanState = new Map(),
+): UsageRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  const object = (value: unknown): Record<string, unknown> =>
+    typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+  const record = object(parsed);
+  const payload = object(record.payload);
+  if (record.payload_type === "run.model.configured") {
+    const configured = object(payload.record);
+    const runId = object(configured.run_stream).id;
+    if (typeof runId === "string" && typeof configured.provider_id === "string")
+      providers.set(runId, configured.provider_id);
+    return null;
+  }
+  if (record.payload_type !== "runtime.session") return null;
+  const event = object(payload.event);
+  if (event.kind !== "model_completed") return null;
+  const usage = object(event.usage);
+  if (typeof record.recorded_at !== "number" || !Number.isFinite(record.recorded_at)) return null;
+  const sessionId = object(record.stream).id;
+  const sourceId = payload.source_run_record_id;
+  if (typeof sessionId !== "string" || typeof sourceId !== "string") return null;
+  const cached = int(usage.cache_read_tokens ?? usage.cached_tokens);
+  const created = int(usage.cache_write_tokens);
+  const provider = typeof payload.run_id === "string" ? providers.get(payload.run_id) : undefined;
+  const input = int(usage.input_tokens);
+  const inclusive = provider === "meta" || provider === "openai";
+  // Unknown cache conventions cannot yield a trustworthy disjoint token count.
+  // Omit such completions rather than fabricate usage or cost from overlapping counters.
+  if (cached + created > 0 && !inclusive && provider !== "anthropic") return null;
+  return {
+    provider: "muse",
+    timestampMs: Math.trunc(record.recorded_at / 1_000),
+    model: typeof event.model === "string" && event.model.length > 0 ? event.model : "unknown",
+    sessionId,
+    totals: {
+      uncachedInputTokens: inclusive ? Math.max(0, input - cached - created) : input,
+      cachedInputTokens: cached,
+      cacheCreationTokens: created,
+      outputTokens: int(usage.output_tokens),
+      reasoningTokens: int(usage.reasoning_tokens),
+    },
+    reportedCostUsd: null,
+    dedupeKey: sourceId,
+  };
+}
+
 export const GROK_COST_USD_TICKS_PER_DOLLAR = 10_000_000_000;
 
 function grokCostTicksToUsd(ticks: unknown): number | null {

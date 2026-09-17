@@ -73,6 +73,7 @@ export interface ServerProviderPresentation {
   readonly reportsContextWindow?: boolean;
   readonly requiresNewThreadForModelChange?: boolean;
   readonly supportsConversationRollback?: boolean;
+  readonly runtimeModeDescriptions?: ServerProvider["runtimeModeDescriptions"];
 }
 
 export type ServerProviderDraft = Omit<ServerProvider, "instanceId" | "driver">;
@@ -222,6 +223,9 @@ export function buildServerProvider(input: {
     : undefined;
   return {
     displayName: input.presentation.displayName,
+    ...(input.presentation.runtimeModeDescriptions
+      ? { runtimeModeDescriptions: input.presentation.runtimeModeDescriptions }
+      : {}),
     ...(typeof input.presentation.supportsConversationRollback === "boolean"
       ? { supportsConversationRollback: input.presentation.supportsConversationRollback }
       : {}),

@@ -80,6 +80,7 @@ interface SerializedFile {
   readonly cs: CodexScanState | null;
   /** Antigravity reducer state at `o`; `null` for other providers. */
   readonly as?: AntigravityScanState | null;
+  readonly ms?: readonly (readonly [string, string])[];
 }
 
 interface SerializedCache {
@@ -131,6 +132,7 @@ export function encodeScanCache(cache: ScanCache): SerializedCache {
       gh: entry.position.guardHash,
       cs: entry.position.codexState,
       as: entry.position.antigravityState ?? null,
+      ...(entry.position.museState ? { ms: [...entry.position.museState] } : {}),
     };
   }
 
@@ -228,7 +230,8 @@ export function decodeScanCache(document: unknown): ScanCache {
       entry.p !== "claude" &&
       entry.p !== "codex" &&
       entry.p !== "grok" &&
-      entry.p !== "antigravity"
+      entry.p !== "antigravity" &&
+      entry.p !== "muse"
     )
       continue;
     if (!isRecordArray(entry.r) || !isRecordArray(entry.t)) continue;
@@ -254,6 +257,17 @@ export function decodeScanCache(document: unknown): ScanCache {
     if (codexState === undefined) continue;
     const antigravityState = decodeAntigravityState(entry.as);
     if (antigravityState === undefined) continue;
+    if (
+      entry.p === "muse" &&
+      (!Array.isArray(entry.ms) ||
+        !entry.ms.every(
+          (route) =>
+            Array.isArray(route) &&
+            route.length === 2 &&
+            route.every((value) => typeof value === "string"),
+        ))
+    )
+      continue;
 
     const provider: UsageProviderKind = entry.p;
     const records = decodeRecords(entry.r, provider);
@@ -272,6 +286,7 @@ export function decodeScanCache(document: unknown): ScanCache {
         guardHash: entry.gh,
         codexState,
         antigravityState,
+        ...(entry.p === "muse" ? { museState: new Map(entry.ms) } : {}),
       },
     });
   }

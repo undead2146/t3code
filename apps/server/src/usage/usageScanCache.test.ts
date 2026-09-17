@@ -88,6 +88,16 @@ describe("scan cache round trip", () => {
         },
       }),
     });
+    original.set("/muse.jsonl", {
+      size: 90,
+      mtimeMs: 450,
+      provider: "muse",
+      records: [record({ provider: "muse", model: "meta-muse", dedupeKey: null })],
+      tailRecords: [],
+      position: position({
+        museState: new Map([["run-1", "anthropic"]]),
+      }),
+    });
     original.set("/antigravity.log", {
       size: 100,
       mtimeMs: 500,
@@ -116,11 +126,12 @@ describe("scan cache round trip", () => {
 
     const restored = decodeScanCache(JSON.parse(JSON.stringify(encodeScanCache(original))));
 
-    expect(restored.size).toBe(5);
+    expect(restored.size).toBe(6);
     expect(restored.get("/a.jsonl")).toEqual(original.get("/a.jsonl"));
     expect(restored.get("/b.jsonl")).toEqual(original.get("/b.jsonl"));
     expect(restored.get("/grok.jsonl")).toEqual(original.get("/grok.jsonl"));
     expect(restored.get("/codex.jsonl")).toEqual(original.get("/codex.jsonl"));
+    expect(restored.get("/muse.jsonl")).toEqual(original.get("/muse.jsonl"));
     expect(restored.get("/antigravity.log")).toEqual(original.get("/antigravity.log"));
   });
 

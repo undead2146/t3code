@@ -122,6 +122,49 @@ function sameRate(a: ModelRate, b: ModelRate): boolean {
   );
 }
 
+/** Muse caches provider catalog prices as decimal USD amounts per million tokens. */
+export function parseMuseRateTable(documents: readonly unknown[]): RateTable {
+  const candidates = new Map<string, ModelRate | null>();
+  const object = (value: unknown): Record<string, unknown> =>
+    typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+  const amount = (value: unknown): number | null => {
+    if (typeof value !== "string" || !/^\d+(?:\.\d+)?$/.test(value)) return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed / 1_000_000 : null;
+  };
+  for (const document of documents) {
+    const catalog = object(document);
+    if (catalog.source !== "provider_catalog" || !Array.isArray(catalog.rows)) continue;
+    for (const raw of catalog.rows) {
+      const model = object(raw);
+      if (typeof model.model_id !== "string") continue;
+      const key = normalizeRateKey(model.model_id);
+      const cost = object(model.cost);
+      const input = amount(cost.input);
+      const output = amount(cost.output);
+      const cached = amount(cost.cached);
+      if (cost.currency !== "USD" || input === null || output === null || cached === null) {
+        candidates.set(key, null);
+        continue;
+      }
+      const rate: ModelRate = {
+        inputCostPerToken: input,
+        outputCostPerToken: output,
+        cacheReadCostPerToken: cached,
+        cacheCreationCostPerToken: input,
+      };
+      const previous = candidates.get(key);
+      candidates.set(
+        key,
+        previous === undefined || (previous !== null && sameRate(previous, rate)) ? rate : null,
+      );
+    }
+  }
+  return new Map(
+    [...candidates].filter((entry): entry is [string, ModelRate] => entry[1] !== null),
+  );
+}
+
 function normalizeRateKey(model: string): string {
   return model.trim().toLowerCase();
 }
@@ -161,13 +204,13 @@ export function lookupRate(table: RateTable, model: string): ModelRate | null {
   const key = stripVariantSuffix(normalizeRateKey(model));
   const bareName = bareModelName(key);
   if (bareName.length === 0 || UNPRICEABLE_MODELS.has(bareName)) return null;
-  const direct = table.get(key) ?? (bareName !== key ? table.get(bareName) : undefined);
+  const direct = table.get(key);
   if (direct) return direct;
 
   // Try stripping reasoning effort suffixes (-low, -medium, -high) or thinking suffix
   const stripped = key.replace(/-(?:low|medium|high|thinking)$/, "");
   if (stripped !== key) {
-    const fallback = table.get(stripped) ?? table.get(bareModelName(stripped));
+    const fallback = table.get(stripped);
     if (fallback) return fallback;
   }
 

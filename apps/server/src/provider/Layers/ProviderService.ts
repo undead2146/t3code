@@ -993,9 +993,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const compactionTerminal = (event: ProviderRuntimeEvent): string | null =>
     event.type === "turn.completed"
       ? event.payload.state
-      : event.type === "runtime.error" || event.type === "turn.aborted"
-        ? event.type
-        : null;
+      : event.type === "item.completed" &&
+          event.payload.itemType === "context_compaction" &&
+          event.payload.status === "completed" &&
+          typeof event.payload.data === "object" &&
+          event.payload.data !== null &&
+          "outcome" in event.payload.data &&
+          event.payload.data.outcome === "noop"
+        ? "completed"
+        : event.type === "runtime.error" || event.type === "turn.aborted"
+          ? event.type
+          : null;
   const processFallbackCompactionEvent = (
     pending: PendingCompaction,
     event: ProviderRuntimeEvent,
@@ -1273,13 +1281,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
       yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
-      const now = DateTime.formatIso(yield* DateTime.now);
-      yield* directory.upsert({
-        ...input.binding,
-        providerInstanceId: bindingInstanceId,
-        status: "starting",
-        lastSeenAt: now,
-      });
       const resumed = yield* adapter
         .startSession({
           threadId: input.binding.threadId,
@@ -1335,7 +1336,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     const instanceId = yield* requireBindingInstanceId(input.operation, binding);
     const adapter = yield* registry.getByInstance(instanceId);
 
-    const isStarting = binding.status === "starting";
     const hasRequestedSession = yield* adapter.hasSession(input.threadId);
     if (hasRequestedSession) {
       return {
@@ -1344,7 +1344,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         threadId: input.threadId,
         runtimeMode: binding.runtimeMode,
         isActive: true,
-        isStarting,
       } as const;
     }
 
@@ -1355,7 +1354,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         threadId: input.threadId,
         runtimeMode: binding.runtimeMode,
         isActive: false,
-        isStarting,
       } as const;
     }
 
@@ -1369,7 +1367,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       threadId: input.threadId,
       runtimeMode: recovered.session.runtimeMode,
       isActive: true,
-      isStarting: false,
     } as const;
   });
 
@@ -1515,17 +1512,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
         yield* clearTurnAnalyticsSession(resolvedInstanceId, threadId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
-        const now = DateTime.formatIso(yield* DateTime.now);
-        yield* directory.upsert({
-          threadId,
-          provider: resolvedProvider,
-          providerInstanceId: resolvedInstanceId,
-          runtimeMode: input.runtimeMode,
-          status: "starting",
-          lastSeenAt: now,
-          ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
-          runtimePayload: persistedBinding?.runtimePayload ?? null,
-        });
         const session = yield* adapter
           .startSession({
             ...input,
@@ -2092,9 +2078,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }
         timedOutNativeCompactions.delete(input.threadId);
         yield* clearTurnAnalyticsSession(routed.instanceId, input.threadId);
-        if (routed.isActive || routed.isStarting) {
-          yield* clearMcpSession(input.threadId);
-        }
+        yield* clearMcpSession(input.threadId);
         yield* directory.upsert({
           threadId: input.threadId,
           provider: routed.adapter.provider,

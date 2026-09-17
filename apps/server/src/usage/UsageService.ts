@@ -291,27 +291,38 @@ export const make = Effect.gen(function* () {
       }
     }
 
-    const providerLogsDir = path.join(config.stateDir, "logs", "provider");
-    const antigravityDirs: string[] = [providerLogsDir];
+    const hasAntigravity =
+      (settings.providerInstances &&
+        Object.values(settings.providerInstances).some(
+          (instance) => instance.driver === "antigravity",
+        )) ||
+      (yield* fileSystem
+        .exists(path.join(config.stateDir, "logs", "provider"))
+        .pipe(Effect.catchCause(() => Effect.succeed(false))));
 
-    const defaultUserdataLogsDir = path.join(
-      NodeOS.homedir(),
-      ".t3",
-      "userdata",
-      "logs",
-      "provider",
-    );
-    if (defaultUserdataLogsDir !== providerLogsDir) {
-      const defaultExists = yield* fileSystem
-        .exists(defaultUserdataLogsDir)
-        .pipe(Effect.catchCause(() => Effect.succeed(false)));
-      if (defaultExists) {
-        antigravityDirs.push(defaultUserdataLogsDir);
+    if (hasAntigravity) {
+      const providerLogsDir = path.join(config.stateDir, "logs", "provider");
+      const antigravityDirs: string[] = [providerLogsDir];
+
+      const defaultUserdataLogsDir = path.join(
+        NodeOS.homedir(),
+        ".t3",
+        "userdata",
+        "logs",
+        "provider",
+      );
+      if (defaultUserdataLogsDir !== providerLogsDir) {
+        const defaultExists = yield* fileSystem
+          .exists(defaultUserdataLogsDir)
+          .pipe(Effect.catchCause(() => Effect.succeed(false)));
+        if (defaultExists) {
+          antigravityDirs.push(defaultUserdataLogsDir);
+        }
       }
-    }
 
-    for (const dir of antigravityDirs) {
-      dirs.push({ provider: "antigravity" as const, dir });
+      for (const dir of antigravityDirs) {
+        dirs.push({ provider: "antigravity" as const, dir });
+      }
     }
 
     return dirs;
