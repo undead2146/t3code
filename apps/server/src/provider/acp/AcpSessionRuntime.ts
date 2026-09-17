@@ -223,6 +223,8 @@ export class AcpSessionRuntime extends Context.Service<
      * Concurrent calls share the same in-flight startup and a failed startup may be retried.
      */
     readonly start: () => Effect.Effect<AcpSessionRuntimeStartResult, EffectAcpErrors.AcpError>;
+    /** Checks whether the runtime connection has been closed or terminated. */
+    readonly isClosed: Effect.Effect<boolean>;
     /** Stream of parsed root-session events and connection failures. */
     readonly getEvents: () => Stream.Stream<AcpSessionRuntimeEvent, never>;
     /** Waits for queued events to be processed, or for the runtime scope to close. */
@@ -973,6 +975,11 @@ export const make = (
       handleExtNotification: acp.handleExtNotification,
       initialize: () => ensureConnected.pipe(Effect.andThen(sendInitialize)),
       start: () => start,
+      isClosed: Effect.gen(function* () {
+        const error = yield* Ref.get(terminationErrorRef);
+        if (Option.isSome(error)) return true;
+        return yield* Ref.get(stoppingRef);
+      }),
       getEvents: () => Stream.fromQueue(eventQueue),
       drainEvents,
       getModeState: Ref.get(modeStateRef),

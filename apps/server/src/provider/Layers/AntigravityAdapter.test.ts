@@ -83,6 +83,7 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
   readonly holdCancel?: boolean;
   readonly holdClose?: boolean;
   readonly holdDispatch?: boolean;
+  readonly prewarm?: boolean;
   readonly turnInactivityTimeoutMs?: number;
   readonly activeToolInactivityTimeoutMs?: number;
   readonly userHome?: string;
@@ -229,12 +230,14 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
       yield* drainEvents;
       calls.push(`drained:${prompt.index}`);
     }),
+    isClosed: Effect.sync(() => controls.closed > 0),
   };
   const commandUpdates: Array<ReadonlyArray<AcpSchema.AvailableCommand>> = [];
   const adapter = yield* makeAntigravityAdapter(
     decodeSettings({ enabled: options?.enabled ?? true }),
     {
       instanceId,
+      ...(options?.prewarm !== undefined ? { prewarm: options.prewarm } : {}),
       turnInactivityTimeoutMs: options?.turnInactivityTimeoutMs,
       activeToolInactivityTimeoutMs: options?.activeToolInactivityTimeoutMs,
       turnRetryBaseDelayMs: 0,
@@ -243,17 +246,23 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
       makeRuntime: (input) =>
         Effect.gen(function* () {
           launches.push(input);
+          let runtimeClosed = false;
           yield* Effect.addFinalizer(() =>
             Effect.gen(function* () {
               yield* Deferred.succeed(closeStarted, undefined);
               if (options?.holdClose) yield* Deferred.await(closeRelease);
               controls.closed += 1;
+              runtimeClosed = true;
             }),
           );
+          const instanceRuntime: Runtime = {
+            ...runtime,
+            isClosed: Effect.sync(() => runtimeClosed),
+          };
           if (options?.customRuntime) {
-            return yield* options.customRuntime(input, runtime);
+            return yield* options.customRuntime(input, instanceRuntime);
           }
-          return runtime;
+          return instanceRuntime;
         }),
       withProcess: (stop, task) =>
         Effect.suspend(() => {
@@ -1415,6 +1424,7 @@ it.layer(layer)("AntigravityAdapter", (it) => {
         const ephemeralCalls: string[] = [];
 
         const ephemeralRuntime: Runtime = {
+          isClosed: Effect.succeed(false),
           handleRequestPermission: () => Effect.void,
           handleReadTextFile: () => Effect.void,
           handleWriteTextFile: () => Effect.void,
@@ -1905,6 +1915,90 @@ it.layer(layer)("AntigravityAdapter", (it) => {
 
         const exited = yield* h.waitForEvent((event) => event.type === "session.exited");
         expect(exited.payload.exitKind).toBe("error");
+      }),
+  );
+
+  it.effect(
+    "warm standby survives caller session completion and is claimed by next session in same directory",
+    () =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness({ prewarm: true });
+        const cwd = process.cwd();
+
+        yield* h.adapter.startSession({
+          threadId,
+          cwd,
+          runtimeMode: "approval-required",
+        });
+
+        while (h.launches.length < 2) {
+          yield* Effect.yieldNow;
+        }
+        expect(h.launches.length).toBe(2);
+        expect(h.launches[1]?.cwd).toBe(cwd);
+
+        yield* h.adapter.stopSession(threadId);
+
+        const threadId2 = ThreadId.make("thread-2");
+        const session2 = yield* h.adapter.startSession({
+          threadId: threadId2,
+          cwd,
+          runtimeMode: "approval-required",
+        });
+
+        expect(session2.threadId).toBe(threadId2);
+      }),
+  );
+
+  it.effect(
+    "falls back to starting a fresh runtime if warm standby runtime fails during startSession",
+    () =>
+      Effect.gen(function* () {
+        let launchCount = 0;
+        const h = yield* makeHarness({
+          prewarm: true,
+          customRuntime: (_input, defaultRuntime) =>
+            Effect.gen(function* () {
+              launchCount += 1;
+              const currentLaunch = launchCount;
+              return {
+                ...defaultRuntime,
+                setModel: (model) =>
+                  Effect.gen(function* () {
+                    if (currentLaunch === 2) {
+                      return yield* AcpErrors.AcpRequestError.internalError(
+                        "The ACP session runtime is closed.",
+                      );
+                    }
+                    return yield* defaultRuntime.setModel(model);
+                  }),
+              };
+            }),
+        });
+        const cwd = process.cwd();
+
+        yield* h.adapter.startSession({
+          threadId,
+          cwd,
+          runtimeMode: "approval-required",
+        });
+
+        while (launchCount < 2) {
+          yield* Effect.yieldNow;
+        }
+        expect(launchCount).toBe(2);
+
+        yield* h.adapter.stopSession(threadId);
+
+        const threadId2 = ThreadId.make("thread-2");
+        const session2 = yield* h.adapter.startSession({
+          threadId: threadId2,
+          cwd,
+          runtimeMode: "approval-required",
+        });
+
+        expect(session2.threadId).toBe(threadId2);
+        expect(launchCount).toBeGreaterThanOrEqual(3);
       }),
   );
 });

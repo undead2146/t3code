@@ -592,6 +592,7 @@ type Runtime = Pick<
   | "drainEvents"
   | "prompt"
   | "cancel"
+  | "isClosed"
 >;
 type NativePermission = EffectAcpSchema.RequestPermissionRequest;
 type NativePermissionResponse = EffectAcpSchema.RequestPermissionResponse;
@@ -1081,73 +1082,73 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       isPrewarming = true;
       const standbyScope = yield* Scope.make("sequential");
       const stopOwned = Scope.close(standbyScope, Exit.void);
-      yield* options
-        .withProcess(
-          stopOwned,
-          Effect.gen(function* () {
-            if (options.profileDirectory && options.userHome) {
-              const configSkillsDirectory = path.join(options.profileDirectory, "config", "skills");
-              syncAntigravityGlobalSkills(
-                configSkillsDirectory,
-                options.userHome,
-                process.platform,
-              );
-            }
-            const additionalDirectories = getAntigravityAdditionalDirectories({
-              attachmentsDir: serverConfig.attachmentsDir,
-              userHome: options.userHome,
-              profileDirectory: options.profileDirectory,
-              path,
-            });
-            const runtime = yield* options.makeRuntime({
-              cwd: targetCwd,
-              clientInfo: { name: "t3-code", version: "0.0.0" },
-              clientFileSystem: true,
-              additionalDirectories,
-              mcpServers: [],
-              ...makeNativeLoggers({
-                nativeEventLogger: options.nativeEventLogger,
-                provider: PROVIDER,
-                threadId: "standby-warm" as ThreadId,
-              }),
-            });
-            const allowedRoots = [targetCwd, ...additionalDirectories];
-            yield* runtime.handleReadTextFile((request) =>
-              readClientTextFile({ fileSystem, path, allowedRoots, request }),
-            );
-            yield* runtime.handleWriteTextFile((request) =>
-              writeClientTextFile({ fileSystem, path, allowedRoots, request }),
-            );
-            yield* runtime.handleRequestPermission(() =>
-              Effect.succeed({
-                outcome: { outcome: "cancelled" },
-              } satisfies NativePermissionResponse),
-            );
-            const started = yield* runtime.start();
-            if (warmStandby) {
-              yield* Scope.close(warmStandby.scope, Exit.void);
-            }
-            warmStandby = {
-              runtime,
-              scope: standbyScope,
-              started,
-              cwd: targetCwd,
-            };
+      const prewarmBody = Effect.gen(function* () {
+        if (options.profileDirectory && options.userHome) {
+          const configSkillsDirectory = path.join(options.profileDirectory, "config", "skills");
+          syncAntigravityGlobalSkills(configSkillsDirectory, options.userHome, process.platform);
+        }
+        const additionalDirectories = getAntigravityAdditionalDirectories({
+          attachmentsDir: serverConfig.attachmentsDir,
+          userHome: options.userHome,
+          profileDirectory: options.profileDirectory,
+          path,
+        });
+        const runtime = yield* options.makeRuntime({
+          cwd: targetCwd,
+          clientInfo: { name: "t3-code", version: "0.0.0" },
+          clientFileSystem: true,
+          additionalDirectories,
+          mcpServers: [],
+          ...makeNativeLoggers({
+            nativeEventLogger: options.nativeEventLogger,
+            provider: PROVIDER,
+            threadId: "standby-warm" as ThreadId,
           }),
-        )
-        .pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              isPrewarming = false;
-            }),
-          ),
-          Effect.catchCause((cause) =>
-            Effect.gen(function* () {
-              yield* Scope.close(standbyScope, Exit.void);
-              yield* Effect.logDebug("Antigravity pre-warm standby failed", cause);
-            }),
-          ),
+        });
+        const allowedRoots = [targetCwd, ...additionalDirectories];
+        yield* runtime.handleReadTextFile((request) =>
+          readClientTextFile({ fileSystem, path, allowedRoots, request }),
         );
+        yield* runtime.handleWriteTextFile((request) =>
+          writeClientTextFile({ fileSystem, path, allowedRoots, request }),
+        );
+        yield* runtime.handleRequestPermission(() =>
+          Effect.succeed({
+            outcome: { outcome: "cancelled" },
+          } satisfies NativePermissionResponse),
+        );
+        const started = yield* runtime.start();
+        if (warmStandby) {
+          yield* Scope.close(warmStandby.scope, Exit.void);
+        }
+        warmStandby = {
+          runtime,
+          scope: standbyScope,
+          started,
+          cwd: targetCwd,
+        };
+      }).pipe(
+        Effect.provideService(Scope.Scope, standbyScope),
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
+      );
+
+      yield* options.withProcess(stopOwned, prewarmBody).pipe(
+        Effect.provideService(Scope.Scope, standbyScope),
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, path),
+        Effect.ensuring(
+          Effect.sync(() => {
+            isPrewarming = false;
+          }),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            yield* Scope.close(standbyScope, Exit.void);
+            yield* Effect.logDebug("Antigravity pre-warm standby failed", cause);
+          }),
+        ),
+      );
     });
   const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -2301,8 +2302,17 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         if (previous) yield* stopContext(previous);
         const cwd = path.resolve(input.cwd);
 
-        const canUseWarmStandby =
+        let canUseWarmStandby =
           !Option.isSome(cursor) && warmStandby !== undefined && warmStandby.cwd === cwd;
+
+        if (canUseWarmStandby && warmStandby) {
+          const isClosed = yield* warmStandby.runtime.isClosed;
+          if (isClosed) {
+            yield* Scope.close(warmStandby.scope, Exit.void);
+            warmStandby = undefined;
+            canUseWarmStandby = false;
+          }
+        }
 
         let sessionScope: Scope.Closeable;
         let runtime: Runtime;
@@ -2320,7 +2330,11 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           sessionScope = yield* Scope.make("sequential");
         }
 
-        yield* prewarm(cwd).pipe(Effect.ignore, Effect.forkIn(ownerScope));
+        yield* prewarm(cwd).pipe(
+          Effect.provideService(Scope.Scope, ownerScope),
+          Effect.ignore,
+          Effect.forkIn(ownerScope),
+        );
 
         let transferred = false;
         let context: SessionContext | undefined;
@@ -2335,7 +2349,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         );
         startingSessions.set(input.threadId, {
           sessionScope,
-          abort: Scope.close(sessionScope, Exit.void),
+          abort: Effect.suspend(() => Scope.close(sessionScope, Exit.void)),
         });
 
         const setupSessionBody = Effect.gen(function* () {
@@ -2585,23 +2599,33 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         });
 
         if (usedStandby) {
-          return yield* setupSessionBody.pipe(
+          const standbyExit = yield* setupSessionBody.pipe(
             Effect.provideService(Scope.Scope, sessionScope),
-            Effect.mapError((cause) =>
-              isAcpError(cause)
-                ? mapAntigravityError(input.threadId, "session/start", cause)
-                : new ProviderAdapterRequestError({
-                    provider: PROVIDER,
-                    method: "session/start",
-                    detail: "Could not start Antigravity. Check the provider setup status.",
-                    cause,
-                  }),
-            ),
+            Effect.exit,
           );
+          if (Exit.isSuccess(standbyExit)) {
+            return standbyExit.value;
+          }
+          yield* Effect.logWarning(
+            "Failed to initialize Antigravity session from warm standby; falling back to starting a fresh runtime",
+            {
+              threadId: input.threadId,
+              cause: standbyExit.cause,
+            },
+          );
+          yield* Scope.close(sessionScope, Exit.void);
+          sessionScope = yield* Scope.make("sequential");
+          startingSessions.set(input.threadId, {
+            sessionScope,
+            abort: Effect.suspend(() => Scope.close(sessionScope, Exit.void)),
+          });
+          usedStandby = false;
         }
 
         return yield* options.withProcess(stopOwned, setupSessionBody).pipe(
           Effect.provideService(Scope.Scope, sessionScope),
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
           Effect.tapError((cause) =>
             isAntigravitySignInRequiredError(cause)
               ? (options.onAuthRequired ?? Effect.void)
