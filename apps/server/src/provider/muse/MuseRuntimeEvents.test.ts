@@ -9,8 +9,16 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   decodeMuseNotification,
   mapMuseNotification,
+  museTransportTruncationSignature,
   type MuseEventContext,
 } from "./MuseRuntimeEvents.ts";
+
+const TRUNCATED_STREAM_FAILURE =
+  "model failed after 10 attempts: transport error [body-truncated]: response body ended before completion (meta stream, 185 KiB received, 11s) (request id: 03c4868d-cd28-4358-9811-fa96aa5a920f, response: resp_6aad5c39058c49f7af784eb6)";
+const TRUNCATED_STREAM_RETRY_REASON =
+  "transport error [body-truncated]: response body ended before completion (meta stream, 185 KiB received, 10s) (after 10 provider attempts)";
+const TRUNCATED_STREAM_WALL_CLOCK =
+  "model call chain exceeded the 12m wall-clock ceiling measured from its first failed attempt: 5 failed attempts (43 provider requests) over 16m12s, all [transport_stream_error:body-truncated]. dominant failure [transport_stream_error]";
 
 function createMockContext(overrides?: Partial<MuseEventContext>): MuseEventContext {
   let counter = 0;
@@ -350,6 +358,24 @@ describe("MuseRuntimeEvents", () => {
         expect(event.payload.usage.usedTokens).toBe(3500);
         expect(event.payload.usage.maxTokens).toBe(500_000);
       }
+    });
+  });
+
+  describe("transport truncation signature", () => {
+    it("classifies truncated response streams across failure shapes with one signature", () => {
+      const failure = museTransportTruncationSignature(TRUNCATED_STREAM_FAILURE);
+      const retry = museTransportTruncationSignature(TRUNCATED_STREAM_RETRY_REASON);
+      const wallClock = museTransportTruncationSignature(TRUNCATED_STREAM_WALL_CLOCK);
+      expect(failure).toBeDefined();
+      expect(retry).toBe(failure);
+      expect(wallClock).toBe(failure);
+    });
+
+    it("ignores recoverable failures that must keep retrying untouched", () => {
+      expect(museTransportTruncationSignature("rate limited, backing off")).toBeUndefined();
+      expect(museTransportTruncationSignature("authentication expired")).toBeUndefined();
+      expect(museTransportTruncationSignature("")).toBeUndefined();
+      expect(museTransportTruncationSignature(undefined)).toBeUndefined();
     });
   });
 });

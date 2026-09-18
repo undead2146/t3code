@@ -54,6 +54,7 @@ import {
   mapMuseNotification,
   MuseItem,
   museApprovalDecision,
+  museTransportTruncationSignature,
   type MuseNotification,
 } from "../muse/MuseRuntimeEvents.ts";
 import type { ProviderAdapterError } from "../Errors.ts";
@@ -118,7 +119,15 @@ interface SessionContext {
   contextWindowTokens?: number;
   pendingTokenUsage: Map<string, Extract<MuseNotification, { method: "session/tokenUsage" }>>;
   stopped: boolean;
+  transportRetryStreak: { turnId: string; signature: string; count: number } | undefined;
+  lastTransportMitigationTurnId: string | undefined;
+  transportStreakCompacted: boolean;
 }
+
+// Consecutive identical truncated-stream retries after which the turn is interrupted:
+// transient blips recover within an attempt or two, while a deterministic cutoff fails
+// all ten CLI attempts the same way.
+const TRANSPORT_TRUNCATION_INTERRUPT_STREAK = 4;
 
 function hasActiveWorkflowOrSubagent(ctx: SessionContext): boolean {
   for (const item of ctx.items.values()) {
@@ -410,6 +419,37 @@ export function make(
         }
         emit(mapped);
       }
+      if (event.method === "turn/retryScheduled") {
+        const signature = museTransportTruncationSignature(event.params.reason);
+        const streak = ctx.transportRetryStreak;
+        if (
+          !signature ||
+          streak?.turnId !== event.params.turnId ||
+          streak.signature !== signature
+        ) {
+          ctx.transportRetryStreak = signature
+            ? { turnId: event.params.turnId, signature, count: 1 }
+            : undefined;
+        } else {
+          streak.count += 1;
+          if (
+            streak.count >= TRANSPORT_TRUNCATION_INTERRUPT_STREAK &&
+            event.params.nextAttempt < event.params.maxAttempts
+          ) {
+            ctx.transportRetryStreak = undefined;
+            mitigateTransportTruncation(ctx, event.params.turnId, true);
+          }
+        }
+      }
+      if (event.method === "turn/completed" && event.params.terminal !== "cancelled") {
+        ctx.transportRetryStreak = undefined;
+        if (event.params.terminal === "completed") {
+          ctx.lastTransportMitigationTurnId = undefined;
+          ctx.transportStreakCompacted = false;
+        } else if (museTransportTruncationSignature(event.params.error?.message)) {
+          mitigateTransportTruncation(ctx, event.params.turnId, false);
+        }
+      }
       if (event.method === "approval/resolved") ctx.approvals.delete(event.params.approvalId);
       if (
         event.method === "item/started" ||
@@ -533,6 +573,9 @@ export function make(
               pendingTokenUsage: new Map(),
               selectedModel,
               stopped: false,
+              transportRetryStreak: undefined,
+              lastTransportMitigationTurnId: undefined,
+              transportStreakCompacted: false,
             };
             yield* Effect.addFinalizer(() =>
               Effect.sync(() => {
@@ -1009,32 +1052,106 @@ export function make(
         }),
       );
     const stopAll = () => Effect.forEach([...sessions.values()], stopContext, { discard: true });
-    const compactThread = Effect.fn("MuseAdapter.compactThread")(function* (threadId: ThreadId) {
-      const ctx = yield* requireSession(threadId);
-      yield* ctx.lock.withPermit(
-        Effect.gen(function* () {
-          const result = yield* attempt("session/compact", () =>
-            ctx.host.connection.command("session/compact", { sessionId: ctx.sessionId }),
-          ).pipe(
-            Effect.flatMap(Schema.decodeUnknownEffect(CompactResult)),
-            Effect.mapError((cause) => requestError("session/compact", cause)),
-          );
-          if (result.status === "noop")
-            yield* Queue.offer(events, {
-              ...base(ctx),
-              eventId: nextEventId(),
-              type: "item.completed",
-              payload: {
-                itemType: "context_compaction",
-                status: "completed",
-                title: "Compaction skipped",
-                detail: result.reason ?? "Muse Code has no context to compact.",
-                data: { outcome: "noop" },
-              },
-            });
-        }),
+    const requestCompaction = Effect.fn("MuseAdapter.requestCompaction")(function* (
+      ctx: SessionContext,
+    ) {
+      return yield* ctx.lock.withPermit(
+        attempt("session/compact", () =>
+          ctx.host.connection.command("session/compact", { sessionId: ctx.sessionId }),
+        ).pipe(
+          Effect.flatMap(Schema.decodeUnknownEffect(CompactResult)),
+          Effect.mapError((cause) => requestError("session/compact", cause)),
+        ),
       );
     });
+    const compactThread = Effect.fn("MuseAdapter.compactThread")(function* (threadId: ThreadId) {
+      const ctx = yield* requireSession(threadId);
+      const result = yield* requestCompaction(ctx);
+      if (result.status === "noop")
+        yield* Queue.offer(events, {
+          ...base(ctx),
+          eventId: nextEventId(),
+          type: "item.completed",
+          payload: {
+            itemType: "context_compaction",
+            status: "completed",
+            title: "Compaction skipped",
+            detail: result.reason ?? "Muse Code has no context to compact.",
+            data: { outcome: "noop" },
+          },
+        });
+    });
+    // Breaks a deterministic truncated-stream failure streak: the CLI replays the same
+    // cutoff on every attempt, so retrying unchanged cannot succeed. Compacts once per
+    // streak, then escalates to guidance instead of compacting in a loop.
+    const mitigateTransportTruncation = (
+      ctx: SessionContext,
+      turnId: string,
+      interrupt: boolean,
+    ) => {
+      // Sync guard: the in-loop trigger races the terminal completion for one storm,
+      // so exactly one mitigation runs per turn.
+      if (ctx.stopped || ctx.lastTransportMitigationTurnId === turnId) return;
+      ctx.lastTransportMitigationTurnId = turnId;
+      const task = Effect.gen(function* () {
+        if (sessions.get(ctx.session.threadId) !== ctx || ctx.stopped) return;
+        if (interrupt)
+          yield* interruptTurn(ctx.session.threadId, TurnId.make(turnId)).pipe(Effect.ignore);
+        if (!ctx.transportStreakCompacted) {
+          const outcome = yield* requestCompaction(ctx).pipe(
+            Effect.map((result) => result.status),
+            Effect.orElseSucceed(() => "failed" as const),
+          );
+          if (outcome === "accepted") {
+            ctx.transportStreakCompacted = true;
+            emit({
+              ...base(ctx),
+              type: "runtime.warning",
+              turnId: TurnId.make(turnId),
+              payload: {
+                message: interrupt
+                  ? `Muse's response stream was truncated identically ${TRANSPORT_TRUNCATION_INTERRUPT_STREAK} times, so the remaining retries were interrupted and the session compacted. Send your message again to retry on compacted context; if streams still truncate, lower reasoning effort or split the task.`
+                  : "Muse's response stream was truncated and the turn failed. The session was compacted automatically — send your message again to retry on compacted context. If it fails again, lower reasoning effort or split the task.",
+              },
+            });
+            return;
+          }
+          if (outcome === "noop") {
+            emit({
+              ...base(ctx),
+              type: "runtime.warning",
+              turnId: TurnId.make(turnId),
+              payload: {
+                message:
+                  "Muse's response stream keeps truncating, but the session has nothing to compact — context size is not the cause. Lower reasoning effort, split the task into smaller turns, or re-authenticate Muse.",
+              },
+            });
+            return;
+          }
+          emit({
+            ...base(ctx),
+            type: "runtime.warning",
+            turnId: TurnId.make(turnId),
+            payload: {
+              message:
+                "Muse's response stream was truncated and the turn failed. Automatic compaction failed — compact the thread manually and retry; if it persists, lower reasoning effort or split the task.",
+            },
+          });
+          return;
+        }
+        emit({
+          ...base(ctx),
+          type: "runtime.warning",
+          turnId: TurnId.make(turnId),
+          payload: {
+            message:
+              "Muse's response stream keeps truncating even though the session was already compacted. Lower reasoning effort, split the task into smaller turns, or re-authenticate Muse. The turn error above carries the provider request id for support.",
+          },
+        });
+      });
+      // MSP invokes this at its native callback boundary, outside an Effect fiber.
+      void Effect.runPromise(task).catch(() => undefined);
+    };
     yield* Effect.addFinalizer(() => stopAll().pipe(Effect.ensuring(Queue.shutdown(events))));
     return {
       provider: PROVIDER,

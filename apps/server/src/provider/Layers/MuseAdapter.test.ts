@@ -7,6 +7,7 @@ import { vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { MuseSettings, ThreadId, type ProviderRuntimeEvent } from "@t3tools/contracts";
@@ -20,6 +21,7 @@ let mockSessionResultHistory: any = undefined;
 let mockResumeShouldFail = false;
 let mockStartShouldFail: string | false = false;
 let mintCommandIdCounter = 0;
+let mockCommands: Array<{ method: string; params: any }> = [];
 
 vi.mock("@muse-code/sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@muse-code/sdk")>();
@@ -37,6 +39,8 @@ vi.mock("@muse-code/sdk", async (importOriginal) => {
           closed: new Promise(() => {}),
           mintCommandId: () => `cmd-${++mintCommandIdCounter}`,
           command: vi.fn(async (method: string, params: any) => {
+            mockCommands.push({ method, params });
+            if (method === "session/compact") return { status: "accepted" };
             if (method === "session/start" && mockStartShouldFail)
               throw new Error(mockStartShouldFail);
             if (method === "session/resume" && mockResumeShouldFail)
@@ -560,6 +564,232 @@ describe("MuseAdapter session lifecycle with workflow items", () => {
       current = sessions.find((s) => s.threadId === threadId);
       expect(current?.status).toBe("ready");
       expect(current?.activeTurnId).toBeUndefined();
+    }).pipe(Effect.provide(testLayer)),
+  );
+});
+
+const TRUNCATED_RETRY_REASON =
+  "transport error [body-truncated]: response body ended before completion (meta stream, 185 KiB received, 10s) (after 10 provider attempts)";
+const TRUNCATED_TURN_ERROR =
+  "model failed after 10 attempts: transport error [body-truncated]: response body ended before completion (meta stream, 185 KiB received, 11s) (request id: 03c4868d-cd28-4358-9811-fa96aa5a920f, response: resp_6aad5c39058c49f7af784eb6)";
+
+describe("MuseAdapter transport truncation mitigation", () => {
+  const collectGuidance = (
+    adapter: Effect.Success<ReturnType<typeof MuseAdapter.make>>,
+    turnId: string,
+  ) =>
+    adapter.streamEvents.pipe(
+      Stream.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "runtime.warning" }> =>
+          event.type === "runtime.warning" &&
+          event.turnId === turnId &&
+          /compact/i.test(event.payload.message),
+      ),
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.forkChild,
+    );
+
+  it.effect("interrupts and compacts after identical truncation retries in one turn", () =>
+    Effect.gen(function* () {
+      mockCommands = [];
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-truncation-loop");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+      const turn = yield* adapter.sendTurn({ threadId, input: "Doomed turn" });
+      const guidanceFiber = yield* collectGuidance(adapter, turn.turnId);
+
+      for (let nextAttempt = 1; nextAttempt <= 4; nextAttempt += 1) {
+        mockNotificationCallback!({
+          method: "turn/retryScheduled",
+          params: {
+            sessionId,
+            viewCursor: `cursor-retry-${nextAttempt}`,
+            turnId: turn.turnId,
+            nextAttempt,
+            maxAttempts: 10,
+            reason: TRUNCATED_RETRY_REASON,
+            retryDelayMs: 1000,
+          },
+        });
+      }
+
+      const collected = yield* Fiber.join(guidanceFiber).pipe(Effect.timeoutOption("5 seconds"));
+      expect(Option.isSome(collected)).toBe(true);
+      const methods = mockCommands.map((command) => command.method);
+      expect(methods).toContain("turn/interrupt");
+      expect(methods).toContain("session/compact");
+
+      const sessions = yield* adapter.listSessions();
+      expect(sessions.find((s) => s.threadId === threadId)?.status).toBe("ready");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("leaves non-transport retry storms alone", () =>
+    Effect.gen(function* () {
+      mockCommands = [];
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-transient-retries");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+      const turn = yield* adapter.sendTurn({ threadId, input: "Flaky turn" });
+
+      for (let nextAttempt = 1; nextAttempt <= 5; nextAttempt += 1) {
+        mockNotificationCallback!({
+          method: "turn/retryScheduled",
+          params: {
+            sessionId,
+            viewCursor: `cursor-retry-${nextAttempt}`,
+            turnId: turn.turnId,
+            nextAttempt,
+            maxAttempts: 10,
+            reason: "rate limited, backing off",
+            retryDelayMs: 1000,
+          },
+        });
+      }
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: "cursor-done",
+          turnId: turn.turnId,
+          terminal: "completed",
+        },
+      });
+
+      const methods = mockCommands.map((command) => command.method);
+      expect(methods).not.toContain("turn/interrupt");
+      expect(methods).not.toContain("session/compact");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("compacts once per truncation streak and escalates when it recurs", () =>
+    Effect.gen(function* () {
+      mockCommands = [];
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-truncation-streak");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+      const failTurn = (turnId: string, cursor: string) =>
+        mockNotificationCallback!({
+          method: "turn/completed",
+          params: {
+            sessionId,
+            viewCursor: cursor,
+            turnId,
+            terminal: "failed",
+            error: { kind: "modelError", message: TRUNCATED_TURN_ERROR, retryable: true },
+          },
+        });
+
+      const first = yield* adapter.sendTurn({ threadId, input: "First attempt" });
+      const firstGuidance = yield* collectGuidance(adapter, first.turnId);
+      failTurn(first.turnId, "cursor-fail-1");
+      expect(
+        Option.isSome(yield* Fiber.join(firstGuidance).pipe(Effect.timeoutOption("5 seconds"))),
+      ).toBe(true);
+      expect(mockCommands.filter((command) => command.method === "session/compact")).toHaveLength(
+        1,
+      );
+
+      const second = yield* adapter.sendTurn({ threadId, input: "Second attempt" });
+      const secondGuidance = yield* collectGuidance(adapter, second.turnId);
+      failTurn(second.turnId, "cursor-fail-2");
+      const escalated = yield* Fiber.join(secondGuidance).pipe(Effect.timeoutOption("5 seconds"));
+      expect(Option.isSome(escalated)).toBe(true);
+      if (Option.isSome(escalated)) {
+        const [warning] = Array.from(escalated.value);
+        expect(warning?.payload.message).toMatch(/already compacted|lower reasoning effort/);
+      }
+      expect(mockCommands.filter((command) => command.method === "session/compact")).toHaveLength(
+        1,
+      );
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("resets the truncation streak after a successful turn", () =>
+    Effect.gen(function* () {
+      mockCommands = [];
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-truncation-reset");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+
+      const first = yield* adapter.sendTurn({ threadId, input: "First attempt" });
+      const firstGuidance = yield* collectGuidance(adapter, first.turnId);
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: "cursor-fail",
+          turnId: first.turnId,
+          terminal: "failed",
+          error: { kind: "modelError", message: TRUNCATED_TURN_ERROR, retryable: true },
+        },
+      });
+      expect(
+        Option.isSome(yield* Fiber.join(firstGuidance).pipe(Effect.timeoutOption("5 seconds"))),
+      ).toBe(true);
+
+      const second = yield* adapter.sendTurn({ threadId, input: "Recovery" });
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: "cursor-ok",
+          turnId: second.turnId,
+          terminal: "completed",
+        },
+      });
+
+      const third = yield* adapter.sendTurn({ threadId, input: "Later attempt" });
+      const thirdGuidance = yield* collectGuidance(adapter, third.turnId);
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: "cursor-fail-2",
+          turnId: third.turnId,
+          terminal: "failed",
+          error: { kind: "modelError", message: TRUNCATED_TURN_ERROR, retryable: true },
+        },
+      });
+      expect(
+        Option.isSome(yield* Fiber.join(thirdGuidance).pipe(Effect.timeoutOption("5 seconds"))),
+      ).toBe(true);
+      expect(mockCommands.filter((command) => command.method === "session/compact")).toHaveLength(
+        2,
+      );
     }).pipe(Effect.provide(testLayer)),
   );
 });

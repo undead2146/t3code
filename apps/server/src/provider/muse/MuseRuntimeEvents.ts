@@ -248,6 +248,22 @@ const notificationMethods: ReadonlySet<string> = new Set([
 export const isMuseNotificationMethod = (method: string): boolean =>
   notificationMethods.has(method);
 
+const TRANSPORT_TRUNCATION_MARKERS = [
+  "body-truncated",
+  "transport_stream_error",
+  "response body ended before completion",
+];
+export const MUSE_TRANSPORT_TRUNCATION_SIGNATURE = "transport-truncation";
+// Classifies failures where the model response stream was cut off mid-body. The CLI
+// replays these identically (same ~185 KiB cutoff on every attempt), so callers use
+// the signature to break the retry storm instead of burning all ten attempts.
+export function museTransportTruncationSignature(message: string | undefined): string | undefined {
+  if (!message) return undefined;
+  const lowered = message.toLowerCase();
+  if (!TRANSPORT_TRUNCATION_MARKERS.some((marker) => lowered.includes(marker))) return undefined;
+  return MUSE_TRANSPORT_TRUNCATION_SIGNATURE;
+}
+
 export function museApprovalDecision(
   decision: string,
   scope?: string,
