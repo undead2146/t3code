@@ -1549,10 +1549,36 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         return;
       case "ConnectionTerminated":
         context.disconnected = true;
+        let connectionErrorMessage = "Antigravity process stopped unexpectedly.";
+        const termLiveQuota = yield* Effect.promise(() =>
+          fetchAntigravityLiveQuota({
+            forceRefresh: true,
+            ...(options.profileDirectory ? { profileDirectory: options.profileDirectory } : {}),
+          }),
+        ).pipe(Effect.orElseSucceed(() => null));
+        if (
+          termLiveQuota?.sessionQuota &&
+          typeof termLiveQuota.sessionQuota.usedPercent === "number" &&
+          termLiveQuota.sessionQuota.usedPercent >= 100
+        ) {
+          const resetsAt = termLiveQuota.sessionQuota.resetsAt;
+          connectionErrorMessage = `Antigravity session quota is exhausted (100%)${resetsAt ? `. Resets at ${resetsAt}` : "."}`;
+          if (options.instanceId) {
+            const limitsUpdate = makeAntigravityUsageLimitsUpdate({ liveQuota: termLiveQuota });
+            yield* emit({
+              type: "account.rate-limits.updated",
+              ...(yield* stamp),
+              provider: PROVIDER,
+              providerInstanceId: options.instanceId,
+              threadId: context.threadId,
+              payload: { limits: limitsUpdate },
+            });
+          }
+        }
         if (context.activeTurnIntent && !context.activeTurnIntent.settled) {
           yield* finishSessionTurn(context, context.activeTurnIntent, {
             state: "failed",
-            errorMessage: "Antigravity process stopped unexpectedly.",
+            errorMessage: connectionErrorMessage,
           });
         }
         context.stopped = true;
@@ -2196,6 +2222,12 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         if (!context.disconnected && !context.stopped) {
           return context.runtime;
         }
+        if (context.closed) {
+          return yield* new ProviderAdapterSessionClosedError({
+            provider: PROVIDER,
+            threadId: context.threadId,
+          });
+        }
         const sessionId =
           (context.session as any)?.providerSessionId ??
           (context.session.resumeCursor as any)?.sessionId ??
@@ -2601,6 +2633,8 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         if (usedStandby) {
           const standbyExit = yield* setupSessionBody.pipe(
             Effect.provideService(Scope.Scope, sessionScope),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
             Effect.exit,
           );
           if (Exit.isSuccess(standbyExit)) {
@@ -2815,7 +2849,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           }
           if (context.promptFiber) {
             yield* cancelRequests(context);
-            yield* context.runtime.cancel;
+            yield* Effect.ignore(context.runtime.cancel);
             yield* Fiber.await(context.promptFiber);
             yield* finishSubagents(context, "cancelled");
           }
@@ -3012,8 +3046,9 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               String(failureError).includes("connection closed")));
         const isFailureRetryable = failureError ? isRetryableAntigravityError(failureError) : false;
 
+        const pendingRetryToUse = context.pendingRetry;
         const retryInfo =
-          context.pendingRetry ??
+          pendingRetryToUse ??
           (isFailureRetryable && failureError
             ? { error: String(failureError) }
             : isProcessExit
@@ -3024,6 +3059,55 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                 }
               : undefined);
         context.pendingRetry = undefined;
+
+        let quotaExhaustionDetail: string | undefined;
+        if (isProcessExit || isFailureRetryable || pendingRetryToUse != null || retryInfo != null) {
+          const liveQuota = yield* Effect.promise(() =>
+            fetchAntigravityLiveQuota({
+              forceRefresh: true,
+              ...(options.profileDirectory ? { profileDirectory: options.profileDirectory } : {}),
+            }),
+          ).pipe(Effect.orElseSucceed(() => null));
+          if (
+            liveQuota?.sessionQuota &&
+            typeof liveQuota.sessionQuota.usedPercent === "number" &&
+            liveQuota.sessionQuota.usedPercent >= 100
+          ) {
+            const resetsAt = liveQuota.sessionQuota.resetsAt;
+            quotaExhaustionDetail = `Antigravity session quota is exhausted (100%)${resetsAt ? `. Resets at ${resetsAt}` : "."}`;
+            if (options.instanceId) {
+              const limitsUpdate = makeAntigravityUsageLimitsUpdate({ liveQuota });
+              yield* emit({
+                type: "account.rate-limits.updated",
+                ...(yield* stamp),
+                provider: PROVIDER,
+                providerInstanceId: options.instanceId,
+                threadId: context.threadId,
+                payload: {
+                  limits: limitsUpdate,
+                },
+              });
+            }
+          }
+        }
+
+        if (quotaExhaustionDetail) {
+          lastRetryError = quotaExhaustionDetail;
+          yield* context.promptLock.withPermit(
+            finishTurn(launch.turn, {
+              state: "failed",
+              errorMessage: quotaExhaustionDetail,
+            }),
+          );
+          context.stopped = true;
+          context.disconnected = true;
+          yield* stopContext(context).pipe(Effect.forkIn(ownerScope));
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session/prompt",
+            detail: quotaExhaustionDetail,
+          });
+        }
 
         if (retryInfo && turnRetryCount < MAX_TURN_RETRIES && !context.stopped) {
           turnRetryCount++;

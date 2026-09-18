@@ -41,6 +41,10 @@ import {
   sanitizeCommandForKill,
   type AntigravityAdapterOptions,
 } from "./AntigravityAdapter.ts";
+import {
+  setAntigravityLiveQuotaCacheForTesting,
+  resetAntigravityLiveQuotaCacheForTesting,
+} from "./antigravityUsageLimits.ts";
 
 const instanceId = ProviderInstanceId.make("antigravity-test");
 const threadId = ThreadId.make("antigravity-thread");
@@ -723,6 +727,47 @@ it.layer(layer)("AntigravityAdapter", (it) => {
       expect(h.hasActivePrompt()).toBe(true);
       yield* Deferred.succeed(prompt.result, { stopReason: "end_turn" });
       yield* Fiber.join(first);
+    }),
+  );
+
+  it.effect("steers an in-flight prompt even if cancel fails with transport error", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({
+        customRuntime: (_input, defaultRuntime) =>
+          Effect.sync(() => ({
+            ...defaultRuntime,
+            cancel: Effect.fail(
+              new AcpErrors.AcpTransportError({
+                detail: "session/cancel timed out",
+                cause: undefined,
+              }),
+            ),
+          })),
+      });
+      yield* h.adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+        modelSelection: { instanceId, model: nativeDefault },
+      });
+      const first = yield* h.adapter
+        .sendTurn({ threadId, input: "First prompt" })
+        .pipe(Effect.forkChild);
+      const firstPrompt = yield* h.nextPrompt;
+
+      const second = yield* h.adapter
+        .sendTurn({
+          threadId,
+          input: "Steer the turn",
+          modelSelection: { instanceId, model: nativeAlternative },
+        })
+        .pipe(Effect.forkChild);
+
+      yield* Deferred.succeed(firstPrompt.result, { stopReason: "cancelled" });
+      const replacement = yield* h.nextPrompt;
+      yield* Deferred.succeed(replacement.result, { stopReason: "end_turn" });
+      const [oldResult, newResult] = yield* Effect.all([Fiber.join(first), Fiber.join(second)]);
+      expect(oldResult.turnId).toBe(newResult.turnId);
     }),
   );
 
@@ -1999,6 +2044,122 @@ it.layer(layer)("AntigravityAdapter", (it) => {
 
         expect(session2.threadId).toBe(threadId2);
         expect(launchCount).toBeGreaterThanOrEqual(3);
+      }),
+  );
+
+  it.effect(
+    "short-circuits turn retries immediately when quota is 100% exhausted on process failure",
+    () =>
+      Effect.gen(function* () {
+        setAntigravityLiveQuotaCacheForTesting({
+          checkedAt: "2026-09-18T10:00:00.000Z",
+          sessionQuota: {
+            modelId: "gemini",
+            label: "Gemini",
+            remainingFraction: 0,
+            usedPercent: 100,
+            resetsAt: "2026-09-18T12:00:00.000Z",
+          },
+          models: [],
+        });
+
+        const h = yield* makeHarness();
+        yield* h.adapter.startSession({
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+        });
+
+        const sending = yield* h.adapter
+          .sendTurn({ threadId, input: "Long running operation" })
+          .pipe(Effect.forkChild);
+
+        const prompt = yield* h.nextPrompt;
+
+        // Simulate ACP process exit
+        yield* h.emitNative({
+          _tag: "ConnectionTerminated",
+          error: new AcpErrors.AcpTransportError({
+            detail: "AcpProcessExitedError: ACP process exited with code 1",
+            cause: undefined,
+          }),
+        });
+
+        const turnExit = yield* Fiber.await(sending);
+        expect(Exit.isFailure(turnExit)).toBe(true);
+
+        const completed = yield* h.waitForEvent((event) => event.type === "turn.completed");
+        expect(completed.payload.state).toBe("failed");
+        expect(completed.payload.errorMessage).toContain(
+          "Antigravity session quota is exhausted (100%)",
+        );
+
+        // Quota update event should be emitted immediately
+        const rateLimitEvent = h.seen.find((event) => event.type === "account.rate-limits.updated");
+        expect(rateLimitEvent).toBeDefined();
+
+        // Should not have attempted any retries (no second prompt)
+        expect(h.calls.filter((c) => c.startsWith("prompt:"))).toHaveLength(1);
+
+        resetAntigravityLiveQuotaCacheForTesting();
+      }),
+  );
+
+  it.effect(
+    "short-circuits turn retries immediately when quota is 100% exhausted on 503 capacity error",
+    () =>
+      Effect.gen(function* () {
+        setAntigravityLiveQuotaCacheForTesting({
+          checkedAt: "2026-09-18T10:00:00.000Z",
+          sessionQuota: {
+            modelId: "gemini",
+            label: "Gemini",
+            remainingFraction: 0,
+            usedPercent: 100,
+            resetsAt: "2026-09-18T12:00:00.000Z",
+          },
+          models: [],
+        });
+
+        const h = yield* makeHarness();
+        yield* h.adapter.startSession({
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+        });
+
+        const sending = yield* h.adapter
+          .sendTurn({ threadId, input: "Long running operation" })
+          .pipe(Effect.forkChild);
+
+        const prompt = yield* h.nextPrompt;
+
+        // Emit 503 capacity error
+        yield* h.emitNative({
+          _tag: "ContentDelta",
+          text: "Agent execution error: request failed (code 503): No capacity available for model gemini-3.8-flash-high on the server",
+          rawPayload: null,
+        });
+
+        const turnExit = yield* Fiber.await(sending);
+        expect(Exit.isFailure(turnExit)).toBe(true);
+
+        const completed = yield* h.waitForEvent((event) => event.type === "turn.completed");
+        expect(completed.payload.state).toBe("failed");
+        expect(completed.payload.errorMessage).toContain(
+          "Antigravity session quota is exhausted (100%)",
+        );
+
+        // Should not have scheduled any api_retries
+        expect(
+          h.seen.some(
+            (event) =>
+              event.type === "session.state.changed" &&
+              Boolean((event.payload as any)?.reason?.includes("api_retry:")),
+          ),
+        ).toBe(false);
+
+        resetAntigravityLiveQuotaCacheForTesting();
       }),
   );
 });

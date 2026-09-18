@@ -95,14 +95,36 @@ diff --git a/dist/unstable/rpc/RpcClient.js b/dist/unstable/rpc/RpcClient.js
 index ec78917..342f9d7 100644
 --- a/dist/unstable/rpc/RpcClient.js
 +++ b/dist/unstable/rpc/RpcClient.js
-@@ -49,6 +49,7 @@ export const makeNoSerialization = /*#__PURE__*/Effect.fnUntraced(function* (gro
+@@ -49,18 +49,19 @@ export const makeNoSerialization = /*#__PURE__*/Effect.fnUntraced(function* (gro
    const services = yield* Effect.context();
    const scope = Context.get(services, Scope.Scope);
    const entries = new Map();
 +  const hooks = yield* Effect.serviceOption(RequestHooks);
    let isShutdown = false;
++  const clearEntries = Effect.fnUntraced(function* (exit) {
++    for (const [id, entry] of entries) {
++      entries.delete(id);
++      if (entry._tag === "Queue") {
++        yield* exit._tag === "Success" ? Queue.end(entry.queue) : Queue.failCause(entry.queue, exit.cause);
++      } else {
++        entry.resume(exit);
++      }
++    }
++  });
    yield* Scope.addFinalizer(scope, Effect.withFiber(parent => {
      isShutdown = true;
+     return clearEntries(Exit.interrupt(parent.id));
+   }));
+-  const clearEntries = Effect.fnUntraced(function* (exit) {
+-    for (const [id, entry] of entries) {
+-      entries.delete(id);
+-      if (entry._tag === "Queue") {
+-        yield* exit._tag === "Success" ? Queue.end(entry.queue) : Queue.failCause(entry.queue, exit.cause);
+-      } else {
+-        entry.resume(exit);
+-      }
+-    }
+-  });
 @@ -86,6 +87,11 @@ export const makeNoSerialization = /*#__PURE__*/Effect.fnUntraced(function* (gro
        return Effect.interrupt;
      }
