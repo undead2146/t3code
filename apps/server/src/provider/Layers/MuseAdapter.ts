@@ -892,7 +892,7 @@ export function make(
               itemId: RuntimeItemId.make(id),
               payload: {
                 itemType: itemType(item),
-                status: "interrupted",
+                status: "completed",
               },
             });
           }
