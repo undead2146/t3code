@@ -12,6 +12,7 @@ import {
   MUSE_DEFAULT_MODEL,
   ProviderDriverKind,
   ProviderInstanceId,
+  RuntimeItemId,
   TurnId,
   type MuseSettings,
   type ProviderRuntimeEvent,
@@ -49,6 +50,7 @@ import {
 import {
   decodeMuseNotification,
   isMuseNotificationMethod,
+  itemType,
   mapMuseNotification,
   MuseItem,
   museApprovalDecision,
@@ -120,10 +122,7 @@ interface SessionContext {
 
 function hasActiveWorkflowOrSubagent(ctx: SessionContext): boolean {
   for (const item of ctx.items.values()) {
-    if (
-      (item.kind === "workflow" || item.kind === "subagent" || item.kind === "reminderChild") &&
-      item.status === "inProgress"
-    ) {
+    if ((item.kind === "workflow" || item.kind === "subagent") && item.status === "inProgress") {
       return true;
     }
   }
@@ -358,7 +357,7 @@ export function make(
         event.method === "item/completed"
       ) {
         const prior = ctx.items.get(event.params.item.itemId);
-        if (prior && prior.revision >= event.params.item.revision) return;
+        if (prior && (prior.revision ?? 0) >= (event.params.item.revision ?? 0)) return;
       }
       if (event.method === "approval/requested" || event.method === "approval/updated") {
         const prior = ctx.approvals.get(event.params.approvalId);
@@ -433,6 +432,11 @@ export function make(
         (event.method === "turn/completed" || event.method === "turn/unqueued") &&
         ctx.session.activeTurnId === event.params.turnId
       ) {
+        for (const [id, item] of ctx.items.entries()) {
+          if (item.kind === "reminderChild" && item.status === "inProgress") {
+            ctx.items.set(id, { ...item, status: "completed" });
+          }
+        }
         if (!hasActiveWorkflowOrSubagent(ctx)) {
           const { activeTurnId: _, ...rest } = ctx.session;
           ctx.session = { ...rest, status: "ready", updatedAt: nowIso() };
@@ -666,7 +670,7 @@ export function make(
             for (const item of result.history?.items ??
               result.history?.snapshot?.state.items ??
               []) {
-              if ((ctx.items.get(item.itemId)?.revision ?? -1) < item.revision)
+              if ((ctx.items.get(item.itemId)?.revision ?? -1) < (item.revision ?? 0))
                 ctx.items.set(item.itemId, item);
               if (item.text) ctx.streamed.set(`${item.itemId}:text`, item.text);
               item.summary?.forEach((text, index) =>
@@ -869,12 +873,48 @@ export function make(
         const ctx = yield* requireSession(threadId);
         const target = turnId ?? ctx.session.activeTurnId;
         if (!target || (turnId && ctx.session.activeTurnId !== turnId)) return;
-        yield* attempt("turn/interrupt", () =>
-          ctx.host.connection.command("turn/interrupt", {
-            sessionId: ctx.sessionId,
+        yield* Effect.tryPromise({
+          try: () =>
+            ctx.host.connection.command("turn/interrupt", {
+              sessionId: ctx.sessionId,
+              turnId: target,
+            }),
+          catch: (cause) => requestError("turn/interrupt", cause),
+        }).pipe(Effect.timeoutOption("5 seconds"), Effect.ignore);
+
+        for (const [id, item] of ctx.items.entries()) {
+          if (item.status === "inProgress") {
+            ctx.items.set(id, { ...item, status: "completed" });
+            emit({
+              ...base(ctx),
+              type: "item.completed",
+              turnId: target,
+              itemId: RuntimeItemId.make(id),
+              payload: {
+                itemType: itemType(item),
+                status: "interrupted",
+              },
+            });
+          }
+        }
+
+        if (!ctx.settledTurns.has(target)) {
+          ctx.settledTurns.add(target);
+          emit({
+            ...base(ctx),
+            type: "turn.completed",
             turnId: target,
-          }),
-        );
+            payload: { state: "cancelled", stopReason: "interrupted" },
+          });
+        }
+
+        const { activeTurnId: _, ...rest } = ctx.session;
+        ctx.session = { ...rest, status: "ready", updatedAt: nowIso() };
+        emit({
+          ...base(ctx),
+          type: "session.state.changed",
+          payload: { state: "ready" },
+        });
       },
     );
     const respondToRequest: Adapter["respondToRequest"] = Effect.fn("MuseAdapter.respondToRequest")(

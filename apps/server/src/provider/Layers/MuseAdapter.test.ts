@@ -5,9 +5,11 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import { MuseSettings, ThreadId } from "@t3tools/contracts";
+import * as Stream from "effect/Stream";
+import { MuseSettings, ThreadId, type ProviderRuntimeEvent } from "@t3tools/contracts";
 import * as ServerConfig from "../../config.ts";
 import * as MuseAdapter from "./MuseAdapter.ts";
 
@@ -459,6 +461,100 @@ describe("MuseAdapter session lifecycle with workflow items", () => {
           terminal: "completed",
         },
       });
+
+      sessions = yield* adapter.listSessions();
+      current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("ready");
+      expect(current?.activeTurnId).toBeUndefined();
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "settles session to ready when turn/completed arrives even if a reminderChild is inProgress",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+        });
+
+        const threadId = ThreadId.make("thread-test-reminder-settle");
+        const session = yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+
+        const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+
+        const turn = yield* adapter.sendTurn({
+          threadId,
+          input: "Test turn with reminder",
+        });
+
+        mockNotificationCallback!({
+          method: "turn/started",
+          params: {
+            sessionId,
+            viewCursor: "cursor-start",
+            turnId: turn.turnId,
+          },
+        });
+        mockNotificationCallback!({
+          method: "item/started",
+          params: {
+            sessionId,
+            viewCursor: "cursor-item",
+            item: {
+              itemId: "item-reminder-1",
+              kind: "reminderChild",
+              revision: 0,
+              status: "inProgress",
+              turnId: turn.turnId,
+            },
+          },
+        });
+        mockNotificationCallback!({
+          method: "turn/completed",
+          params: {
+            sessionId,
+            viewCursor: "cursor-turn-done",
+            turnId: turn.turnId,
+            terminal: "completed",
+          },
+        });
+
+        const sessions = yield* adapter.listSessions();
+        const current = sessions.find((s) => s.threadId === threadId);
+        expect(current?.status).toBe("ready");
+        expect(current?.activeTurnId).toBeUndefined();
+      }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("interruptTurn settles active turn and transitions session to ready", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-interrupt");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "Long running turn to interrupt",
+      });
+
+      let sessions = yield* adapter.listSessions();
+      let current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("running");
+      expect(current?.activeTurnId).toBe(turn.turnId);
+
+      // Call interruptTurn
+      yield* adapter.interruptTurn(threadId, turn.turnId);
 
       sessions = yield* adapter.listSessions();
       current = sessions.find((s) => s.threadId === threadId);

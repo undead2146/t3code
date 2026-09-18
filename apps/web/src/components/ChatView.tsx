@@ -6206,12 +6206,12 @@ export default function ChatView(props: ChatViewProps) {
     !isWorking && activeThread ? (activeThreadShell?.backgroundLiveness ?? null) : null;
   const [isStoppingBackgroundWork, setIsStoppingBackgroundWork] = useState(false);
   useEffect(() => {
-    // "Stopping..." holds until the liveness clears; the interrupt command
+    // "Stopping..." holds until the liveness clears or work stops; the interrupt command
     // returning only means the request was accepted.
-    if (activeBackgroundLiveness === null) {
+    if (!isWorking || activeBackgroundLiveness === null) {
       setIsStoppingBackgroundWork(false);
     }
-  }, [activeBackgroundLiveness]);
+  }, [isWorking, activeBackgroundLiveness]);
   useEffect(() => {
     // Per-thread state: switching threads while A's stop is pending must not
     // disable B's Stop button (review finding).
@@ -6220,24 +6220,37 @@ export default function ChatView(props: ChatViewProps) {
   const handleStopBackgroundWork = useCallback(async () => {
     if (!activeThread) return;
     setIsStoppingBackgroundWork(true);
-    const result = await interruptThreadTurn({
-      environmentId,
-      input: buildThreadTurnInterruptInput(activeThread),
-    });
-    if (result._tag === "Failure") {
-      // Every failure clears the pending state — an interrupted command
-      // never reached the server, so liveness would hold "Stopping..."
-      // forever. Only real failures toast.
-      setIsStoppingBackgroundWork(false);
-      if (!isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThread.id,
-          error instanceof Error ? error.message : "Failed to stop background work.",
-        );
+    try {
+      const result = await interruptThreadTurn({
+        environmentId,
+        input: buildThreadTurnInterruptInput(activeThread),
+      });
+      if (result._tag === "Failure") {
+        // Every failure clears the pending state — an interrupted command
+        // never reached the server, so liveness would hold "Stopping..."
+        // forever. Only real failures toast.
+        setIsStoppingBackgroundWork(false);
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          setThreadError(
+            activeThread.id,
+            error instanceof Error ? error.message : "Failed to stop background work.",
+          );
+        }
+      } else if (!isWorking || activeBackgroundLiveness === null) {
+        setIsStoppingBackgroundWork(false);
       }
+    } catch {
+      setIsStoppingBackgroundWork(false);
     }
-  }, [activeThread, environmentId, interruptThreadTurn, setThreadError]);
+  }, [
+    activeBackgroundLiveness,
+    activeThread,
+    environmentId,
+    interruptThreadTurn,
+    isWorking,
+    setThreadError,
+  ]);
   const backgroundLivenessBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
     if (activeBackgroundLiveness === null || !activeThread) {
       return null;

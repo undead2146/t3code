@@ -124,7 +124,8 @@ export function parseMuseLine(
   if (typeof sessionId !== "string" || typeof sourceId !== "string") return null;
   const cached = int(usage.cache_read_tokens ?? usage.cached_tokens);
   const created = int(usage.cache_write_tokens);
-  const provider = typeof payload.run_id === "string" ? providers.get(payload.run_id) : undefined;
+  const provider =
+    (typeof payload.run_id === "string" ? providers.get(payload.run_id) : undefined) ?? "meta";
   const input = int(usage.input_tokens);
   const inclusive = provider === "meta" || provider === "openai";
   // Unknown cache conventions cannot yield a trustworthy disjoint token count.

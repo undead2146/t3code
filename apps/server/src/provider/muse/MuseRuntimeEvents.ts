@@ -17,16 +17,17 @@ import {
 import * as Schema from "effect/Schema";
 import { MuseSubscriptionUsage, museSubscriptionUsageToLimits } from "../Layers/museUsageLimits.ts";
 
-const optionalString = Schema.optional(Schema.String);
+const optionalString = Schema.optional(Schema.NullOr(Schema.String));
+const optionalInt = Schema.optional(Schema.NullOr(NonNegativeInt));
 const identity = { sessionId: Schema.String, viewCursor: Schema.String };
 export const MuseItem = Schema.Struct({
   itemId: Schema.String,
   kind: Schema.String,
-  revision: NonNegativeInt,
+  revision: Schema.NullOr(NonNegativeInt),
   status: Schema.String,
   turnId: Schema.optional(Schema.NullOr(Schema.String)),
   text: optionalString,
-  summary: Schema.optional(Schema.Array(Schema.String)),
+  summary: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
   tool: optionalString,
   args: optionalString,
   visibleOutput: optionalString,
@@ -34,8 +35,8 @@ export const MuseItem = Schema.Struct({
   fallbackText: optionalString,
   commandText: optionalString,
   outcome: optionalString,
-  tokensBefore: Schema.optional(NonNegativeInt),
-  tokensAfter: Schema.optional(NonNegativeInt),
+  tokensBefore: optionalInt,
+  tokensAfter: optionalInt,
   scriptId: optionalString,
   entryId: optionalString,
   workflowRunId: optionalString,
@@ -49,7 +50,7 @@ export const MuseItem = Schema.Struct({
   reminderAgentId: optionalString,
   childSessionId: optionalString,
   taskId: optionalString,
-  generationId: Schema.optional(NonNegativeInt),
+  generationId: optionalInt,
 });
 export type MuseItem = typeof MuseItem.Type;
 
@@ -119,9 +120,11 @@ export const MuseNotification = Schema.Union([
       terminal: Schema.String,
       reason: optionalString,
       error: Schema.optional(
-        Schema.Struct({ kind: Schema.String, message: Schema.String, retryable: Schema.Boolean }),
+        Schema.NullOr(
+          Schema.Struct({ kind: Schema.String, message: Schema.String, retryable: Schema.Boolean }),
+        ),
       ),
-      usage: Schema.optional(tokenUsage),
+      usage: Schema.optional(Schema.NullOr(tokenUsage)),
     }),
   }),
   Schema.Struct({
@@ -288,7 +291,7 @@ function itemTitle(item: MuseItem): string | undefined {
   return undefined;
 }
 
-function itemType(item: MuseItem): CanonicalItemType {
+export function itemType(item: MuseItem): CanonicalItemType {
   switch (item.kind) {
     case "userMessage":
       return "user_message";
@@ -431,9 +434,10 @@ export function mapMuseNotification(
               title: title ?? (item.kind === "workflow" ? "Workflow" : "Subagent"),
               description: detail || title || (item.kind === "workflow" ? "Workflow" : "Subagent"),
               ...(item.kind === "subagent" && item.role ? { role: item.role } : {}),
-              ...(item.kind === "workflow" && (item.entryId || item.scriptId)
-                ? { workflowName: item.entryId || item.scriptId }
-                : {}),
+              ...(() => {
+                const workflowName = item.entryId ?? item.scriptId;
+                return item.kind === "workflow" && workflowName ? { workflowName } : {};
+              })(),
               ...(item.workflowRunId || item.scriptPath
                 ? {
                     runHandles: {
@@ -522,8 +526,8 @@ export function mapMuseNotification(
           type: "thread.state.changed",
           payload: {
             state: "compacted",
-            ...(item.tokensBefore !== undefined ? { beforeTokens: item.tokensBefore } : {}),
-            ...(item.tokensAfter !== undefined ? { afterTokens: item.tokensAfter } : {}),
+            ...(item.tokensBefore != null ? { beforeTokens: item.tokensBefore } : {}),
+            ...(item.tokensAfter != null ? { afterTokens: item.tokensAfter } : {}),
           },
         });
       }
@@ -733,8 +737,9 @@ export function mapMuseNotification(
           },
         },
       ];
-    case "session/tokenUsage":
-      if (context.contextUsedTokens === undefined) return [];
+    case "session/tokenUsage": {
+      const usedTokens = context.contextUsedTokens ?? event.params.totalTokens;
+      const maxTokens = context.contextWindowTokens ?? 1_000_000;
       return [
         {
           ...base,
@@ -742,8 +747,8 @@ export function mapMuseNotification(
           turnId: TurnId.make(event.params.turnId),
           payload: {
             usage: {
-              usedTokens: context.contextUsedTokens,
-              ...(context.contextWindowTokens ? { maxTokens: context.contextWindowTokens } : {}),
+              usedTokens,
+              maxTokens,
               totalProcessedTokens: event.params.cumulative.totalTokens,
               inputTokens: event.params.cumulative.promptTokens,
               outputTokens: event.params.cumulative.outputTokens,
@@ -754,6 +759,7 @@ export function mapMuseNotification(
           },
         },
       ];
+    }
     case "session/contextUsage":
       return [
         {

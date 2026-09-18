@@ -29,6 +29,7 @@ const PRESENTATION = {
   badgeLabel: "Developer Preview",
   supportsConversationRollback: false,
   showInteractionModeToggle: false,
+  reportsContextWindow: true,
   runtimeModeDescriptions: {
     "approval-required": "Ask before shell commands. Workspace file writes are allowed.",
     "auto-accept-edits": "Muse requests approval when needed. Workspace file writes are allowed.",

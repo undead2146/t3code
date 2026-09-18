@@ -255,4 +255,101 @@ describe("MuseRuntimeEvents", () => {
       }
     });
   });
+
+  describe("token and context usage mapping", () => {
+    it("maps session/tokenUsage even when contextUsedTokens is undefined", () => {
+      const raw = {
+        method: "session/tokenUsage",
+        params: {
+          sessionId: "sess-1",
+          viewCursor: "cur-9",
+          turnId: "turn-1",
+          promptTokens: NonNegativeInt.make(1200),
+          totalTokens: NonNegativeInt.make(1500),
+          usage: {
+            inputTokens: NonNegativeInt.make(1000),
+            outputTokens: NonNegativeInt.make(300),
+            cachedTokens: NonNegativeInt.make(200),
+            reasoningTokens: NonNegativeInt.make(0),
+          },
+          cumulative: {
+            promptTokens: NonNegativeInt.make(5000),
+            outputTokens: NonNegativeInt.make(1200),
+            totalTokens: NonNegativeInt.make(6200),
+          },
+        },
+      };
+      const decoded = decodeMuseNotification(raw);
+      const events = mapMuseNotification(decoded, createMockContext());
+      expect(events).toHaveLength(1);
+      const event = events[0];
+      expect(event?.type).toBe("thread.token-usage.updated");
+      if (event?.type === "thread.token-usage.updated") {
+        expect(event.payload.usage.usedTokens).toBe(1500);
+        expect(event.payload.usage.maxTokens).toBe(1_000_000);
+        expect(event.payload.usage.totalProcessedTokens).toBe(6200);
+        expect(event.payload.usage.inputTokens).toBe(5000);
+        expect(event.payload.usage.outputTokens).toBe(1200);
+        expect(event.payload.usage.lastInputTokens).toBe(1200);
+        expect(event.payload.usage.lastOutputTokens).toBe(300);
+        expect(event.payload.usage.lastCachedInputTokens).toBe(200);
+      }
+    });
+
+    it("prefers explicit contextUsedTokens and contextWindowTokens when provided", () => {
+      const raw = {
+        method: "session/tokenUsage",
+        params: {
+          sessionId: "sess-1",
+          viewCursor: "cur-10",
+          turnId: "turn-2",
+          promptTokens: NonNegativeInt.make(1000),
+          totalTokens: NonNegativeInt.make(1200),
+          usage: {
+            inputTokens: NonNegativeInt.make(800),
+            outputTokens: NonNegativeInt.make(200),
+            cachedTokens: NonNegativeInt.make(0),
+            reasoningTokens: NonNegativeInt.make(0),
+          },
+          cumulative: {
+            promptTokens: NonNegativeInt.make(2000),
+            outputTokens: NonNegativeInt.make(400),
+            totalTokens: NonNegativeInt.make(2400),
+          },
+        },
+      };
+      const decoded = decodeMuseNotification(raw);
+      const events = mapMuseNotification(
+        decoded,
+        createMockContext({ contextUsedTokens: 1150, contextWindowTokens: 200_000 }),
+      );
+      expect(events).toHaveLength(1);
+      const event = events[0];
+      if (event?.type === "thread.token-usage.updated") {
+        expect(event.payload.usage.usedTokens).toBe(1150);
+        expect(event.payload.usage.maxTokens).toBe(200_000);
+      }
+    });
+
+    it("maps session/contextUsage correctly", () => {
+      const raw = {
+        method: "session/contextUsage",
+        params: {
+          sessionId: "sess-1",
+          viewCursor: "cur-11",
+          usedTokens: NonNegativeInt.make(3500),
+          windowTokens: NonNegativeInt.make(500_000),
+        },
+      };
+      const decoded = decodeMuseNotification(raw);
+      const events = mapMuseNotification(decoded, createMockContext());
+      expect(events).toHaveLength(1);
+      const event = events[0];
+      expect(event?.type).toBe("thread.token-usage.updated");
+      if (event?.type === "thread.token-usage.updated") {
+        expect(event.payload.usage.usedTokens).toBe(3500);
+        expect(event.payload.usage.maxTokens).toBe(500_000);
+      }
+    });
+  });
 });
