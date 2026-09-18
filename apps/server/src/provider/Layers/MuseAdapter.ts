@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
 import {
   createUuidV7Mint,
   spawnMspConnection,
@@ -115,6 +118,55 @@ interface SessionContext {
   stopped: boolean;
 }
 
+function hasActiveWorkflowOrSubagent(ctx: SessionContext): boolean {
+  for (const item of ctx.items.values()) {
+    if (
+      (item.kind === "workflow" || item.kind === "subagent" || item.kind === "reminderChild") &&
+      item.status === "inProgress"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function healWindowsSkillSymlinks(cwd: string): Promise<void> {
+  if (process.platform !== "win32") return;
+  const skillDirs = [
+    [".claude", "skills"],
+    [".agents", "skills"],
+    [".gemini", "skills"],
+  ];
+  for (const parts of skillDirs) {
+    const fullPath = NodePath.join(cwd, ...parts);
+    try {
+      const stat = await NodeFSP.lstat(fullPath);
+      if (stat.isFile()) {
+        const targetRel = (await NodeFSP.readFile(fullPath, "utf-8")).trim();
+        const targetAbs = NodePath.resolve(NodePath.dirname(fullPath), targetRel);
+        const targetStat = await NodeFSP.stat(targetAbs).catch(() => null);
+        if (targetStat?.isDirectory()) {
+          await NodeFSP.unlink(fullPath);
+          await NodeFSP.symlink(targetAbs, fullPath, "junction");
+        }
+      }
+    } catch {
+      // Ignore errors if directory/file does not exist or cannot be accessed.
+    }
+  }
+}
+
+export function arePathsEquivalent(pathA: string, pathB: string): boolean {
+  if (pathA === pathB) return true;
+  const normA = NodePath.normalize(pathA);
+  const normB = NodePath.normalize(pathB);
+  if (normA === normB) return true;
+  if (process.platform === "win32") {
+    return normA.toLowerCase() === normB.toLowerCase();
+  }
+  return false;
+}
+
 export function make(
   settings: MuseSettings,
   options?: {
@@ -134,16 +186,30 @@ export function make(
     const lifecycle = yield* Semaphore.make(1);
     const mintEventId = createUuidV7Mint();
     const nextEventId = () => EventId.make(mintEventId());
-    const requestError = (method: string, cause: unknown) =>
-      new ProviderAdapterRequestError({
+    const requestError = (method: string, cause: unknown) => {
+      let detail = "Muse Code rejected the request or its response was invalid.";
+      if (typeof cause === "string" && cause.trim().length > 0) {
+        detail = cause;
+      } else if (Schema.is(ProviderAdapterRequestError)(cause)) {
+        detail = cause.detail;
+      } else if (cause instanceof Error && cause.message.trim().length > 0) {
+        detail = cause.message;
+      } else if (
+        typeof cause === "object" &&
+        cause !== null &&
+        "message" in cause &&
+        typeof (cause as { message: unknown }).message === "string" &&
+        (cause as { message: string }).message.trim().length > 0
+      ) {
+        detail = (cause as { message: string }).message;
+      }
+      return new ProviderAdapterRequestError({
         provider: PROVIDER,
         method,
-        detail:
-          typeof cause === "string"
-            ? cause
-            : "Muse Code rejected the request or its response was invalid.",
+        detail,
         ...(typeof cause === "string" ? {} : { cause }),
       });
+    };
     const attempt = <A>(method: string, run: () => Promise<A>) =>
       Effect.tryPromise({ try: run, catch: (cause) => requestError(method, cause) }).pipe(
         Effect.timeoutOrElse({
@@ -354,13 +420,25 @@ export function make(
         ctx.items.set(event.params.item.itemId, event.params.item);
         if (event.params.item.status !== "inProgress")
           ctx.deltaCursors.delete(event.params.item.itemId);
+        if (
+          !hasActiveWorkflowOrSubagent(ctx) &&
+          ctx.session.status === "running" &&
+          (!ctx.session.activeTurnId || ctx.settledTurns.has(ctx.session.activeTurnId))
+        ) {
+          const { activeTurnId: _, ...rest } = ctx.session;
+          ctx.session = { ...rest, status: "ready", updatedAt: nowIso() };
+        }
       }
       if (
         (event.method === "turn/completed" || event.method === "turn/unqueued") &&
         ctx.session.activeTurnId === event.params.turnId
       ) {
-        const { activeTurnId: _, ...rest } = ctx.session;
-        ctx.session = { ...rest, status: "ready", updatedAt: nowIso() };
+        if (!hasActiveWorkflowOrSubagent(ctx)) {
+          const { activeTurnId: _, ...rest } = ctx.session;
+          ctx.session = { ...rest, status: "ready", updatedAt: nowIso() };
+        } else {
+          ctx.session = { ...ctx.session, status: "running", updatedAt: nowIso() };
+        }
       }
       if (event.method === "session/contextUsage" && ctx.pendingTokenUsage.size > 0) {
         const pending = [...ctx.pendingTokenUsage.values()];
@@ -386,6 +464,7 @@ export function make(
           const scope = yield* Scope.make();
           const start = Effect.gen(function* () {
             const cwd = input.cwd ?? config.cwd;
+            yield* Effect.promise(() => healWindowsSkillSymlinks(cwd));
             const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
             const args = ["serve", "--trust-workspace"];
             if (
@@ -520,30 +599,53 @@ export function make(
                   },
                 }
               : undefined;
-            const result = yield* attempt(cursor ? "session/resume" : "session/start", () =>
-              host.connection.command(cursor ? "session/resume" : "session/start", {
-                sessionId,
-                ...(sessionConfig ? { config: sessionConfig } : {}),
-                ...(cursor
-                  ? { history: "inline" }
-                  : {
-                      workspaceRoot: cwd,
-                      approvalMode: mode,
-                      ...(initialSelection
-                        ? {
-                            modelId: initialSelection.modelId,
-                            ...("providerId" in initialSelection
-                              ? { providerId: initialSelection.providerId }
-                              : {}),
-                          }
-                        : {}),
-                    }),
-              }),
-            ).pipe(
+            // session/resume is only valid within the same muse serve process. When T3 Code
+            // restarts, it always spawns a fresh process whose sessions are empty, so resume
+            // will be rejected. Fall back to session/start transparently so the user gets a
+            // fresh conversation rather than an opaque error.
+            const doStart = (startSessionId: string) =>
+              attempt("session/start", () =>
+                host.connection.command("session/start", {
+                  sessionId: startSessionId,
+                  ...(sessionConfig ? { config: sessionConfig } : {}),
+                  workspaceRoot: cwd,
+                  approvalMode: mode,
+                  ...(initialSelection
+                    ? {
+                        modelId: initialSelection.modelId,
+                        ...("providerId" in initialSelection
+                          ? { providerId: initialSelection.providerId }
+                          : {}),
+                      }
+                    : {}),
+                }),
+              );
+            const resumeOrStart = cursor
+              ? attempt("session/resume", () =>
+                  host.connection.command("session/resume", {
+                    sessionId,
+                    ...(sessionConfig ? { config: sessionConfig } : {}),
+                    history: "inline",
+                  }),
+                ).pipe(
+                  Effect.catch(() => {
+                    // Resume failed — muse serve was restarted and the session is gone.
+                    // Mint a fresh session id and update ctx so notification routing stays correct.
+                    const freshId = host.connection.mintCommandId();
+                    ctx.sessionId = freshId;
+                    ctx.session = {
+                      ...ctx.session,
+                      resumeCursor: { schemaVersion: 1, sessionId: freshId, selectedModel },
+                    };
+                    return doStart(freshId);
+                  }),
+                )
+              : doStart(sessionId);
+            const result = yield* resumeOrStart.pipe(
               Effect.flatMap(Schema.decodeUnknownEffect(SessionResult)),
               Effect.mapError((cause) => requestError("session/start", cause)),
             );
-            if (result.session.workspaceRoot !== cwd)
+            if (!arePathsEquivalent(result.session.workspaceRoot, cwd))
               return yield* requestError(
                 "session/resume",
                 "Muse session belongs to a different workspace.",
@@ -557,7 +659,7 @@ export function make(
             if (initialSelection && "profileId" in initialSelection)
               yield* attempt("session/setModel", () =>
                 host.connection.command("session/setModel", {
-                  sessionId,
+                  sessionId: ctx.sessionId,
                   model: initialSelection,
                 }),
               );
@@ -573,17 +675,27 @@ export function make(
             }
             if (ctx.session.status === "connecting") {
               const activeTurnId = result.session.activeTurnId;
+              const hasActiveWorkflow = hasActiveWorkflowOrSubagent(ctx);
               ctx.session = {
                 ...ctx.session,
-                status: activeTurnId && !ctx.settledTurns.has(activeTurnId) ? "running" : "ready",
+                status:
+                  (activeTurnId && !ctx.settledTurns.has(activeTurnId)) || hasActiveWorkflow
+                    ? "running"
+                    : "ready",
                 ...(activeTurnId && !ctx.settledTurns.has(activeTurnId)
                   ? { activeTurnId: TurnId.make(activeTurnId) }
                   : {}),
               };
             }
-            if (cursor)
+            // Only set approval mode post-resume when we actually resumed; session/start
+            // already carries approvalMode in its params, so calling it again is redundant
+            // and would use the wrong session id if we fell back to a fresh start.
+            if (cursor && ctx.sessionId === sessionId)
               yield* attempt("session/setApprovalMode", () =>
-                host.connection.command("session/setApprovalMode", { sessionId, mode }),
+                host.connection.command("session/setApprovalMode", {
+                  sessionId: ctx.sessionId,
+                  mode,
+                }),
               );
             ctx.session = {
               ...ctx.session,

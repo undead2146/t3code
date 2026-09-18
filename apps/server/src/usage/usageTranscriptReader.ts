@@ -43,9 +43,6 @@ export interface TranscriptFile {
 }
 
 /**
-<<<<<<< HEAD
- * Lists `.jsonl` and `.log` transcripts under `root` last modified at or after `sinceMs`.
-=======
  * Where a parse stopped, with enough state to continue from there.
  *
  * The guard hash fingerprints the bytes immediately before `resumeOffset`. A
@@ -99,8 +96,7 @@ function fnv1a(buffer: Buffer): number {
 }
 
 /**
- * Lists `.jsonl` transcripts under `root` last modified at or after `sinceMs`.
->>>>>>> upstream/main
+ * Lists `.jsonl` and `.log` transcripts under `root` last modified at or after `sinceMs`.
  *
  * Errors on individual entries are swallowed: session files rotate and get
  * removed while the walk is in flight, and a partial listing is far better than

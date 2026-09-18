@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Usage reporting contract.
  *
  * Each environment scans the provider CLIs' own on-disk session transcripts
@@ -38,6 +38,8 @@ export const UsageProviderKind = Schema.Literals([
   "grok",
   "antigravity",
   "muse",
+  "cursor",
+  "opencode",
 ]);
 export type UsageProviderKind = typeof UsageProviderKind.Type;
 
@@ -99,6 +101,8 @@ export const UsageBucket = Schema.Struct({
   hourStart: Schema.optional(TrimmedNonEmptyString),
   provider: UsageProviderKind,
   model: TrimmedNonEmptyString,
+  /** Source directory, so overlapping multi-home environments merge once per source. */
+  sourcePath: Schema.optional(TrimmedNonEmptyString),
   totals: UsageTokenTotals,
   costUsd: Schema.Number,
   /**

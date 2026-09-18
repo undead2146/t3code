@@ -1,0 +1,547 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
+import { MuseSettings, ThreadId } from "@t3tools/contracts";
+import * as ServerConfig from "../../config.ts";
+import * as MuseAdapter from "./MuseAdapter.ts";
+
+const decodeMuseSettings = Schema.decodeSync(MuseSettings);
+
+let mockNotificationCallback: ((notification: any) => void) | undefined;
+let mockSessionResultHistory: any = undefined;
+let mockResumeShouldFail = false;
+let mockStartShouldFail: string | false = false;
+let mintCommandIdCounter = 0;
+
+vi.mock("@muse-code/sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@muse-code/sdk")>();
+  return {
+    ...actual,
+    spawnMspConnection: () => ({
+      close: vi.fn(async () => {}),
+      initialize: vi.fn(async () => ({
+        connection: {
+          onNotification: vi.fn((cb) => {
+            mockNotificationCallback = cb;
+          }),
+          onProtocolError: vi.fn(() => {}),
+          onServerRequest: vi.fn(() => {}),
+          closed: new Promise(() => {}),
+          mintCommandId: () => `cmd-${++mintCommandIdCounter}`,
+          command: vi.fn(async (method: string, params: any) => {
+            if (method === "session/start" && mockStartShouldFail)
+              throw new Error(mockStartShouldFail);
+            if (method === "session/resume" && mockResumeShouldFail)
+              throw new Error("Session not found");
+            if (method === "session/start" || method === "session/resume") {
+              return {
+                session: {
+                  sessionId: params.sessionId ?? `cmd-${mintCommandIdCounter}`,
+                  workspaceRoot: params.workspaceRoot ?? "Z:\\test-workspace",
+                  modelId: "default",
+                  status: "ready",
+                  activeTurnId: null,
+                },
+                history: mockSessionResultHistory,
+              };
+            }
+            if (method === "turn/start") {
+              return {
+                status: "accepted",
+                turnId: `turn-${++mintCommandIdCounter}`,
+              };
+            }
+            return {};
+          }),
+          request: vi.fn(async () => ({})),
+        },
+        child: {
+          exit: new Promise(() => {}),
+          close: vi.fn(async () => {}),
+        },
+      })),
+    }),
+  };
+});
+
+const testLayer = ServerConfig.layerTest(process.cwd(), { prefix: "t3-muse-adapter-test-" }).pipe(
+  Layer.provideMerge(NodeServices.layer),
+);
+
+describe("MuseAdapter session lifecycle with workflow items", () => {
+  it.effect(
+    "prevents session status from dropping to ready when turn/completed arrives while a workflow is inProgress",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+        });
+
+        const threadId = ThreadId.make("thread-test-1");
+        const session = yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+
+        expect(session.status).toBe("ready");
+        expect(mockNotificationCallback).toBeDefined();
+        const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+
+        // 1. Turn starts
+        mockNotificationCallback!({
+          method: "turn/started",
+          params: {
+            sessionId,
+            viewCursor: "cursor-1",
+            turnId: "turn-100",
+          },
+        });
+
+        let sessions = yield* adapter.listSessions();
+        let current = sessions.find((s) => s.threadId === threadId);
+        expect(current?.status).toBe("running");
+        expect(current?.activeTurnId).toBe("turn-100");
+
+        // 2. Workflow item starts
+        mockNotificationCallback!({
+          method: "item/started",
+          params: {
+            sessionId,
+            viewCursor: "cursor-2",
+            item: {
+              itemId: "wf-item-1",
+              kind: "workflow",
+              revision: 1,
+              status: "inProgress",
+              turnId: "turn-100",
+              scriptId: "data-sync",
+            },
+          },
+        });
+
+        // 3. Turn completes while workflow is still inProgress
+        mockNotificationCallback!({
+          method: "turn/completed",
+          params: {
+            sessionId,
+            viewCursor: "cursor-3",
+            turnId: "turn-100",
+            terminal: "completed",
+          },
+        });
+
+        sessions = yield* adapter.listSessions();
+        current = sessions.find((s) => s.threadId === threadId);
+        // Session MUST remain "running" because workflow is inProgress!
+        expect(current?.status).toBe("running");
+
+        // 4. Workflow item completes
+        mockNotificationCallback!({
+          method: "item/completed",
+          params: {
+            sessionId,
+            viewCursor: "cursor-4",
+            item: {
+              itemId: "wf-item-1",
+              kind: "workflow",
+              revision: 2,
+              status: "completed",
+              turnId: "turn-100",
+              scriptId: "data-sync",
+            },
+          },
+        });
+
+        sessions = yield* adapter.listSessions();
+        current = sessions.find((s) => s.threadId === threadId);
+        // Now that workflow has completed and turn was completed, session transitions to ready!
+        expect(current?.status).toBe("ready");
+      }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("transitions to ready immediately on turn/completed if no workflow is active", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-2");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+
+      mockNotificationCallback!({
+        method: "turn/started",
+        params: {
+          sessionId,
+          viewCursor: "cursor-1",
+          turnId: "turn-200",
+        },
+      });
+
+      let sessions = yield* adapter.listSessions();
+      let current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("running");
+
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: "cursor-2",
+          turnId: "turn-200",
+          terminal: "completed",
+        },
+      });
+
+      sessions = yield* adapter.listSessions();
+      current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("ready");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "sets session status to running on startup if restored history contains an inProgress workflow",
+    () =>
+      Effect.gen(function* () {
+        mockSessionResultHistory = {
+          mode: "inline",
+          items: [
+            {
+              itemId: "wf-prev-1",
+              kind: "workflow",
+              revision: 1,
+              status: "inProgress",
+              turnId: "turn-prev",
+              scriptId: "background-job",
+            },
+          ],
+          snapshot: null,
+        };
+
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+        });
+
+        const threadId = ThreadId.make("thread-test-3");
+        const session = yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+
+        expect(session.status).toBe("running");
+
+        const sessions = yield* adapter.listSessions();
+        const current = sessions.find((s) => s.threadId === threadId);
+        expect(current?.status).toBe("running");
+
+        mockSessionResultHistory = undefined;
+      }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "falls back to session/start when session/resume is rejected by a freshly spawned muse process",
+    () =>
+      Effect.gen(function* () {
+        mockResumeShouldFail = true;
+        mintCommandIdCounter = 0;
+
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+        });
+
+        const threadId = ThreadId.make("thread-test-4");
+        // Simulate a stored resume cursor from a previous muse serve run.
+        const staleResumeCursor = { schemaVersion: 1, sessionId: "old-session-id" };
+        const session = yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+          resumeCursor: staleResumeCursor,
+        });
+
+        // Despite the stale cursor, the session must start successfully via fallback.
+        expect(session.status).toBe("ready");
+        // The resume cursor must carry a fresh session id, not the stale one.
+        const newCursor = session.resumeCursor as { schemaVersion: number; sessionId: string };
+        expect(newCursor.schemaVersion).toBe(1);
+        expect(newCursor.sessionId).not.toBe("old-session-id");
+
+        mockResumeShouldFail = false;
+      }).pipe(Effect.provide(testLayer)),
+  );
+  it.effect("accepts items with revision 0 without failing or aborting the session", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-rev0");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+
+      // Deliver an item with initial revision 0
+      mockNotificationCallback!({
+        method: "item/started",
+        params: {
+          sessionId,
+          viewCursor: "cursor-0",
+          item: {
+            itemId: "item-rev0",
+            kind: "agentMessage",
+            revision: 0,
+            status: "inProgress",
+            turnId: "turn-rev0",
+            text: "Hello from Muse",
+          },
+        },
+      });
+
+      const sessions = yield* adapter.listSessions();
+      const current = sessions.find((s) => s.threadId === threadId);
+      // Session must not have crashed with "Muse Code sent an invalid notification"
+      expect(current?.lastError).toBeUndefined();
+      expect(current?.status).toBe("ready");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("supports multiple consecutive turns without hanging or getting stuck in running", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-multi-turn");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+
+      // --- Turn 1 ---
+      const turn1 = yield* adapter.sendTurn({
+        threadId,
+        input: "First user message",
+      });
+      expect(turn1.turnId).toBeDefined();
+
+      let sessions = yield* adapter.listSessions();
+      let current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("running");
+      expect(current?.activeTurnId).toBe(turn1.turnId);
+
+      // Turn 1 notifications
+      mockNotificationCallback!({
+        method: "turn/started",
+        params: {
+          sessionId,
+          viewCursor: "cursor-1-start",
+          turnId: turn1.turnId,
+        },
+      });
+      mockNotificationCallback!({
+        method: "item/started",
+        params: {
+          sessionId,
+          viewCursor: "cursor-1-item",
+          item: {
+            itemId: "item-t1-1",
+            kind: "agentMessage",
+            revision: 0,
+            status: "inProgress",
+            turnId: turn1.turnId,
+          },
+        },
+      });
+      mockNotificationCallback!({
+        method: "item/completed",
+        params: {
+          sessionId,
+          viewCursor: "cursor-1-item-done",
+          item: {
+            itemId: "item-t1-1",
+            kind: "agentMessage",
+            revision: 1,
+            status: "completed",
+            turnId: turn1.turnId,
+          },
+        },
+      });
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: "cursor-1-done",
+          turnId: turn1.turnId,
+          terminal: "completed",
+        },
+      });
+
+      sessions = yield* adapter.listSessions();
+      current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("ready");
+      expect(current?.activeTurnId).toBeUndefined();
+
+      // --- Turn 2 ---
+      const turn2 = yield* adapter.sendTurn({
+        threadId,
+        input: "Second user message after making changes",
+      });
+      expect(turn2.turnId).toBeDefined();
+      expect(turn2.turnId).not.toBe(turn1.turnId);
+
+      sessions = yield* adapter.listSessions();
+      current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("running");
+      expect(current?.activeTurnId).toBe(turn2.turnId);
+
+      // Turn 2 notifications
+      mockNotificationCallback!({
+        method: "turn/started",
+        params: {
+          sessionId,
+          viewCursor: "cursor-2-start",
+          turnId: turn2.turnId,
+        },
+      });
+      mockNotificationCallback!({
+        method: "item/started",
+        params: {
+          sessionId,
+          viewCursor: "cursor-2-item",
+          item: {
+            itemId: "item-t2-1",
+            kind: "workflow",
+            revision: 0,
+            status: "inProgress",
+            turnId: turn2.turnId,
+          },
+        },
+      });
+      mockNotificationCallback!({
+        method: "item/completed",
+        params: {
+          sessionId,
+          viewCursor: "cursor-2-item-done",
+          item: {
+            itemId: "item-t2-1",
+            kind: "workflow",
+            revision: 1,
+            status: "completed",
+            turnId: turn2.turnId,
+          },
+        },
+      });
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: "cursor-2-done",
+          turnId: turn2.turnId,
+          terminal: "completed",
+        },
+      });
+
+      sessions = yield* adapter.listSessions();
+      current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("ready");
+      expect(current?.activeTurnId).toBeUndefined();
+    }).pipe(Effect.provide(testLayer)),
+  );
+});
+
+describe("MuseAdapter path and symlink utilities", () => {
+  it("compares paths equivalently across slashes and Windows drive casing", () => {
+    expect(MuseAdapter.arePathsEquivalent("z:\\Workspaces\\t3code", "Z:\\Workspaces\\t3code")).toBe(
+      true,
+    );
+    expect(MuseAdapter.arePathsEquivalent("Z:/Workspaces/t3code", "Z:\\Workspaces\\t3code")).toBe(
+      true,
+    );
+    expect(MuseAdapter.arePathsEquivalent("z:/Workspaces/t3code", "Z:\\Workspaces\\t3code")).toBe(
+      true,
+    );
+    expect(MuseAdapter.arePathsEquivalent("Z:\\other", "Z:\\Workspaces\\t3code")).toBe(false);
+  });
+
+  it("heals broken git symlink files into directory junctions on Windows", async () => {
+    if (process.platform !== "win32") return;
+    const tempDir = await NodeFSP.mkdtemp(
+      NodePath.join(process.env.TEMP || "C:\\Temp", "t3-symlink-test-"),
+    );
+    try {
+      const agentsSkillsDir = NodePath.join(tempDir, ".agents", "skills");
+      await NodeFSP.mkdir(agentsSkillsDir, { recursive: true });
+      await NodeFSP.writeFile(NodePath.join(agentsSkillsDir, "test-skill.md"), "skill", "utf8");
+
+      const claudeDir = NodePath.join(tempDir, ".claude");
+      await NodeFSP.mkdir(claudeDir, { recursive: true });
+      const claudeSkillsFile = NodePath.join(claudeDir, "skills");
+      await NodeFSP.writeFile(claudeSkillsFile, "../.agents/skills", "utf8");
+
+      const statBefore = await NodeFSP.lstat(claudeSkillsFile);
+      expect(statBefore.isFile()).toBe(true);
+
+      await MuseAdapter.healWindowsSkillSymlinks(tempDir);
+
+      const statAfter = await NodeFSP.stat(claudeSkillsFile);
+      expect(statAfter.isDirectory()).toBe(true);
+      const lstatAfter = await NodeFSP.lstat(claudeSkillsFile);
+      expect(lstatAfter.isSymbolicLink()).toBe(true);
+      const readContent = await NodeFSP.readFile(
+        NodePath.join(claudeSkillsFile, "test-skill.md"),
+        "utf8",
+      );
+      expect(readContent).toBe("skill");
+    } finally {
+      await NodeFSP.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it.effect("preserves underlying error details when session/start fails", () =>
+    Effect.gen(function* () {
+      const errorDetail =
+        "failed to read skill file: The directory name is invalid. (os error 267)";
+      mockStartShouldFail = errorDetail;
+
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-error");
+      const exit = yield* Effect.exit(
+        adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        }),
+      );
+
+      expect(exit._tag).toBe("Failure");
+      if (exit._tag === "Failure") {
+        const failure = exit.cause;
+        expect(String(failure)).toContain(errorDetail);
+      }
+
+      mockStartShouldFail = false;
+    }).pipe(Effect.provide(testLayer)),
+  );
+});

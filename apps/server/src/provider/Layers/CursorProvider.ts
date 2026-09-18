@@ -975,7 +975,7 @@ const runCursorCommand = (
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const spawnCommand = yield* resolveSpawnCommand(
-      cursorSettings.binaryPath,
+      cursorSettings.binaryPath.trim() || "cursor-agent",
       args,
       environment ? { env: environment } : {},
     );

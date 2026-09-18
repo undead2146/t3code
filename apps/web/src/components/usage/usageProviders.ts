@@ -1,6 +1,15 @@
 import type { UsageProviderKind } from "@t3tools/contracts";
 
-import { AntigravityIcon, ClaudeAI, GrokIcon, type Icon, MetaIcon, OpenAI } from "../Icons";
+import {
+  AntigravityIcon,
+  ClaudeAI,
+  CursorIcon,
+  GrokIcon,
+  type Icon,
+  MetaIcon,
+  OpenAI,
+  OpenCodeIcon,
+} from "../Icons";
 
 type UsageProviderPresentation = {
   readonly label: string;
@@ -29,6 +38,16 @@ export const PROVIDER_PRESENTATION = {
     // Contrast-aware neutral between the Codex series and muted chart chrome.
     color: "color-mix(in oklab, var(--contrast-foreground) 72%, var(--background))",
     mark: GrokIcon,
+  },
+  cursor: {
+    label: "Cursor",
+    color: "#8b8b8b",
+    mark: CursorIcon,
+  },
+  opencode: {
+    label: "OpenCode",
+    color: "#5b9bbd",
+    mark: OpenCodeIcon,
   },
   antigravity: {
     label: "Antigravity",

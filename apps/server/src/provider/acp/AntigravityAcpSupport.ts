@@ -67,7 +67,7 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
       authMethodId: input.authMethod ?? "oauth-personal",
       resumeMethod: "resume",
       cancelBehavior: "wait-for-prompt",
-      cancelTimeout: Duration.seconds(5),
+      cancelTimeout: Duration.seconds(15),
       clientCapabilities: {
         fs: {
           readTextFile: input.clientFileSystem === true,

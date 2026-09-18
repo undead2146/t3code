@@ -536,8 +536,7 @@ export async function fetchAntigravityLiveQuota(
 
   // In automated vitest runs, avoid blocking live outbound HTTP requests unless explicitly requested
   if (process.env.VITEST && !process.env.ANTIGRAVITY_LIVE_TEST) {
-    const disk = readDiskQuotaCache();
-    return disk ? parseAntigravityQuotaPayload(disk) : (inMemoryLiveQuotaCache?.data ?? null);
+    return inMemoryLiveQuotaCache?.data ?? null;
   }
 
   // Helper to query Google Cloud Code quota endpoints

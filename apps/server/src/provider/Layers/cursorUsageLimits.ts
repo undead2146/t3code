@@ -10,9 +10,11 @@
  * - Content-Type: application/json
  * - Connect-Protocol-Version: 1
  *
- * Two windows are tracked:
- * 1. "Included in Pro" (id: "cursor_pro_included", kind: "monthly")
- * 2. "On-Demand" (id: "cursor_on_demand", kind: "other")
+ * Windows tracked:
+ * - "Cursor Models" (id: "cursor_models", kind: "monthly")
+ * - "Other Models" (id: "cursor_other_models", kind: "monthly")
+ * - "Included in Pro" (id: "cursor_pro_included", kind: "monthly") [fallback if single aggregate]
+ * - "On-Demand" (id: "cursor_on_demand", kind: "other") [only if spendLimit configured]
  */
 
 import * as NodeFS from "node:fs";
@@ -43,6 +45,7 @@ export interface CursorPeriodUsageDetails {
 export interface CursorPlanUsage {
   readonly totalSpend?: number;
   readonly includedSpend?: number;
+  readonly bonusSpend?: number;
   readonly remaining?: number;
   readonly limit?: number;
   readonly remainingBonus?: boolean;
@@ -90,6 +93,8 @@ export interface CursorCurrentPeriodUsageResponse {
 }
 
 export const CURSOR_WINDOW_IDS = {
+  CURSOR_MODELS: "cursor_models",
+  OTHER_MODELS: "cursor_other_models",
   PRO_INCLUDED: "cursor_pro_included",
   ON_DEMAND: "cursor_on_demand",
 } as const;
@@ -117,46 +122,48 @@ export function findCursorAuthToken(env?: NodeJS.ProcessEnv): string | null {
   const envToken =
     env?.CURSOR_AUTH_TOKEN ||
     env?.CURSOR_AGENT_AUTH_TOKEN ||
-    process.env.CURSOR_AUTH_TOKEN ||
-    process.env.CURSOR_AGENT_AUTH_TOKEN;
-  if (envToken && envToken.trim()) {
+    env?.CURSOR_API_KEY ||
+    env?.CURSOR_TOKEN;
+  if (envToken?.trim()) {
     return envToken.trim();
   }
 
-  const homedir = NodeOS.homedir();
+  // Check local Cursor auth storage:
+  // Windows: %APPDATA%/Cursor/auth.json
+  // macOS: ~/Library/Application Support/Cursor/auth.json
+  // Linux: ~/.config/Cursor/auth.json
+  const homeDir = NodeOS.homedir();
+  const platform = process.platform;
+
   const candidatePaths: string[] = [];
 
-  if (process.platform === "win32") {
-    const appData = env?.APPDATA || process.env.APPDATA;
-    if (appData) {
-      candidatePaths.push(NodePath.join(appData, "Cursor", "auth.json"));
-    }
-    candidatePaths.push(NodePath.join(homedir, "AppData", "Roaming", "Cursor", "auth.json"));
-  } else if (process.platform === "darwin") {
-    candidatePaths.push(NodePath.join(homedir, ".cursor", "auth.json"));
+  if (platform === "win32") {
+    const appData = env?.APPDATA || NodePath.join(homeDir, "AppData", "Roaming");
+    candidatePaths.push(NodePath.join(appData, "Cursor", "auth.json"));
+  } else if (platform === "darwin") {
     candidatePaths.push(
-      NodePath.join(homedir, "Library", "Application Support", "Cursor", "auth.json"),
+      NodePath.join(homeDir, "Library", "Application Support", "Cursor", "auth.json"),
     );
   } else {
-    const xdgConfig = env?.XDG_CONFIG_HOME || process.env.XDG_CONFIG_HOME;
-    if (xdgConfig) {
-      candidatePaths.push(NodePath.join(xdgConfig, "cursor", "auth.json"));
-    }
-    candidatePaths.push(NodePath.join(homedir, ".config", "cursor", "auth.json"));
-    candidatePaths.push(NodePath.join(homedir, ".cursor", "auth.json"));
+    const configDir = env?.XDG_CONFIG_HOME || NodePath.join(homeDir, ".config");
+    candidatePaths.push(NodePath.join(configDir, "Cursor", "auth.json"));
   }
 
-  for (const p of candidatePaths) {
+  // Also check ~/.cursor/auth.json as a fallback across platforms
+  candidatePaths.push(NodePath.join(homeDir, ".cursor", "auth.json"));
+
+  for (const filePath of candidatePaths) {
     try {
-      if (NodeFS.existsSync(p)) {
-        const raw = NodeFS.readFileSync(p, "utf8");
+      if (NodeFS.existsSync(filePath)) {
+        const raw = NodeFS.readFileSync(filePath, "utf-8");
         const parsed = JSON.parse(raw);
-        if (typeof parsed?.accessToken === "string" && parsed.accessToken.trim()) {
-          return parsed.accessToken.trim();
+        const token = parsed?.accessToken || parsed?.token || parsed?.auth_token || parsed?.apiKey;
+        if (typeof token === "string" && token.trim()) {
+          return token.trim();
         }
       }
     } catch {
-      // Continue to next candidate
+      // Ignore read/parse errors and check next candidate
     }
   }
 
@@ -164,33 +171,31 @@ export function findCursorAuthToken(env?: NodeJS.ProcessEnv): string | null {
 }
 
 /**
- * Calls Cursor's DashboardService.GetCurrentPeriodUsage over Connect-RPC.
+ * Queries the Cursor usage endpoint using Connect-RPC protocol.
  */
 export async function fetchCursorCurrentPeriodUsage(
-  token: string,
+  accessToken: string,
   options?: {
-    readonly endpoint?: string;
-    readonly timeoutMs?: number;
     readonly fetchImpl?: typeof fetch;
+    readonly endpoint?: string;
   },
 ): Promise<CursorCurrentPeriodUsageResponse | null> {
+  const fetchFn = options?.fetchImpl ?? globalThis.fetch;
   const endpoint = options?.endpoint ?? CURSOR_DEFAULT_ENDPOINT;
-  const timeoutMs = options?.timeoutMs ?? 5_000;
-  const fetcher = options?.fetchImpl ?? fetch;
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  if (typeof fetchFn !== "function") {
+    return null;
+  }
 
   try {
-    const response = await fetcher(endpoint, {
+    const response = await fetchFn(endpoint, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
         "Connect-Protocol-Version": "1",
       },
-      body: JSON.stringify({}),
-      signal: controller.signal,
+      body: "{}",
     });
 
     if (!response.ok) {
@@ -201,38 +206,42 @@ export async function fetchCursorCurrentPeriodUsage(
     return data;
   } catch {
     return null;
-  } finally {
-    clearTimeout(timeoutId);
   }
-}
-
-function parseTimestampToMs(val: unknown): number | null {
-  if (val === undefined || val === null) return null;
-  if (typeof val === "number") {
-    return Number.isFinite(val) ? val : null;
-  }
-  if (typeof val === "string") {
-    const trimmed = val.trim();
-    if (!trimmed) return null;
-    if (/^\d+$/.test(trimmed)) {
-      const n = Number(trimmed);
-      return Number.isFinite(n) ? n : null;
-    }
-    const ms = Date.parse(trimmed);
-    return Number.isNaN(ms) ? null : ms;
-  }
-  return null;
-}
-
-function parseTimestampToIso(val: unknown): string | undefined {
-  const ms = parseTimestampToMs(val);
-  if (ms === null) return undefined;
-  const d = new Date(ms);
-  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
 }
 
 /**
- * Computes ServerProviderUsageLimits from Cursor CurrentPeriodUsageResponse.
+ * Parses timestamp from string or number to milliseconds since epoch.
+ */
+function parseTimestampToMs(val: string | number | undefined): number | null {
+  if (val === undefined || val === null) return null;
+  if (typeof val === "number") {
+    // If it's in seconds (e.g. 1789245529), convert to ms
+    return val < 1e11 ? val * 1000 : val;
+  }
+  const str = val.trim();
+  const num = Number(str);
+  if (!Number.isNaN(num)) {
+    return num < 1e11 ? num * 1000 : num;
+  }
+  const parsedDate = Date.parse(str);
+  return Number.isNaN(parsedDate) ? null : parsedDate;
+}
+
+/**
+ * Converts timestamp to ISO 8601 string.
+ */
+function parseTimestampToIso(val: string | number | undefined): string | undefined {
+  const ms = parseTimestampToMs(val);
+  if (ms === null || !Number.isFinite(ms)) return undefined;
+  try {
+    return new Date(ms).toISOString();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Transforms Cursor API quota response into T3 Code ServerProviderUsageLimits.
  */
 export function makeCursorUsageLimits(input: {
   readonly quota: CursorCurrentPeriodUsageResponse | null;
@@ -264,39 +273,89 @@ export function makeCursorUsageLimits(input: {
     }
   }
 
-  // 1. "Included in Pro" window
   const planUsage = quota.planUsage;
-  const includedSpend = planUsage?.includedSpend ?? quota.includedSpend ?? 0;
-  const standardLimit =
-    planUsage?.limit ??
-    quota.standardCreditLimit ??
-    (quota.limit !== undefined && quota.limit > 0 ? quota.limit : 2000);
 
-  let proUsedPercent = 0;
-  if (standardLimit > 0) {
-    proUsedPercent = clampPercent((includedSpend / standardLimit) * 100);
+  const hasDistinctModelBuckets =
+    (typeof planUsage?.autoPercentUsed === "number" &&
+      Number.isFinite(planUsage.autoPercentUsed)) ||
+    (typeof planUsage?.apiPercentUsed === "number" && Number.isFinite(planUsage.apiPercentUsed));
+
+  if (hasDistinctModelBuckets) {
+    // 1. Cursor Models (Cursor Grok, Composer, auto models)
+    if (
+      typeof planUsage?.autoPercentUsed === "number" &&
+      Number.isFinite(planUsage.autoPercentUsed)
+    ) {
+      windows.push({
+        id: CURSOR_WINDOW_IDS.CURSOR_MODELS,
+        kind: "monthly",
+        label: "Cursor Models",
+        usedPercent: clampPercent(planUsage.autoPercentUsed),
+        ...(resetsAt ? { resetsAt } : {}),
+        ...(windowDurationMins ? { windowDurationMins } : {}),
+      });
+    }
+
+    // 2. Other Models (named models, API models)
+    if (
+      typeof planUsage?.apiPercentUsed === "number" &&
+      Number.isFinite(planUsage.apiPercentUsed)
+    ) {
+      windows.push({
+        id: CURSOR_WINDOW_IDS.OTHER_MODELS,
+        kind: "monthly",
+        label: "Other Models",
+        usedPercent: clampPercent(planUsage.apiPercentUsed),
+        ...(resetsAt ? { resetsAt } : {}),
+        ...(windowDurationMins ? { windowDurationMins } : {}),
+      });
+    }
+  } else {
+    // Fallback: single "Included in Pro" window
+    let proUsedPercent = 0;
+    if (
+      typeof planUsage?.totalPercentUsed === "number" &&
+      Number.isFinite(planUsage.totalPercentUsed)
+    ) {
+      proUsedPercent = clampPercent(planUsage.totalPercentUsed);
+    } else if (
+      typeof planUsage?.remaining === "number" &&
+      typeof planUsage?.limit === "number" &&
+      planUsage.limit > 0
+    ) {
+      proUsedPercent = clampPercent(
+        ((planUsage.limit - planUsage.remaining) / planUsage.limit) * 100,
+      );
+    } else {
+      const includedSpend = planUsage?.includedSpend ?? quota.includedSpend ?? 0;
+      const standardLimit =
+        planUsage?.limit ??
+        quota.standardCreditLimit ??
+        (quota.limit !== undefined && quota.limit > 0 ? quota.limit : 2000);
+
+      if (standardLimit > 0) {
+        proUsedPercent = clampPercent((includedSpend / standardLimit) * 100);
+      }
+    }
+
+    windows.push({
+      id: CURSOR_WINDOW_IDS.PRO_INCLUDED,
+      kind: "monthly",
+      label: "Included in Pro",
+      usedPercent: proUsedPercent,
+      ...(resetsAt ? { resetsAt } : {}),
+      ...(windowDurationMins ? { windowDurationMins } : {}),
+    });
   }
 
-  windows.push({
-    id: CURSOR_WINDOW_IDS.PRO_INCLUDED,
-    kind: "monthly",
-    label: "Included in Pro",
-    usedPercent: proUsedPercent,
-    ...(resetsAt ? { resetsAt } : {}),
-    ...(windowDurationMins ? { windowDurationMins } : {}),
-  });
-
-  // 2. "On-Demand" usage window
+  // 3. "On-Demand" usage window (only present if onDemandLimit is configured and > 0)
   const spendLimitUsage = quota.spendLimitUsage;
   const onDemandSpend =
     spendLimitUsage?.totalSpend ??
-    (spendLimitUsage?.currentSpend !== undefined
-      ? spendLimitUsage.currentSpend
-      : planUsage?.totalSpend !== undefined && planUsage?.includedSpend !== undefined
-        ? Math.max(0, planUsage.totalSpend - planUsage.includedSpend)
-        : quota.totalSpend !== undefined && quota.includedSpend !== undefined
-          ? Math.max(0, quota.totalSpend - quota.includedSpend)
-          : 0);
+    spendLimitUsage?.currentSpend ??
+    (quota.totalSpend !== undefined && quota.includedSpend !== undefined
+      ? Math.max(0, quota.totalSpend - quota.includedSpend)
+      : 0);
 
   const onDemandLimit =
     spendLimitUsage?.spendLimit ??
@@ -306,23 +365,17 @@ export function makeCursorUsageLimits(input: {
     quota.overallLimit ??
     quota.pooledLimit;
 
-  let onDemandUsedPercent = 0;
   if (onDemandLimit !== undefined && onDemandLimit > 0) {
-    onDemandUsedPercent = clampPercent((onDemandSpend / onDemandLimit) * 100);
-  } else if (onDemandSpend > 0) {
-    onDemandUsedPercent = 100;
-  } else {
-    onDemandUsedPercent = 0;
+    const onDemandUsedPercent = clampPercent((onDemandSpend / onDemandLimit) * 100);
+    windows.push({
+      id: CURSOR_WINDOW_IDS.ON_DEMAND,
+      kind: "other",
+      label: "On-Demand",
+      usedPercent: onDemandUsedPercent,
+      ...(resetsAt ? { resetsAt } : {}),
+      ...(windowDurationMins ? { windowDurationMins } : {}),
+    });
   }
-
-  windows.push({
-    id: CURSOR_WINDOW_IDS.ON_DEMAND,
-    kind: "other",
-    label: "On-Demand",
-    usedPercent: onDemandUsedPercent,
-    ...(resetsAt ? { resetsAt } : {}),
-    ...(windowDurationMins ? { windowDurationMins } : {}),
-  });
 
   return makeUsageLimits({
     checkedAt,

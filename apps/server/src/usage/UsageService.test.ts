@@ -3,10 +3,11 @@
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeSqlite from "node:sqlite";
 
 import { assert, describe, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
+import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import {
   ProviderDriverKind,
   ProviderInstanceId,
@@ -30,6 +31,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as UsageService from "./UsageService.ts";
 
 const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const encodeUnknownJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 function claudeLine(id: number, outputTokens: number, model = "claude-fable-5"): string {
   return `${JSON.stringify({
@@ -83,6 +85,7 @@ const serviceLayers = (input: {
 }) =>
   ServerConfig.layerTest(process.cwd(), { prefix: input.prefix }).pipe(
     Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(Layer.succeed(HostProcessPlatform, "linux")),
     Layer.provideMerge(ServerSettings.layerTest(input.settings)),
     Layer.provideMerge(
       Layer.succeed(
@@ -100,6 +103,11 @@ const serviceLayers = (input: {
     Layer.provideMerge(
       Layer.succeed(HostProcessEnvironment, {
         GROK_HOME: NodePath.join(input.home, "grok"),
+        MUSE_HOME: NodePath.join(input.home, "muse"),
+        OPENCODE_DATA_DIR: NodePath.join(input.home, "opencode"),
+        ANTIGRAVITY_DATA_DIR: NodePath.join(input.home, "antigravity"),
+        XDG_CONFIG_HOME: NodePath.join(input.home, "config"),
+        APPDATA: NodePath.join(input.home, "config"),
         ...input.environment,
       }),
     ),
@@ -110,6 +118,66 @@ function totalOutputTokens(summary: { buckets: readonly { totals: { outputTokens
 }
 
 describe("UsageService", () => {
+  it.live(
+    "includes OpenCode history but does not substitute desktop usage for an unavailable Cursor account",
+    () =>
+      Effect.gen(function* () {
+        const { settings, home } = yield* setup;
+        const root = NodePath.join(home, "opencode");
+        const message = yield* encodeUnknownJson({
+          id: "msg_1",
+          sessionID: "session-1",
+          role: "assistant",
+          modelID: "example-model",
+          time: { created: Date.parse("2026-08-01T10:00:00Z") },
+          tokens: { input: 10, output: 5, reasoning: 2, cache: { read: 20, write: 3 } },
+        });
+        const bubble = yield* encodeUnknownJson({
+          type: 2,
+          createdAt: "2026-08-01T10:00:00Z",
+          modelInfo: { modelName: "example-model" },
+          tokenCount: { inputTokens: 100, outputTokens: 20 },
+        });
+        yield* Effect.promise(async () => {
+          const directory = NodePath.join(root, "storage", "message", "session-1");
+          await NodeFSP.mkdir(directory, { recursive: true });
+          await NodeFSP.writeFile(NodePath.join(directory, "msg_1.json"), message);
+          const desktop = NodePath.join(home, "config", "Cursor", "User", "globalStorage");
+          await NodeFSP.mkdir(desktop, { recursive: true });
+          const db = new NodeSqlite.DatabaseSync(NodePath.join(desktop, "state.vscdb"));
+          try {
+            db.exec("CREATE TABLE cursorDiskKV (key TEXT, value TEXT)");
+            db.prepare("INSERT INTO cursorDiskKV VALUES (?, ?)").run(
+              "bubbleId:session:assistant",
+              bubble,
+            );
+          } finally {
+            db.close();
+          }
+        });
+        const service = yield* UsageService.make.pipe(
+          Effect.provide(serviceLayers({ prefix: "usage-service-opencode", home, settings })),
+        );
+        const summary = yield* service.readSummary(WINDOW);
+        assert.strictEqual(summary.buckets[0]?.provider, "opencode");
+        assert.isFalse(summary.buckets.some((bucket) => bucket.provider === "cursor"));
+        assert.strictEqual(
+          summary.sources.find((source) => source.fingerprint.provider === "cursor")?.status,
+          "missing",
+        );
+        assert.strictEqual(summary.buckets[0]?.sourcePath, root);
+        assert.strictEqual(summary.buckets[0]?.totals.outputTokens, 7);
+        assert.strictEqual(
+          summary.sources.find((source) => source.fingerprint.provider === "opencode")
+            ?.distinctSessions,
+          1,
+        );
+        assert.include(
+          summary.sources.find((source) => source.fingerprint.provider === "cursor")?.message ?? "",
+          "Cursor account history needs a Cursor CLI login",
+        );
+      }).pipe(Effect.scoped),
+  );
   it.live("reads configured and disabled accounts once across shared and aliased homes", () =>
     Effect.gen(function* () {
       const { transcript, settings, home } = yield* setup;
@@ -605,5 +673,99 @@ describe("UsageService", () => {
         `interruption left the next matching request pending at scheduler check ${orphanedAt}`,
       );
     }).pipe(Effect.scoped),
+  );
+
+  it.live(
+    "discovers Muse transcript directories and aggregates Muse usage with catalog pricing",
+    () =>
+      Effect.gen(function* () {
+        const { settings, home } = yield* setup;
+        const museHome = NodePath.join(home, "muse");
+        const sessionDir = NodePath.join(
+          museHome,
+          "sessions",
+          "2026",
+          "08",
+          "01",
+          "session-test-1",
+        );
+        const catalogDir = NodePath.join(museHome, "model-catalog");
+        yield* Effect.promise(() => NodeFSP.mkdir(sessionDir, { recursive: true }));
+        yield* Effect.promise(() => NodeFSP.mkdir(catalogDir, { recursive: true }));
+
+        const sessionFile = NodePath.join(sessionDir, "session.jsonl");
+        const configLine = encodeUnknownJsonString({
+          payload_type: "run.model.configured",
+          payload: { record: { provider_id: "meta", run_stream: { id: "run-1" } } },
+        });
+        const eventLine = encodeUnknownJsonString({
+          payload_type: "runtime.session",
+          recorded_at: 1_785_585_600_000_000,
+          stream: { kind: "session", id: "session-test-1" },
+          payload: {
+            run_id: "run-1",
+            source_run_record_id: "completion-1",
+            event: {
+              kind: "model_completed",
+              model: "example-muse",
+              usage: {
+                input_tokens: 1_000,
+                cached_tokens: 200,
+                cache_read_tokens: 200,
+                output_tokens: 500,
+              },
+            },
+          },
+        });
+        yield* Effect.promise(() =>
+          NodeFSP.writeFile(sessionFile, `${configLine}\n${eventLine}\n`),
+        );
+
+        const catalogFile = NodePath.join(catalogDir, "meta.json");
+        const catalogContent = encodeUnknownJsonString({
+          source: "provider_catalog",
+          rows: [
+            {
+              model_id: "example-muse",
+              cost: { currency: "USD", input: "2", output: "8", cached: "0.5" },
+            },
+          ],
+        });
+        yield* Effect.promise(() => NodeFSP.writeFile(catalogFile, catalogContent));
+
+        const service = yield* UsageService.make.pipe(
+          Effect.provide(
+            serviceLayers({
+              prefix: "usage-service-muse-test",
+              home,
+              settings: {
+                ...settings,
+                providerInstances: {
+                  [ProviderInstanceId.make("muse-instance")]: {
+                    driver: ProviderDriverKind.make("muse"),
+                    environment: [{ name: "MUSE_HOME", value: museHome, sensitive: false }],
+                  },
+                },
+              },
+            }),
+          ),
+        );
+
+        const summary = yield* service.readSummary(WINDOW);
+        const museSources = summary.sources.filter(
+          (s) => s.fingerprint.provider === "muse" && s.status === "ok",
+        );
+        assert.strictEqual(museSources.length, 1);
+        assert.strictEqual(museSources[0]?.scannedFiles, 1);
+        assert.strictEqual(museSources[0]?.distinctSessions, 1);
+
+        const bucket = summary.buckets.find((b) => b.totals.outputTokens === 500);
+        assert.isDefined(bucket);
+        assert.strictEqual(bucket?.totals.uncachedInputTokens, 800);
+        assert.strictEqual(bucket?.totals.cachedInputTokens, 200);
+        assert.strictEqual(bucket?.totals.outputTokens, 500);
+        assert.isNotNull(bucket?.costUsd);
+        assert.isTrue(summary.pricing.source?.includes("Muse provider catalog"));
+      }).pipe(Effect.scoped),
   );
 });

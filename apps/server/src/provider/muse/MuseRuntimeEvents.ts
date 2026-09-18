@@ -4,6 +4,7 @@ import {
   ProviderDriverKind,
   RuntimeItemId,
   RuntimeRequestId,
+  RuntimeTaskId,
   TurnId,
   type CanonicalItemType,
   type CanonicalRequestType,
@@ -21,7 +22,7 @@ const identity = { sessionId: Schema.String, viewCursor: Schema.String };
 export const MuseItem = Schema.Struct({
   itemId: Schema.String,
   kind: Schema.String,
-  revision: PositiveInt,
+  revision: NonNegativeInt,
   status: Schema.String,
   turnId: Schema.optional(Schema.NullOr(Schema.String)),
   text: optionalString,
@@ -35,6 +36,20 @@ export const MuseItem = Schema.Struct({
   outcome: optionalString,
   tokensBefore: Schema.optional(NonNegativeInt),
   tokensAfter: Schema.optional(NonNegativeInt),
+  scriptId: optionalString,
+  entryId: optionalString,
+  workflowRunId: optionalString,
+  scriptPath: optionalString,
+  message: optionalString,
+  triggerSource: optionalString,
+  resumeFromRunId: optionalString,
+  role: optionalString,
+  objective: optionalString,
+  subagentId: optionalString,
+  reminderAgentId: optionalString,
+  childSessionId: optionalString,
+  taskId: optionalString,
+  generationId: Schema.optional(NonNegativeInt),
 });
 export type MuseItem = typeof MuseItem.Type;
 
@@ -251,6 +266,28 @@ export function museApprovalDecision(
   }
 }
 
+function itemTitle(item: MuseItem): string | undefined {
+  if (item.tool) {
+    return item.tool === "read_file" ? "Read file" : item.tool;
+  }
+  if (item.kind === "workflow") {
+    if (item.scriptId) return `Workflow: ${item.scriptId}`;
+    if (item.entryId) return `Workflow: ${item.entryId}`;
+    if (item.workflowRunId) return `Workflow: ${item.workflowRunId}`;
+    return "Workflow";
+  }
+  if (item.kind === "subagent") {
+    if (item.role) return `Subagent: ${item.role}`;
+    if (item.objective) return `Subagent: ${item.objective}`;
+    return "Subagent task";
+  }
+  if (item.kind === "reminderChild") {
+    if (item.reminderAgentId) return `Reminder: ${item.reminderAgentId}`;
+    return "Reminder";
+  }
+  return undefined;
+}
+
 function itemType(item: MuseItem): CanonicalItemType {
   switch (item.kind) {
     case "userMessage":
@@ -264,6 +301,8 @@ function itemType(item: MuseItem): CanonicalItemType {
     case "toolCall":
       return "dynamic_tool_call";
     case "subagent":
+    case "workflow":
+    case "reminderChild":
       return "collab_agent_tool_call";
     case "compaction":
       return "context_compaction";
@@ -335,8 +374,10 @@ export function mapMuseNotification(
             : item.status === "rejected"
               ? "declined"
               : "failed";
+      const title = itemTitle(item);
       const detail =
         item.text ||
+        item.message ||
         item.summary?.join("\n") ||
         item.visibleOutput ||
         item.failureReason ||
@@ -362,7 +403,7 @@ export function mapMuseNotification(
           payload: {
             itemType: itemType(item),
             status,
-            ...(item.tool ? { title: item.tool === "read_file" ? "Read file" : item.tool } : {}),
+            ...(title ? { title } : {}),
             ...(detail ? { detail } : {}),
             data: {
               ...item,
@@ -374,6 +415,70 @@ export function mapMuseNotification(
           },
         },
       ];
+      if (item.kind === "workflow" || item.kind === "subagent") {
+        const taskId = RuntimeTaskId.make(item.itemId);
+        if (type === "item.started") {
+          result.push({
+            ...base,
+            eventId: context.nextEventId(),
+            type: "task.started",
+            itemId: RuntimeItemId.make(item.itemId),
+            ...(item.turnId ? { turnId: TurnId.make(item.turnId) } : {}),
+            ...(item.turnId === null ? { turnId: undefined } : {}),
+            payload: {
+              taskId,
+              taskType: item.kind === "workflow" ? "local_workflow" : "subagent",
+              title: title ?? (item.kind === "workflow" ? "Workflow" : "Subagent"),
+              description: detail || title || (item.kind === "workflow" ? "Workflow" : "Subagent"),
+              ...(item.kind === "subagent" && item.role ? { role: item.role } : {}),
+              ...(item.kind === "workflow" && (item.entryId || item.scriptId)
+                ? { workflowName: item.entryId || item.scriptId }
+                : {}),
+              ...(item.workflowRunId || item.scriptPath
+                ? {
+                    runHandles: {
+                      ...(item.workflowRunId ? { runId: item.workflowRunId } : {}),
+                      ...(item.scriptPath ? { scriptPath: item.scriptPath } : {}),
+                    },
+                  }
+                : {}),
+            },
+          });
+        } else if (type === "item.updated") {
+          result.push({
+            ...base,
+            eventId: context.nextEventId(),
+            type: "task.updated",
+            itemId: RuntimeItemId.make(item.itemId),
+            ...(item.turnId ? { turnId: TurnId.make(item.turnId) } : {}),
+            ...(item.turnId === null ? { turnId: undefined } : {}),
+            payload: {
+              taskId,
+              status:
+                status === "inProgress"
+                  ? "running"
+                  : status === "completed"
+                    ? "completed"
+                    : "failed",
+              ...(detail ? { description: detail } : {}),
+            },
+          });
+        } else if (type === "item.completed") {
+          result.push({
+            ...base,
+            eventId: context.nextEventId(),
+            type: "task.completed",
+            itemId: RuntimeItemId.make(item.itemId),
+            ...(item.turnId ? { turnId: TurnId.make(item.turnId) } : {}),
+            ...(item.turnId === null ? { turnId: undefined } : {}),
+            payload: {
+              taskId,
+              status: status === "completed" ? "completed" : "failed",
+              ...(detail ? { summary: detail } : {}),
+            },
+          });
+        }
+      }
       // Single-shot completions can arrive without any streamed deltas.
       const textFields =
         item.kind === "agentMessage" || item.kind === "reasoning"

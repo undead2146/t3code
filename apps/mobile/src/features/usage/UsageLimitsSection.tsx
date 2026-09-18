@@ -41,7 +41,9 @@ function useBarColor(driver: Driver): string | null {
         ? "claude"
         : driver === "antigravity"
           ? "antigravity"
-          : null;
+          : driver === "muse"
+            ? "muse"
+            : null;
   return kind ? colors[kind] : null;
 }
 

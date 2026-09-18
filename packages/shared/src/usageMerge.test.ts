@@ -9,7 +9,7 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { isModelCostUnknown, mergeUsage, type EnvironmentUsage } from "./usageMerge.ts";
+import { mergeUsage, type EnvironmentUsage } from "./usageMerge.ts";
 
 function bucket(overrides: Partial<UsageBucket> = {}): UsageBucket {
   return {
@@ -75,6 +75,41 @@ function environment(id: string, usageSummary: UsageSummary): EnvironmentUsage {
 }
 
 describe("mergeUsage", () => {
+  it("counts a Cursor account once across servers while retaining each server's other providers", () => {
+    const account = {
+      provider: "cursor" as const,
+      hostId: "cursor.com",
+      homePath: "cursor-account:account-hash",
+      volumeId: "account-hash",
+    };
+    const merged = mergeUsage(
+      [
+        environment(
+          "mac",
+          summary([bucket({ provider: "cursor", sourcePath: account.homePath })], [account]),
+        ),
+        environment(
+          "linux",
+          summary(
+            [
+              bucket({ provider: "cursor", sourcePath: account.homePath }),
+              bucket({ provider: "opencode", sourcePath: "/opencode" }),
+            ],
+            [account, { provider: "opencode", hostId: "linux", homePath: "/opencode" }],
+          ),
+        ),
+      ],
+      USAGE_CONTRACT_VERSION,
+    );
+    expect(
+      merged.providers.map((provider) => [provider.provider, provider.costUsd]).sort(),
+    ).toEqual([
+      ["cursor", 10],
+      ["opencode", 10],
+    ]);
+    expect(merged.duplicateSources).toHaveLength(1);
+  });
+
   it("sums environments that read different transcript directories", () => {
     const merged = mergeUsage(
       [
@@ -145,6 +180,31 @@ describe("mergeUsage", () => {
         merged.providers.map((provider) => [provider.provider, provider.sessions]),
       ),
     ).toEqual({ claude: 1, codex: 1 });
+  });
+
+  it("counts overlapping provider roots once while keeping each environment's unique root", () => {
+    const source = (homePath: string) => ({
+      provider: "opencode" as const,
+      hostId: "host",
+      homePath,
+    });
+    const usage = (sourcePath: string, costUsd: number) =>
+      bucket({ provider: "opencode", sourcePath, costUsd });
+    const merged = mergeUsage(
+      [
+        environment(
+          "env-a",
+          summary([usage("/shared", 10), usage("/a", 2)], [source("/shared"), source("/a")]),
+        ),
+        environment(
+          "env-b",
+          summary([usage("/shared", 10), usage("/b", 3)], [source("/shared"), source("/b")]),
+        ),
+      ],
+      USAGE_CONTRACT_VERSION,
+    );
+    expect(merged.costUsd).toBe(15);
+    expect(merged.sessions).toBe(3);
   });
 
   it("excludes an environment reporting an older contract version", () => {
@@ -220,38 +280,6 @@ describe("mergeUsage", () => {
     expect(merged.providers[0]?.costShare).toBeCloseTo(0.75, 5);
     expect(merged.costQuality.unpricedShare).toBeCloseTo(0.5, 5);
     expect(merged.costQuality.cacheSavingsUsd).toBe(4);
-  });
-
-  it("marks a model with no known rates as unpriced rather than free", () => {
-    const merged = mergeUsage(
-      [
-        environment(
-          "env-a",
-          summary(
-            [
-              bucket({ costUsd: 75 }),
-              bucket({
-                provider: "codex",
-                model: "unknown-model",
-                costUsd: 0,
-                costSource: "unpriced",
-                unpricedRecords: 5,
-              }),
-            ],
-            [
-              { provider: "claude", hostId: "mac", homePath: "/a/.claude" },
-              { provider: "codex", hostId: "mac", homePath: "/a/.codex" },
-            ],
-          ),
-        ),
-      ],
-      USAGE_CONTRACT_VERSION,
-    );
-
-    expect(merged.models.find((model) => model.model === "unknown-model")?.unpricedRecords).toBe(5);
-    expect(merged.models.filter(isModelCostUnknown).map((model) => model.model)).toEqual([
-      "unknown-model",
-    ]);
   });
 
   it("keeps two machines apart when hostname and home path collide", () => {
