@@ -337,6 +337,43 @@ function requestType(subject: typeof approvalSubject.Type): CanonicalRequestType
   return "mcp_elicitation_approval";
 }
 
+// Tool-spawned children never arrive as kind="subagent" items, so the Agents
+// surface would miss them entirely. These tools are translated into the same
+// task.* lifecycle the native subagent items produce.
+const SUBAGENT_TOOL_METHODS: ReadonlySet<string> = new Set([
+  "subagent_spawn",
+  "subagent_wait",
+  "subagent_read_result",
+]);
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function parseJsonRecord(text: string | null | undefined): Record<string, unknown> | undefined {
+  if (!text) return undefined;
+  try {
+    return asRecord(JSON.parse(text));
+  } catch {
+    // Partial tool output is completed by later item updates.
+    return undefined;
+  }
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function subagentTaskTitle(input: Record<string, unknown> | undefined): string {
+  const taskName = input ? nonEmptyString(input.task_name) : undefined;
+  if (taskName) return `Subagent: ${taskName}`;
+  const role = input ? nonEmptyString(input.role) : undefined;
+  if (role) return `Subagent: ${role}`;
+  return "Subagent";
+}
+
 export interface MuseEventContext {
   readonly threadId: ThreadId;
   readonly providerInstanceId: ProviderInstanceId;
@@ -497,6 +534,103 @@ export function mapMuseNotification(
               ...(detail ? { summary: detail } : {}),
             },
           });
+        }
+      }
+      if (item.kind === "toolCall" && item.tool && SUBAGENT_TOOL_METHODS.has(item.tool)) {
+        const output = parseJsonRecord(item.visibleOutput);
+        const subagentId =
+          (input ? nonEmptyString(input.subagent_id) : undefined) ??
+          nonEmptyString(output?.subagent_id);
+        if (item.tool === "subagent_spawn" && type === "item.completed" && status === "completed") {
+          // A rejected spawn has no child; the failed tool row already shows it.
+          if (output?.status === "accepted" && subagentId) {
+            const role = input ? nonEmptyString(input.role) : undefined;
+            const objective = input ? nonEmptyString(input.objective) : undefined;
+            const agentPath = nonEmptyString(output.agent_path);
+            result.push({
+              ...base,
+              eventId: context.nextEventId(),
+              type: "task.started",
+              itemId: RuntimeItemId.make(item.itemId),
+              ...(item.turnId ? { turnId: TurnId.make(item.turnId) } : {}),
+              ...(item.turnId === null ? { turnId: undefined } : {}),
+              payload: {
+                taskId: RuntimeTaskId.make(subagentId),
+                taskType: "subagent",
+                title: subagentTaskTitle(input),
+                ...(objective ? { description: objective } : {}),
+                ...(role ? { role } : {}),
+                toolUseId: item.itemId,
+                ...(agentPath ? { agentPath } : {}),
+              },
+            });
+          }
+        } else if (
+          item.tool === "subagent_wait" &&
+          type === "item.started" &&
+          subagentId !== undefined
+        ) {
+          result.push({
+            ...base,
+            eventId: context.nextEventId(),
+            type: "task.updated",
+            itemId: RuntimeItemId.make(item.itemId),
+            ...(item.turnId ? { turnId: TurnId.make(item.turnId) } : {}),
+            ...(item.turnId === null ? { turnId: undefined } : {}),
+            payload: {
+              taskId: RuntimeTaskId.make(subagentId),
+              taskType: "subagent",
+              status: "running",
+              description: "Waiting for subagent result",
+            },
+          });
+        } else if (
+          (item.tool === "subagent_wait" || item.tool === "subagent_read_result") &&
+          type === "item.completed" &&
+          subagentId !== undefined
+        ) {
+          // A wait that times out (or any unrecognized envelope) leaves the
+          // child alive; only an explicit terminal envelope settles it.
+          const envelopeStatus = nonEmptyString(output?.status);
+          const terminalStatus =
+            envelopeStatus === "ready"
+              ? ("completed" as const)
+              : envelopeStatus === "failed" || envelopeStatus === "error"
+                ? ("failed" as const)
+                : envelopeStatus === "cancelled" || envelopeStatus === "canceled"
+                  ? ("stopped" as const)
+                  : undefined;
+          const summary = nonEmptyString(output?.summary);
+          if (terminalStatus) {
+            result.push({
+              ...base,
+              eventId: context.nextEventId(),
+              type: "task.completed",
+              itemId: RuntimeItemId.make(item.itemId),
+              ...(item.turnId ? { turnId: TurnId.make(item.turnId) } : {}),
+              ...(item.turnId === null ? { turnId: undefined } : {}),
+              payload: {
+                taskId: RuntimeTaskId.make(subagentId),
+                taskType: "subagent",
+                status: terminalStatus,
+                ...(summary ? { summary } : {}),
+              },
+            });
+          } else {
+            result.push({
+              ...base,
+              eventId: context.nextEventId(),
+              type: "task.updated",
+              itemId: RuntimeItemId.make(item.itemId),
+              ...(item.turnId ? { turnId: TurnId.make(item.turnId) } : {}),
+              ...(item.turnId === null ? { turnId: undefined } : {}),
+              payload: {
+                taskId: RuntimeTaskId.make(subagentId),
+                taskType: "subagent",
+                status: "running",
+              },
+            });
+          }
         }
       }
       // Single-shot completions can arrive without any streamed deltas.

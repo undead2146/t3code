@@ -566,6 +566,104 @@ describe("MuseAdapter session lifecycle with workflow items", () => {
       expect(current?.activeTurnId).toBeUndefined();
     }).pipe(Effect.provide(testLayer)),
   );
+
+  it.effect("interruptTurn force-completes in-flight messages so they stop streaming", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-interrupt-flush");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+      const turn = yield* adapter.sendTurn({ threadId, input: "Turn with streaming output" });
+
+      mockNotificationCallback!({
+        method: "turn/started",
+        params: { sessionId, viewCursor: "cursor-start", turnId: turn.turnId },
+      });
+      mockNotificationCallback!({
+        method: "item/started",
+        params: {
+          sessionId,
+          viewCursor: "cursor-msg",
+          item: {
+            itemId: "item-msg-1",
+            kind: "agentMessage",
+            revision: 1,
+            status: "inProgress",
+            turnId: turn.turnId,
+            text: "partial output",
+          },
+        },
+      });
+      mockNotificationCallback!({
+        method: "item/started",
+        params: {
+          sessionId,
+          viewCursor: "cursor-tool",
+          item: {
+            itemId: "item-tool-1",
+            kind: "toolCall",
+            revision: 1,
+            status: "inProgress",
+            turnId: turn.turnId,
+            tool: "powershell",
+          },
+        },
+      });
+
+      const collected = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (
+            event,
+          ): event is Extract<
+            ProviderRuntimeEvent,
+            { type: "item.completed" | "turn.completed" | "session.state.changed" }
+          > =>
+            event.type === "item.completed" ||
+            event.type === "turn.completed" ||
+            event.type === "session.state.changed",
+        ),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.interruptTurn(threadId, turn.turnId);
+      const events = yield* Fiber.join(collected);
+
+      const completions = events.filter((event) => event.type === "item.completed");
+      expect(completions).toHaveLength(2);
+      for (const event of completions) {
+        if (event.type === "item.completed") {
+          // Valid RuntimeItemStatus: ingestion finalizes streaming messages off this.
+          expect(event.payload.status).toBe("completed");
+        }
+      }
+      expect(
+        completions
+          .map((event) => (event.type === "item.completed" ? event.payload.itemType : null))
+          .sort(),
+      ).toEqual(["assistant_message", "dynamic_tool_call"]);
+
+      const turnCompleted = events.find((event) => event.type === "turn.completed");
+      expect(turnCompleted?.type).toBe("turn.completed");
+      if (turnCompleted?.type === "turn.completed") {
+        expect(turnCompleted.payload.state).toBe("cancelled");
+      }
+      const sessionChanged = events.find((event) => event.type === "session.state.changed");
+      expect(sessionChanged?.type).toBe("session.state.changed");
+      if (sessionChanged?.type === "session.state.changed") {
+        expect(sessionChanged.payload.state).toBe("ready");
+      }
+    }).pipe(Effect.provide(testLayer)),
+  );
 });
 
 const TRUNCATED_RETRY_REASON =

@@ -361,6 +361,172 @@ describe("MuseRuntimeEvents", () => {
     });
   });
 
+  describe("tool-spawned subagent mapping", () => {
+    const spawnArgs = JSON.stringify({
+      command_id: "review-001",
+      objective: "Review the auth module",
+      role: "Reviewer",
+      task_name: "auth-review",
+    });
+    const acceptedOutput = JSON.stringify({
+      status: "accepted",
+      subagent_id: "sub-child-1",
+      agent_path: "main/auth-review/10",
+      task_ref: "task/abc#0",
+    });
+
+    function toolItem(method: "item/started" | "item/completed", item: Record<string, unknown>) {
+      return {
+        method,
+        params: {
+          sessionId: "sess-1",
+          viewCursor: "cur-sub",
+          item: {
+            itemId: "tool-1",
+            kind: "toolCall",
+            revision: method === "item/started" ? NonNegativeInt.make(1) : NonNegativeInt.make(2),
+            status: method === "item/started" ? "inProgress" : "completed",
+            turnId: "turn-1",
+            ...item,
+          },
+        },
+      };
+    }
+
+    it("maps an accepted spawn to task.started with the child identity", () => {
+      const decoded = decodeMuseNotification(
+        toolItem("item/completed", {
+          tool: "subagent_spawn",
+          args: spawnArgs,
+          visibleOutput: acceptedOutput,
+        }),
+      );
+      const events = mapMuseNotification(decoded, createMockContext());
+      expect(events).toHaveLength(2);
+      expect(events[0]?.type).toBe("item.completed");
+
+      const taskEvent = events[1];
+      expect(taskEvent?.type).toBe("task.started");
+      if (taskEvent?.type === "task.started") {
+        expect(taskEvent.payload.taskId).toBe("sub-child-1");
+        expect(taskEvent.payload.taskType).toBe("subagent");
+        expect(taskEvent.payload.title).toBe("Subagent: auth-review");
+        expect(taskEvent.payload.description).toBe("Review the auth module");
+        expect(taskEvent.payload.role).toBe("Reviewer");
+        expect(taskEvent.payload.toolUseId).toBe("tool-1");
+        expect(taskEvent.payload.agentPath).toBe("main/auth-review/10");
+        expect(taskEvent.turnId).toBe("turn-1");
+      }
+    });
+
+    it("emits no task event for spawn started or rejected spawns", () => {
+      const started = mapMuseNotification(
+        decodeMuseNotification(
+          toolItem("item/started", { tool: "subagent_spawn", args: spawnArgs }),
+        ),
+        createMockContext(),
+      );
+      expect(started.map((event) => event.type)).toEqual(["item.started"]);
+
+      const rejected = mapMuseNotification(
+        decodeMuseNotification(
+          toolItem("item/completed", {
+            tool: "subagent_spawn",
+            args: spawnArgs,
+            visibleOutput: JSON.stringify({ status: "rejected", reason: "busy" }),
+          }),
+        ),
+        createMockContext(),
+      );
+      expect(rejected.map((event) => event.type)).toEqual(["item.completed"]);
+    });
+
+    it("maps wait started to task.updated running", () => {
+      const decoded = decodeMuseNotification(
+        toolItem("item/started", {
+          tool: "subagent_wait",
+          args: JSON.stringify({ command_id: "wait-1", subagent_id: "sub-child-1" }),
+        }),
+      );
+      const events = mapMuseNotification(decoded, createMockContext());
+      expect(events).toHaveLength(2);
+      const taskEvent = events[1];
+      expect(taskEvent?.type).toBe("task.updated");
+      if (taskEvent?.type === "task.updated") {
+        expect(taskEvent.payload.taskId).toBe("sub-child-1");
+        expect(taskEvent.payload.taskType).toBe("subagent");
+        expect(taskEvent.payload.status).toBe("running");
+      }
+    });
+
+    it("maps a ready wait result to task.completed with the summary", () => {
+      const decoded = decodeMuseNotification(
+        toolItem("item/completed", {
+          tool: "subagent_wait",
+          args: JSON.stringify({ command_id: "wait-1", subagent_id: "sub-child-1" }),
+          visibleOutput: JSON.stringify({
+            status: "ready",
+            subagent_id: "sub-child-1",
+            summary: "Found 3 issues",
+          }),
+        }),
+      );
+      const events = mapMuseNotification(decoded, createMockContext());
+      expect(events).toHaveLength(2);
+      const taskEvent = events[1];
+      expect(taskEvent?.type).toBe("task.completed");
+      if (taskEvent?.type === "task.completed") {
+        expect(taskEvent.payload.taskId).toBe("sub-child-1");
+        expect(taskEvent.payload.status).toBe("completed");
+        expect(taskEvent.payload.summary).toBe("Found 3 issues");
+      }
+    });
+
+    it("keeps the child running when a wait times out", () => {
+      const decoded = decodeMuseNotification(
+        toolItem("item/completed", {
+          tool: "subagent_wait",
+          args: JSON.stringify({ command_id: "wait-1", subagent_id: "sub-child-1" }),
+          visibleOutput: JSON.stringify({ status: "timeout", subagent_id: "sub-child-1" }),
+        }),
+      );
+      const events = mapMuseNotification(decoded, createMockContext());
+      expect(events).toHaveLength(2);
+      const taskEvent = events[1];
+      expect(taskEvent?.type).toBe("task.updated");
+      if (taskEvent?.type === "task.updated") {
+        expect(taskEvent.payload.taskId).toBe("sub-child-1");
+        expect(taskEvent.payload.status).toBe("running");
+      }
+    });
+
+    it("maps read_result envelopes to terminal task states", () => {
+      const readResult = (output: Record<string, unknown>) =>
+        mapMuseNotification(
+          decodeMuseNotification(
+            toolItem("item/completed", {
+              tool: "subagent_read_result",
+              args: JSON.stringify({ subagent_id: "sub-child-1" }),
+              visibleOutput: JSON.stringify(output),
+            }),
+          ),
+          createMockContext(),
+        );
+
+      const completed = readResult({ status: "ready", summary: "done" })[1];
+      expect(completed?.type).toBe("task.completed");
+      if (completed?.type === "task.completed") {
+        expect(completed.payload.status).toBe("completed");
+      }
+
+      const failed = readResult({ status: "failed", summary: "crashed" })[1];
+      expect(failed?.type).toBe("task.completed");
+      if (failed?.type === "task.completed") {
+        expect(failed.payload.status).toBe("failed");
+      }
+    });
+  });
+
   describe("transport truncation signature", () => {
     it("classifies truncated response streams across failure shapes with one signature", () => {
       const failure = museTransportTruncationSignature(TRUNCATED_STREAM_FAILURE);
