@@ -38,6 +38,7 @@ import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSes
 import * as ProviderService from "../src/provider/Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../src/provider/Services/ProviderSessionDirectory.ts";
 import * as ProviderSessionReaper from "../src/provider/Services/ProviderSessionReaper.ts";
+import * as StalledTurnWatchdog from "../src/provider/Services/StalledTurnWatchdog.ts";
 import * as RepositoryIdentityResolver from "../src/project/RepositoryIdentityResolver.ts";
 import * as ServerLifecycleEvents from "../src/serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "../src/serverRuntimeStartup.ts";
@@ -78,6 +79,10 @@ const startupDependencies = Layer.mergeAll(
   }),
   Layer.succeed(ProviderSessionReaper.ProviderSessionReaper, {
     start: () => Effect.void,
+  }),
+  Layer.succeed(StalledTurnWatchdog.StalledTurnWatchdog, {
+    start: () => Effect.void,
+    runSweep: () => Effect.void,
   }),
   ServerLifecycleEvents.layer,
   Layer.succeed(ServerEnvironment.ServerEnvironment, {
