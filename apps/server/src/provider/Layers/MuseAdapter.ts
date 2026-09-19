@@ -87,7 +87,12 @@ const SessionResult = Schema.Struct({
     }),
   ),
 });
-const TurnResult = Schema.Struct({ status: Schema.Literal("accepted"), turnId: Schema.String });
+const TurnResult = Schema.Struct({
+  status: Schema.Literal("accepted"),
+  turnId: Schema.String,
+  startedNewTurn: Schema.optional(Schema.Boolean),
+  disposition: Schema.optional(Schema.Literals(["started", "queued", "steered"])),
+});
 const CompactResult = Schema.Struct({
   status: Schema.Literals(["accepted", "noop"]),
   reason: Schema.optional(Schema.String),
@@ -470,7 +475,7 @@ export function make(
       }
       if (
         (event.method === "turn/completed" || event.method === "turn/unqueued") &&
-        ctx.session.activeTurnId === event.params.turnId
+        (!ctx.session.activeTurnId || ctx.session.activeTurnId === event.params.turnId)
       ) {
         for (const [id, item] of ctx.items.entries()) {
           if (item.kind === "reminderChild" && item.status === "inProgress") {
@@ -884,7 +889,7 @@ export function make(
             ctx.host.connection.command("turn/start", {
               sessionId: ctx.sessionId,
               input: parts,
-              ifBusy: "steer",
+              ifBusy: "queue",
               ...(effort ? { reasoningEffort: effort } : {}),
             }),
           ).pipe(
@@ -896,7 +901,16 @@ export function make(
               "turn/start",
               ctx.session.lastError ?? "Muse Code disconnected.",
             );
-          if (!ctx.settledTurns.has(result.turnId))
+          if (result.disposition === "steered" || result.startedNewTurn === false) {
+            ctx.settledTurns.delete(result.turnId);
+            emit({
+              ...base(ctx),
+              type: "turn.started",
+              turnId: TurnId.make(result.turnId),
+              payload: {},
+            });
+          }
+          if (result.disposition !== "queued" && !ctx.settledTurns.has(result.turnId))
             ctx.session = {
               ...ctx.session,
               status: "running",
@@ -916,6 +930,7 @@ export function make(
         const ctx = yield* requireSession(threadId);
         const target = turnId ?? ctx.session.activeTurnId;
         if (!target || (turnId && ctx.session.activeTurnId !== turnId)) return;
+        if (ctx.settledTurns.has(target)) return;
         yield* Effect.tryPromise({
           try: () =>
             ctx.host.connection.command("turn/interrupt", {

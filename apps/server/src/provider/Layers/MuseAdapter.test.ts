@@ -22,6 +22,7 @@ let mockResumeShouldFail = false;
 let mockStartShouldFail: string | false = false;
 let mintCommandIdCounter = 0;
 let mockCommands: Array<{ method: string; params: any }> = [];
+let mockTurnStartResponse: any = undefined;
 
 vi.mock("@muse-code/sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@muse-code/sdk")>();
@@ -58,6 +59,11 @@ vi.mock("@muse-code/sdk", async (importOriginal) => {
               };
             }
             if (method === "turn/start") {
+              if (mockTurnStartResponse) {
+                const res = mockTurnStartResponse;
+                mockTurnStartResponse = undefined;
+                return res;
+              }
               return {
                 status: "accepted",
                 turnId: `turn-${++mintCommandIdCounter}`,
@@ -888,6 +894,115 @@ describe("MuseAdapter transport truncation mitigation", () => {
       expect(mockCommands.filter((command) => command.method === "session/compact")).toHaveLength(
         2,
       );
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("sends ifBusy: queue on turn/start to prevent turn stealing", () =>
+    Effect.gen(function* () {
+      mockCommands = [];
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-ifbusy-queue");
+      yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({ threadId, input: "Hello world" });
+      const startCmd = mockCommands.find((c) => c.method === "turn/start");
+      expect(startCmd).toBeDefined();
+      expect(startCmd?.params.ifBusy).toBe("queue");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("synthesizes turn.started when turn/start returns steered disposition", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-steered-recovery");
+      yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      mockTurnStartResponse = {
+        status: "accepted",
+        turnId: "turn-steered-123",
+        disposition: "steered",
+        startedNewTurn: false,
+      };
+
+      const collected = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "turn.started"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const turn = yield* adapter.sendTurn({ threadId, input: "Steered message" });
+      expect(turn.turnId).toBe("turn-steered-123");
+
+      const events = yield* Fiber.join(collected);
+      expect(events).toHaveLength(1);
+      expect(events[0]?.type).toBe("turn.started");
+      expect(events[0]?.turnId).toBe("turn-steered-123");
+
+      const sessions = yield* adapter.listSessions();
+      const current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("running");
+      expect(current?.activeTurnId).toBe("turn-steered-123");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("handles queued turn disposition without prematurely marking session running", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-queued-disposition");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+
+      mockTurnStartResponse = {
+        status: "accepted",
+        turnId: "turn-queued-456",
+        disposition: "queued",
+        startedNewTurn: false,
+      };
+
+      const turn = yield* adapter.sendTurn({ threadId, input: "Queued message" });
+      expect(turn.turnId).toBe("turn-queued-456");
+
+      let sessions = yield* adapter.listSessions();
+      let current = sessions.find((s) => s.threadId === threadId);
+      // Because it is queued, session status does not transition to running yet
+      expect(current?.status).toBe("ready");
+
+      // Now Muse dequeues and starts the turn
+      mockNotificationCallback!({
+        method: "turn/started",
+        params: {
+          sessionId,
+          viewCursor: "cursor-q-start",
+          turnId: "turn-queued-456",
+        },
+      });
+
+      sessions = yield* adapter.listSessions();
+      current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("running");
+      expect(current?.activeTurnId).toBe("turn-queued-456");
     }).pipe(Effect.provide(testLayer)),
   );
 });
