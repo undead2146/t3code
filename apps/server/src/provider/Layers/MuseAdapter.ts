@@ -25,6 +25,7 @@ import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
+import * as Option from "effect/Option";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Queue from "effect/Queue";
@@ -952,7 +953,7 @@ export function make(
           return;
         }
         if (ctx.settledTurns.has(target)) return;
-        const interrupted = yield* Effect.tryPromise({
+        const interruptedOption = yield* Effect.tryPromise({
           try: () =>
             ctx.host.connection.command("turn/interrupt", {
               sessionId: ctx.sessionId,
@@ -960,13 +961,10 @@ export function make(
             }),
           catch: (cause) => requestError("turn/interrupt", cause),
         }).pipe(
-          Effect.timeoutTo({
-            duration: "5 seconds",
-            onSuccess: () => true,
-            onTimeout: () => false,
-          }),
-          Effect.catchAll(() => Effect.succeed(false)),
+          Effect.timeoutOption("5 seconds"),
+          Effect.catch(() => Effect.succeed(Option.none())),
         );
+        const interrupted = Option.isSome(interruptedOption);
 
         for (const [id, item] of ctx.items.entries()) {
           if (item.status === "inProgress") {
