@@ -24,6 +24,7 @@ import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Queue from "effect/Queue";
@@ -223,10 +224,14 @@ export function make(
         ...(typeof cause === "string" ? {} : { cause }),
       });
     };
-    const attempt = <A>(method: string, run: () => Promise<A>) =>
+    const attempt = <A>(
+      method: string,
+      run: () => Promise<A>,
+      timeoutDuration: Duration.DurationInput = "60 seconds",
+    ) =>
       Effect.tryPromise({ try: run, catch: (cause) => requestError(method, cause) }).pipe(
         Effect.timeoutOrElse({
-          duration: "60 seconds",
+          duration: timeoutDuration,
           orElse: () => Effect.fail(requestError(method, `${method} timed out`)),
         }),
       );
@@ -885,16 +890,27 @@ export function make(
           const effort = input.modelSelection
             ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
             : undefined;
-          const result = yield* attempt("turn/start", () =>
-            ctx.host.connection.command("turn/start", {
-              sessionId: ctx.sessionId,
-              input: parts,
-              ifBusy: "queue",
-              ...(effort ? { reasoningEffort: effort } : {}),
-            }),
+          const result = yield* attempt(
+            "turn/start",
+            () =>
+              ctx.host.connection.command("turn/start", {
+                sessionId: ctx.sessionId,
+                input: parts,
+                ifBusy: "queue",
+                ...(effort ? { reasoningEffort: effort } : {}),
+              }),
+            "20 seconds",
           ).pipe(
             Effect.flatMap(Schema.decodeUnknownEffect(TurnResult)),
             Effect.mapError((cause) => requestError("turn/start", cause)),
+            Effect.tapError((cause) =>
+              Effect.sync(() => {
+                failSession(
+                  ctx,
+                  `Muse Code failed to start turn: ${cause.detail ?? cause.message}`,
+                );
+              }),
+            ),
           );
           if (ctx.stopped)
             return yield* requestError(
@@ -929,16 +945,28 @@ export function make(
       function* (threadId, turnId) {
         const ctx = yield* requireSession(threadId);
         const target = turnId ?? ctx.session.activeTurnId;
-        if (!target || (turnId && ctx.session.activeTurnId !== turnId)) return;
+        if (!target || (turnId && ctx.session.activeTurnId !== turnId)) {
+          if (ctx.session.status === "starting") {
+            yield* stopContext(ctx);
+          }
+          return;
+        }
         if (ctx.settledTurns.has(target)) return;
-        yield* Effect.tryPromise({
+        const interrupted = yield* Effect.tryPromise({
           try: () =>
             ctx.host.connection.command("turn/interrupt", {
               sessionId: ctx.sessionId,
               turnId: target,
             }),
           catch: (cause) => requestError("turn/interrupt", cause),
-        }).pipe(Effect.timeoutOption("5 seconds"), Effect.ignore);
+        }).pipe(
+          Effect.timeoutTo({
+            duration: "5 seconds",
+            onSuccess: () => true,
+            onTimeout: () => false,
+          }),
+          Effect.catchAll(() => Effect.succeed(false)),
+        );
 
         for (const [id, item] of ctx.items.entries()) {
           if (item.status === "inProgress") {
@@ -964,6 +992,19 @@ export function make(
             turnId: target,
             payload: { state: "cancelled", stopReason: "interrupted" },
           });
+        }
+
+        if (!interrupted) {
+          yield* Effect.logWarning(
+            "Muse process unresponsive to turn/interrupt, stopping wedged process",
+            {
+              threadId,
+              turnId: target,
+              sessionId: ctx.sessionId,
+            },
+          );
+          yield* stopContext(ctx);
+          return;
         }
 
         const { activeTurnId: _, ...rest } = ctx.session;

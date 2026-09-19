@@ -23,6 +23,7 @@ let mockStartShouldFail: string | false = false;
 let mintCommandIdCounter = 0;
 let mockCommands: Array<{ method: string; params: any }> = [];
 let mockTurnStartResponse: any = undefined;
+let mockTurnInterruptShouldHang = false;
 
 vi.mock("@muse-code/sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@muse-code/sdk")>();
@@ -41,6 +42,8 @@ vi.mock("@muse-code/sdk", async (importOriginal) => {
           mintCommandId: () => `cmd-${++mintCommandIdCounter}`,
           command: vi.fn(async (method: string, params: any) => {
             mockCommands.push({ method, params });
+            if (method === "turn/interrupt" && mockTurnInterruptShouldHang)
+              return new Promise(() => {});
             if (method === "session/compact") return { status: "accepted" };
             if (method === "session/start" && mockStartShouldFail)
               throw new Error(mockStartShouldFail);
@@ -669,6 +672,39 @@ describe("MuseAdapter session lifecycle with workflow items", () => {
         expect(sessionChanged.payload.state).toBe("ready");
       }
     }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "interruptTurn terminates and evicts context when muse process hangs on turn/interrupt",
+    () =>
+      Effect.gen(function* () {
+        mockTurnInterruptShouldHang = true;
+        try {
+          const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+            environment: process.env,
+          });
+
+          const threadId = ThreadId.make("thread-test-interrupt-hang");
+          yield* adapter.startSession({
+            threadId,
+            cwd: "Z:\\test-workspace",
+            runtimeMode: "full-access",
+          });
+
+          const turn = yield* adapter.sendTurn({
+            threadId,
+            input: "Turn that hangs on interrupt",
+          });
+
+          yield* adapter.interruptTurn(threadId, turn.turnId);
+
+          const sessions = yield* adapter.listSessions();
+          const current = sessions.find((s) => s.threadId === threadId);
+          expect(current).toBeUndefined();
+        } finally {
+          mockTurnInterruptShouldHang = false;
+        }
+      }).pipe(Effect.provide(testLayer)),
   );
 });
 
