@@ -163,6 +163,11 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
     if (target.kind !== "server" || !bootstrapComplete || renderState !== "missing") {
       return;
     }
+    const draftId = useComposerDraftStore.getState().getDraftIdByRef(target.threadRef);
+    if (draftId) {
+      void navigate({ to: "/draft/$draftId", params: { draftId }, replace: true });
+      return;
+    }
     // Navigation already resolved onto this path, so a drop aimed here
     // passed its landing check; once the thread reads as missing it can
     // never be attached, release it even when there is nowhere to redirect.
@@ -202,7 +207,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
         />
       );
     }
-  } else if (renderState === "ready" || renderState === "loading") {
+  } else if (serverThreadShell !== null && (renderState === "ready" || renderState === "loading")) {
     view = (
       <ChatView
         {...(nextChatViewKey ? { key: nextChatViewKey.key } : {})}

@@ -1752,7 +1752,7 @@ function normalizePersistedDraftThreads(
           : candidateDraftThread.loadBalancedEnvironmentId === null
             ? { loadBalancedEnvironmentId: null }
             : {}),
-        promotedTo,
+        promotedTo: null,
       };
     }
   }
@@ -2496,12 +2496,7 @@ function toHydratedDraftThreadState(
             persistedDraftThread.loadBalancedEnvironmentId as EnvironmentId | null,
         }
       : {}),
-    promotedTo: persistedDraftThread.promotedTo
-      ? scopeThreadRef(
-          persistedDraftThread.promotedTo.environmentId as EnvironmentId,
-          persistedDraftThread.promotedTo.threadId as ThreadId,
-        )
-      : null,
+    promotedTo: null,
   };
 }
 

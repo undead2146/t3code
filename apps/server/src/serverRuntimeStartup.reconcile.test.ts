@@ -692,6 +692,60 @@ it.effect("retries failed projections and continues after a persistent failure",
   );
 });
 
+it.effect("reconciles orphaned settled threads to stopped without restarting or continuing", () => {
+  const settledThread = {
+    ...makeThread("thread-settled-reconcile", "running", TurnId.make("turn-settled")),
+    settledOverride: "settled" as const,
+  };
+  const dispatched: Array<{ type: string; session: { status: string; activeTurnId: unknown } }> =
+    [];
+  let directoryUpsertedStatus: string | null | undefined = null;
+
+  return runReconciliation({
+    threads: [settledThread],
+    continueAfterRestart: true,
+    directory: {
+      getBinding: () =>
+        Effect.succeed(
+          Option.some({
+            threadId: settledThread.id,
+            providerInstanceId,
+            status: "running",
+            lastSeenAt: updatedAt,
+            resumeCursor: "resume-123",
+            runtimePayload: {},
+          } as never),
+        ),
+      upsert: (binding) => {
+        directoryUpsertedStatus = binding.status;
+        return Effect.void;
+      },
+      recordImportedTranscript: () => Effect.die("unused"),
+      getProvider: () => Effect.die("unused"),
+      listThreadIds: () => Effect.die("unused"),
+      listBindings: () => Effect.succeed([]),
+    },
+    dispatch: (command) => {
+      if (command.type === "thread.session.set") {
+        dispatched.push({ type: command.type, session: command.session });
+      }
+      return Effect.succeed({ sequence: 1 });
+    },
+  }).pipe(
+    Effect.tap(() =>
+      Effect.sync(() => {
+        assert.equal(directoryUpsertedStatus, "stopped");
+        assert.equal(dispatched.length, 1);
+        const first = dispatched[0];
+        assert.ok(first);
+        assert.equal(first.type, "thread.session.set");
+        assert.equal(first.session.status, "stopped");
+        assert.equal(first.session.activeTurnId, null);
+      }),
+    ),
+  );
+});
+
 it.effect("does not fail startup when the live provider session inventory cannot be read", () => {
   let queried = false;
   return ServerRuntimeStartup.reconcileProviderSessions.pipe(

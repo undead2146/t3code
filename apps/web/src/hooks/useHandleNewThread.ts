@@ -184,7 +184,7 @@ export function useNewThreadHandler() {
         readThreadShell(storedDraftThreadRef) === null
           ? storedDraftThread
           : null;
-      if (storedDraftThreadRef && reusableStoredDraftThread === null) {
+      if (storedDraftThreadRef && readThreadShell(storedDraftThreadRef) !== null) {
         markPromotedDraftThreadByRef(storedDraftThreadRef);
       }
       // New-thread surfaces (button, hotkeys, "/" landing, palette) only

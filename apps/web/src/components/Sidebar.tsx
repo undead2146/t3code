@@ -716,6 +716,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
   project: ProjectFaviconProject | null;
   projectDisplayName: string | null;
   isActive: boolean;
+  isSubmitting?: boolean | undefined;
   onNavigate: (draftId: DraftId) => void;
   onDiscard: (draftId: DraftId) => void;
 }) {
@@ -737,7 +738,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
       ? promptPreview
       : attachmentCount > 0
         ? `${attachmentCount} attachment${attachmentCount === 1 ? "" : "s"}`
-        : session.promotedTo
+        : session.promotedTo && props.isSubmitting
           ? "Starting thread..."
           : "New thread";
   const handleActivate = useCallback(() => onNavigate(draftId), [draftId, onNavigate]);
@@ -813,6 +814,7 @@ interface SidebarDraftRowData {
   draftId: DraftId;
   session: DraftSessionState;
   composer: ComposerThreadDraftState;
+  isSubmitting?: boolean | undefined;
 }
 
 // Draft sessions with user content, surfaced above the pinned block so an
@@ -829,6 +831,9 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
 }) {
   const draftThreadsByThreadKey = useComposerDraftStore((store) => store.draftThreadsByThreadKey);
   const draftsByThreadKey = useComposerDraftStore((store) => store.draftsByThreadKey);
+  const backgroundSubmissionThreadKeys = useComposerDraftStore(
+    (store) => store.backgroundSubmissionThreadKeys,
+  );
   const clearDraftThread = useComposerDraftStore((store) => store.clearDraftThread);
   // The open draft's row is FROZEN at the moment the draft became the route:
   // it stays visible (like a thread row) but never repaints while the user
@@ -892,22 +897,32 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
         continue;
       }
       const composer = draftsByThreadKey[draftKey];
+      const isSubmitting =
+        session.promotedTo != null &&
+        backgroundSubmissionThreadKeys[scopedThreadKey(session.promotedTo)] === true;
       if (session.promotedTo != null) {
-        rows.push({
-          draftId: DraftId.make(draftKey),
-          session,
-          composer: composer ?? {
-            prompt: "",
-            text: "",
-            images: [],
-            files: [],
-            terminalContexts: [],
-            previewAnnotations: [],
-            reviewComments: [],
-            persistedAttachments: [],
-          },
-        });
-        continue;
+        if (isSubmitting) {
+          rows.push({
+            draftId: DraftId.make(draftKey),
+            session,
+            composer: composer ?? {
+              prompt: "",
+              images: [],
+              files: [],
+              nonPersistedImageIds: [],
+              persistedAttachments: [],
+              terminalContexts: [],
+              previewAnnotations: [],
+              reviewComments: [],
+              modelSelectionByProvider: {},
+              activeProvider: null,
+              runtimeMode: null,
+              interactionMode: null,
+            },
+            isSubmitting: true,
+          });
+          continue;
+        }
       }
       if (!composer || !composerDraftHasUserContent(composer)) {
         continue;
@@ -939,7 +954,8 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
   }
   return (
     <>
-      {drafts.map(({ composer, draftId, session }) => {
+      {drafts.map((draft) => {
+        const { composer, draftId, session, isSubmitting } = draft;
         const projectKey = `${session.environmentId}:${session.projectId}`;
         const isActive =
           draftId === props.routeDraftId ||
@@ -958,6 +974,7 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
             project={props.projectByKey.get(projectKey) ?? null}
             projectDisplayName={props.projectDisplayNameByKey.get(projectKey) ?? null}
             isActive={isActive}
+            isSubmitting={isSubmitting}
             onNavigate={props.onNavigateToDraft}
             onDiscard={handleDiscard}
           />
@@ -2485,8 +2502,10 @@ export default function Sidebar() {
         if (readThreadShell(session.promotedTo) !== null) {
           continue;
         }
-        count += 1;
-        continue;
+        if (store.backgroundSubmissionThreadKeys[scopedThreadKey(session.promotedTo)] === true) {
+          count += 1;
+          continue;
+        }
       }
       if (!composerDraftHasUserContent(store.draftsByThreadKey[draftKey])) {
         continue;
@@ -2932,7 +2951,7 @@ export default function Sidebar() {
         setOpenMobile(false);
       }
       const session = useComposerDraftStore.getState().getDraftSession(draftId);
-      if (session?.promotedTo) {
+      if (session?.promotedTo && readThreadShell(session.promotedTo) !== null) {
         void router.navigate({
           to: "/$environmentId/$threadId",
           params: buildThreadRouteParams(session.promotedTo),

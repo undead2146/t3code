@@ -565,6 +565,60 @@ export const reconcileProviderSessions = Effect.gen(function* () {
             }).pipe(Effect.as(Option.none())),
       ),
     );
+    if (thread.settledOverride === "settled") {
+      const reconciledAt = DateTime.formatIso(yield* DateTime.now);
+      if (Option.isSome(binding)) {
+        yield* directory
+          .upsert({
+            ...binding.value,
+            status: "stopped",
+            runtimePayload: {
+              ...readRuntimePayload(binding.value.runtimePayload),
+              activeTurnId: null,
+              [SERVER_UPDATE_CONTINUATION_KEY]: null,
+              continueAfterServerUpdatePrepared: null,
+            },
+          })
+          .pipe(
+            Effect.catchCause((cause) =>
+              Cause.hasInterrupts(cause)
+                ? Effect.failCause(cause)
+                : Effect.logWarning("failed to reconcile orphaned settled binding", {
+                    threadId: thread.id,
+                    cause,
+                  }),
+            ),
+          );
+      }
+      if (session.status !== "stopped" || session.activeTurnId !== null) {
+        yield* orchestrationEngine
+          .dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make(yield* crypto.randomUUIDv4),
+            threadId: thread.id,
+            session: {
+              ...session,
+              status: "stopped",
+              activeTurnId: null,
+              lastError: null,
+              updatedAt: reconciledAt,
+            },
+            createdAt: reconciledAt,
+          })
+          .pipe(
+            Effect.retry({ times: 1 }),
+            Effect.catchCause((cause) =>
+              Cause.hasInterrupts(cause)
+                ? Effect.failCause(cause)
+                : Effect.logWarning("failed to settle orphaned settled projection", {
+                    threadId: thread.id,
+                    cause,
+                  }),
+            ),
+          );
+      }
+      continue;
+    }
     const continuationMarkerPresent =
       Option.isSome(binding) && hasServerUpdateContinuationMarker(binding.value.runtimePayload);
     const continuationTurnId = Option.isSome(binding)
