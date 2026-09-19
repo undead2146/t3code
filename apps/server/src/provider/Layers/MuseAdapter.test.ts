@@ -2,7 +2,7 @@
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { describe, expect, it } from "@effect/vitest";
+import { afterEach, describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -88,6 +88,15 @@ vi.mock("@muse-code/sdk", async (importOriginal) => {
 const testLayer = ServerConfig.layerTest(process.cwd(), { prefix: "t3-muse-adapter-test-" }).pipe(
   Layer.provideMerge(NodeServices.layer),
 );
+
+afterEach(() => {
+  mockTurnInterruptShouldHang = false;
+  mockStartShouldFail = false;
+  mockResumeShouldFail = false;
+  mockTurnStartResponse = undefined;
+  mockSessionResultHistory = undefined;
+  mockCommands = [];
+});
 
 describe("MuseAdapter session lifecycle with workflow items", () => {
   it.effect(
@@ -674,7 +683,7 @@ describe("MuseAdapter session lifecycle with workflow items", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.effect(
+  it.live(
     "interruptTurn terminates and evicts context when muse process hangs on turn/interrupt",
     () =>
       Effect.gen(function* () {
