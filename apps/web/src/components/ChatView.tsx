@@ -1728,7 +1728,7 @@ export default function ChatView(props: ChatViewProps) {
   const [localServerErrorsByThreadKey, setLocalServerErrorsByThreadKey] = useState<
     Record<string, LocalThreadErrorEntry>
   >({});
-  const [isConnecting, _setIsConnecting] = useState(false);
+
   const isRevertingCheckpoint = useComposerDraftStore((store) =>
     store.rewindingThreadKeys.has(routeThreadKey),
   );
@@ -2883,6 +2883,7 @@ export default function ChatView(props: ChatViewProps) {
     conversationProviderStatus !== null &&
     conversationProviderStatus.supportsConversationRollback !== false;
   const phase = derivePhase(activeThread?.session ?? null);
+  const isConnecting = phase === "connecting";
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const latestCheckpointCompletedAt = activeThread?.checkpoints.at(-1)?.completedAt ?? null;
   const workspaceMutationId = useMemo(() => {
@@ -3266,6 +3267,7 @@ export default function ChatView(props: ChatViewProps) {
     recordedWorktreeSetup?.phase === "running";
   const isWorking =
     phase === "running" ||
+    phase === "connecting" ||
     isSendBusy ||
     isConnecting ||
     isRevertingCheckpoint ||
@@ -5787,7 +5789,13 @@ export default function ChatView(props: ChatViewProps) {
     };
   }, [activeThread?.id, activeThread?.messages, handoffAttachmentPreviews, optimisticUserMessages]);
 
+  const currentContextKey = threadId ? `thread:${threadId}` : draftId ? `draft:${draftId}` : null;
+  const lastContextKeyRef = useRef(currentContextKey);
   useEffect(() => {
+    if (currentContextKey === lastContextKeyRef.current) {
+      return;
+    }
+    lastContextKeyRef.current = currentContextKey;
     setOptimisticUserMessages((existing) => {
       for (const message of existing) {
         revokeUserMessagePreviewUrls(message);
@@ -5796,7 +5804,7 @@ export default function ChatView(props: ChatViewProps) {
     });
     resetLocalDispatch();
     setExpandedImage(null);
-  }, [draftId, resetLocalDispatch, threadId]);
+  }, [currentContextKey, resetLocalDispatch]);
 
   const closeExpandedImage = useCallback(() => {
     setExpandedImage(null);

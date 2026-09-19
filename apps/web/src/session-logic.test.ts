@@ -2122,6 +2122,27 @@ describe("deriveActiveWorkStartedAt", () => {
       ),
     ).toBe("2026-02-27T21:11:00.000Z");
   });
+
+  it("treats session.status starting as unsettled and active work", () => {
+    expect(
+      isLatestTurnSettled(latestTurn, {
+        status: "starting",
+        activeTurnId: null,
+      }),
+    ).toBe(false);
+
+    expect(
+      deriveActiveWorkStartedAt(
+        null,
+        {
+          status: "starting",
+          activeTurnId: null,
+        },
+        null,
+        "2026-02-27T21:12:00.000Z",
+      ),
+    ).toBe("2026-02-27T21:12:00.000Z");
+  });
 });
 
 describe("deriveWorkLogEntries quiet-timeline guarantee", () => {

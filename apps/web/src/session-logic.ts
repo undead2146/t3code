@@ -199,7 +199,7 @@ export function isLatestTurnSettled(
   if (!latestTurn?.startedAt) return false;
   if (!latestTurn.completedAt) return false;
   if (!session) return true;
-  if (session.status === "running") return false;
+  if (session.status === "running" || session.status === "starting") return false;
   return true;
 }
 
@@ -216,8 +216,11 @@ export function deriveActiveWorkStartedAt(
     }
     return sendStartedAt ?? latestUserMessageAt;
   }
+  if (session?.status === "starting") {
+    return sendStartedAt ?? latestUserMessageAt;
+  }
   if (!isLatestTurnSettled(latestTurn, session)) {
-    return latestTurn?.startedAt ?? sendStartedAt;
+    return latestTurn?.startedAt ?? sendStartedAt ?? latestUserMessageAt;
   }
   return sendStartedAt;
 }
