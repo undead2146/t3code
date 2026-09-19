@@ -202,7 +202,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
         />
       );
     }
-  } else if (renderState === "ready" || (renderState === "loading" && serverThreadShell !== null)) {
+  } else if (renderState === "ready" || renderState === "loading") {
     view = (
       <ChatView
         {...(nextChatViewKey ? { key: nextChatViewKey.key } : {})}
