@@ -901,7 +901,7 @@ export function make(
               "turn/start",
               ctx.session.lastError ?? "Muse Code disconnected.",
             );
-          if (result.disposition === "steered" || result.startedNewTurn === false) {
+          if (result.disposition !== "queued") {
             ctx.settledTurns.delete(result.turnId);
             emit({
               ...base(ctx),

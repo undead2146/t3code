@@ -2054,6 +2054,63 @@ describe("deriveMessagesTimelineRows", () => {
     ]);
   });
 
+  it("uses stopped automatically label when turn is interrupted by watchdog or stalled", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          id: "work-entry-1",
+          kind: "work",
+          createdAt: "2026-01-01T00:00:05Z",
+          entry: {
+            id: "work-1",
+            createdAt: "2026-01-01T00:00:05Z",
+            turnId: "turn-1" as never,
+            label: "Ran command",
+            tone: "tool" as const,
+          },
+        },
+        {
+          id: "work-entry-2",
+          kind: "work",
+          createdAt: "2026-01-01T00:15:00Z",
+          entry: {
+            id: "work-2",
+            createdAt: "2026-01-01T00:15:00Z",
+            turnId: "turn-1" as never,
+            label: "Turn stopped automatically",
+            detail:
+              "No provider progress for 15 minutes. The provider may have stalled, so the turn was stopped automatically. Send a new message to retry.",
+            tone: "info" as const,
+            sourceActivityKind: "provider.turn.interrupted",
+          },
+        },
+      ],
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "interrupted",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:15:00Z",
+      },
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        kind: "turn-fold",
+        turnId: "turn-1",
+        label: "Turn stopped automatically after 15m",
+        expanded: false,
+      }),
+      expect.objectContaining({
+        kind: "work-toggle",
+        summary: "Turn stopped automatically",
+      }),
+    ]);
+  });
+
   it("keeps the previous turn folded while a newly sent message awaits its turn", () => {
     // Right after send, isWorking is true but latestTurn still points at the
     // previous, settled turn — it must stay folded through that window.

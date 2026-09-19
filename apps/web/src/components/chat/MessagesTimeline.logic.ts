@@ -686,7 +686,14 @@ function deriveTurnFolds(input: {
       // User input and subagent batches stay visible after their turn settles.
       if (
         entry.kind === "work" &&
-        (entry.entry.questionAnswer !== undefined || entry.entry.agentSpawn !== undefined)
+        (entry.entry.questionAnswer !== undefined ||
+          entry.entry.agentSpawn !== undefined ||
+          (group.terminalEntry === null &&
+            (entry.entry.sourceActivityKind === "provider.turn.interrupted" ||
+              entry.entry.tone === "error" ||
+              (entry.entry.tone === "info" &&
+                (entry.entry.label.toLowerCase().includes("stopped") ||
+                  entry.entry.detail?.toLowerCase().includes("stopped"))))))
       ) {
         continue;
       }
@@ -730,13 +737,24 @@ function deriveTurnFolds(input: {
               lastEntryEnd,
           );
     const duration = elapsedMs !== null ? formatDuration(elapsedMs) : null;
-    const label = isLatestInterruptedTurn
+    const wasStoppedAutomatically = group.entries.some(
+      (entry) =>
+        entry.kind === "work" &&
+        (entry.entry.label.toLowerCase().includes("stopped automatically") ||
+          entry.entry.detail?.toLowerCase().includes("stopped automatically") ||
+          entry.entry.detail?.toLowerCase().includes("stalled")),
+    );
+    const label = wasStoppedAutomatically
       ? duration
-        ? `You stopped after ${duration}`
-        : "You stopped this response"
-      : duration
-        ? `Worked for ${duration}`
-        : "Worked";
+        ? `Turn stopped automatically after ${duration}`
+        : "Turn stopped automatically"
+      : isLatestInterruptedTurn
+        ? duration
+          ? `You stopped after ${duration}`
+          : "You stopped this response"
+        : duration
+          ? `Worked for ${duration}`
+          : "Worked";
 
     foldsByAnchorEntryId.set(firstHiddenEntry.id, {
       turnId,
