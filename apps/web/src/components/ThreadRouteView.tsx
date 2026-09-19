@@ -113,6 +113,8 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
     serverThreadShellExists: serverThreadShell !== null,
     serverThreadDetailExists: serverThreadDetail !== null,
     serverThreadDetailDeleted: serverThreadStatus === "deleted",
+    serverThreadSynchronizing:
+      serverThreadStatus === "synchronizing" || serverThreadStatus === "empty",
     draftThreadExists: draftThread !== null,
   });
   const threadSyncPhase = resolveThreadSyncPhase({
@@ -158,27 +160,33 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
   }, [canonicalThreadRef, draftSession, navigate, target.kind]);
 
   useEffect(() => {
-    if (target.kind !== "server" || !bootstrapComplete) {
+    if (target.kind !== "server" || !bootstrapComplete || renderState !== "missing") {
       return;
     }
     // Navigation already resolved onto this path, so a drop aimed here
     // passed its landing check; once the thread reads as missing it can
     // never be attached, release it even when there is nowhere to redirect.
-    if (renderState === "missing") {
+    const timeoutId = setTimeout(() => {
       const { clearPendingFileDropsForThread } = useSidebarPendingFileDropStore.getState();
       clearPendingFileDropsForThread(target.threadRef);
       if (environmentHasAnyThreads) {
         void navigate({ to: "/", replace: true });
       }
-    }
+    }, 500);
+    return () => clearTimeout(timeoutId);
   }, [bootstrapComplete, environmentHasAnyThreads, navigate, renderState, target]);
 
   useEffect(() => {
-    if (target.kind !== "server" || !serverThreadStarted || !draftThread) {
+    if (
+      target.kind !== "server" ||
+      !serverThreadStarted ||
+      !draftThread ||
+      serverThreadShell === null
+    ) {
       return;
     }
     finalizePromotedDraftThreadByRef(target.threadRef);
-  }, [draftThread, serverThreadStarted, target]);
+  }, [draftThread, serverThreadShell, serverThreadStarted, target]);
 
   let view: React.ReactNode = null;
   if (target.kind === "draft") {

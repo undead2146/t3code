@@ -735,7 +735,11 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
   const preview =
     promptPreview.length > 0
       ? promptPreview
-      : `${attachmentCount} attachment${attachmentCount === 1 ? "" : "s"}`;
+      : attachmentCount > 0
+        ? `${attachmentCount} attachment${attachmentCount === 1 ? "" : "s"}`
+        : session.promotedTo
+          ? "Starting thread..."
+          : "New thread";
   const handleActivate = useCallback(() => onNavigate(draftId), [draftId, onNavigate]);
   const handleKeyDown = useCallback(
     (event: ReactKeyboardEvent) => {
@@ -820,6 +824,7 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
   projectDisplayNameByKey: ReadonlyMap<string, string>;
   scopedProjectKeys: ReadonlySet<string> | null;
   routeDraftId: string | null;
+  routeThreadRef?: ScopedThreadRef | null;
   onNavigateToDraft: (draftId: DraftId) => void;
 }) {
   const draftThreadsByThreadKey = useComposerDraftStore((store) => store.draftThreadsByThreadKey);
@@ -856,11 +861,24 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
     // unmapped, so the mapping only knows about the latest per project.
     for (const [draftKey, session] of Object.entries(draftThreadsByThreadKey)) {
       if (session.promotedTo != null) {
-        continue;
+        if (readThreadShell(session.promotedTo) !== null) {
+          continue;
+        }
       }
+      const isRouteDraft = props.routeDraftId !== null && draftKey === props.routeDraftId;
+      const isRoutePromotedThread =
+        props.routeThreadRef !== null &&
+        props.routeThreadRef !== undefined &&
+        session.promotedTo !== null &&
+        session.promotedTo !== undefined &&
+        session.promotedTo.environmentId === props.routeThreadRef.environmentId &&
+        session.promotedTo.threadId === props.routeThreadRef.threadId;
+
       if (
         props.scopedProjectKeys !== null &&
-        !props.scopedProjectKeys.has(`${session.environmentId}:${session.projectId}`)
+        !props.scopedProjectKeys.has(`${session.environmentId}:${session.projectId}`) &&
+        !isRouteDraft &&
+        !isRoutePromotedThread
       ) {
         continue;
       }
@@ -874,6 +892,23 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
         continue;
       }
       const composer = draftsByThreadKey[draftKey];
+      if (session.promotedTo != null) {
+        rows.push({
+          draftId: DraftId.make(draftKey),
+          session,
+          composer: composer ?? {
+            prompt: "",
+            text: "",
+            images: [],
+            files: [],
+            terminalContexts: [],
+            previewAnnotations: [],
+            reviewComments: [],
+            persistedAttachments: [],
+          },
+        });
+        continue;
+      }
       if (!composer || !composerDraftHasUserContent(composer)) {
         continue;
       }
@@ -886,6 +921,7 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
     draftsByThreadKey,
     frozenActive,
     props.routeDraftId,
+    props.routeThreadRef,
     props.scopedProjectKeys,
   ]);
   const handleDiscard = useCallback(
@@ -905,6 +941,14 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
     <>
       {drafts.map(({ composer, draftId, session }) => {
         const projectKey = `${session.environmentId}:${session.projectId}`;
+        const isActive =
+          draftId === props.routeDraftId ||
+          (props.routeThreadRef !== null &&
+            props.routeThreadRef !== undefined &&
+            session.promotedTo !== null &&
+            session.promotedTo !== undefined &&
+            session.promotedTo.environmentId === props.routeThreadRef.environmentId &&
+            session.promotedTo.threadId === props.routeThreadRef.threadId);
         return (
           <SidebarDraftRow
             key={draftId}
@@ -913,7 +957,7 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
             composer={composer}
             project={props.projectByKey.get(projectKey) ?? null}
             projectDisplayName={props.projectDisplayNameByKey.get(projectKey) ?? null}
-            isActive={draftId === props.routeDraftId}
+            isActive={isActive}
             onNavigate={props.onNavigateToDraft}
             onDiscard={handleDiscard}
           />
@@ -2438,6 +2482,10 @@ export default function Sidebar() {
     let count = 0;
     for (const [draftKey, session] of Object.entries(store.draftThreadsByThreadKey)) {
       if (session.promotedTo != null) {
+        if (readThreadShell(session.promotedTo) !== null) {
+          continue;
+        }
+        count += 1;
         continue;
       }
       if (!composerDraftHasUserContent(store.draftsByThreadKey[draftKey])) {
@@ -2527,7 +2575,9 @@ export default function Sidebar() {
       (thread) =>
         thread.archivedAt === null &&
         (scopedProjectKeys === null ||
-          scopedProjectKeys.has(`${thread.environmentId}:${thread.projectId}`)),
+          scopedProjectKeys.has(`${thread.environmentId}:${thread.projectId}`) ||
+          (routeThreadKey !== null &&
+            scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey)),
     );
     const pinned: EnvironmentThreadShell[] = [];
     const active: EnvironmentThreadShell[] = [];
@@ -2880,6 +2930,14 @@ export default function Sidebar() {
       clearSelection();
       if (isMobile) {
         setOpenMobile(false);
+      }
+      const session = useComposerDraftStore.getState().getDraftSession(draftId);
+      if (session?.promotedTo) {
+        void router.navigate({
+          to: "/$environmentId/$threadId",
+          params: buildThreadRouteParams(session.promotedTo),
+        });
+        return;
       }
       void router.navigate({ to: "/draft/$draftId", params: { draftId } });
     },
@@ -4755,6 +4813,7 @@ export default function Sidebar() {
                           projectDisplayNameByKey={projectDisplayNameByKey}
                           scopedProjectKeys={scopedProjectKeys}
                           routeDraftId={routeDraftIdForRows}
+                          routeThreadRef={routeThreadRef}
                           onNavigateToDraft={navigateToDraft}
                         />,
                       ];

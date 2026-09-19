@@ -106,6 +106,19 @@ describe("threadRoutes", () => {
     ).toBe("loading");
   });
 
+  it("keeps synchronizing server threads in the loading state even without a shell", () => {
+    expect(
+      resolveThreadRouteRenderState({
+        bootstrapComplete: true,
+        serverThreadShellExists: false,
+        serverThreadDetailExists: false,
+        serverThreadDetailDeleted: false,
+        serverThreadSynchronizing: true,
+        draftThreadExists: false,
+      }),
+    ).toBe("loading");
+  });
+
   it("renders server details and local drafts when they are ready", () => {
     expect(
       resolveThreadRouteRenderState({
