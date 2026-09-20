@@ -746,6 +746,9 @@ export function mapMuseNotification(
       ];
     case "turn/completed": {
       const params = event.params;
+      if (params.terminal === "failed" && params.reason === "incomplete") {
+        return [];
+      }
       return [
         {
           ...base,

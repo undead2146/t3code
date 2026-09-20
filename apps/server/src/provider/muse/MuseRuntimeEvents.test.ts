@@ -544,4 +544,64 @@ describe("MuseRuntimeEvents", () => {
       expect(museTransportTruncationSignature(undefined)).toBeUndefined();
     });
   });
+
+  describe("turn/completed mapping", () => {
+    it("drops interim incomplete turn completions so outer turn stays active", () => {
+      const raw = {
+        method: "turn/completed",
+        params: {
+          sessionId: "sess-1",
+          viewCursor: "cur-100",
+          turnId: "turn-interim",
+          terminal: "failed",
+          reason: "incomplete",
+        },
+      };
+      const decoded = decodeMuseNotification(raw);
+      const events = mapMuseNotification(decoded, createMockContext());
+      expect(events).toEqual([]);
+    });
+
+    it("maps normal completed and failed turns", () => {
+      const rawCompleted = {
+        method: "turn/completed",
+        params: {
+          sessionId: "sess-1",
+          viewCursor: "cur-101",
+          turnId: "turn-done",
+          terminal: "completed",
+        },
+      };
+      const eventsCompleted = mapMuseNotification(
+        decodeMuseNotification(rawCompleted),
+        createMockContext(),
+      );
+      expect(eventsCompleted).toHaveLength(1);
+      expect(eventsCompleted[0]?.type).toBe("turn.completed");
+      if (eventsCompleted[0]?.type === "turn.completed") {
+        expect(eventsCompleted[0].payload.state).toBe("completed");
+      }
+
+      const rawFailed = {
+        method: "turn/completed",
+        params: {
+          sessionId: "sess-1",
+          viewCursor: "cur-102",
+          turnId: "turn-err",
+          terminal: "failed",
+          reason: "error",
+        },
+      };
+      const eventsFailed = mapMuseNotification(
+        decodeMuseNotification(rawFailed),
+        createMockContext(),
+      );
+      expect(eventsFailed).toHaveLength(1);
+      expect(eventsFailed[0]?.type).toBe("turn.completed");
+      if (eventsFailed[0]?.type === "turn.completed") {
+        expect(eventsFailed[0].payload.state).toBe("failed");
+        expect(eventsFailed[0].payload.stopReason).toBe("error");
+      }
+    });
+  });
 });

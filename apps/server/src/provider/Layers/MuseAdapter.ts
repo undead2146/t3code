@@ -38,7 +38,12 @@ import * as Stream from "effect/Stream";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
-import { MuseSkillCatalog, museSkillInputParts, museSkillMentions } from "../Drivers/MuseSkills.ts";
+import {
+  MuseSkillCatalog,
+  museSkillMentions,
+  planMuseSkillDispatch,
+  type MuseSkillDispatch,
+} from "../Drivers/MuseSkills.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
@@ -273,7 +278,7 @@ export function make(
     const attempt = <A>(
       method: string,
       run: () => Promise<A>,
-      timeoutDuration: Duration.DurationInput = "60 seconds",
+      timeoutDuration: Duration.Duration | string | number = "60 seconds",
     ) =>
       Effect.tryPromise({ try: run, catch: (cause) => requestError(method, cause) }).pipe(
         Effect.timeoutOrElse({
@@ -417,17 +422,24 @@ export function make(
 
         while (pageCount < MAX_PAGES && !ctx.stopped) {
           pageCount++;
-          const result = (await ctx.host.connection.request("view/page", {
+          const requestPromise = ctx.host.connection.request("view/page", {
             sessionId: ctx.sessionId,
             ...(currentCursor ? { cursor: currentCursor } : {}),
             direction: "forward",
             limit: 200,
-          })) as
+          }) as Promise<
             | {
                 events?: Array<{ method: string; params?: unknown }>;
                 nextCursor?: string | null;
               }
-            | undefined;
+            | undefined
+          >;
+
+          const timeoutPromise = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("view/page timeout")), 10_000),
+          );
+
+          const result = await Promise.race([requestPromise, timeoutPromise]);
 
           if (!result || !Array.isArray(result.events) || result.events.length === 0) {
             break;
@@ -511,7 +523,15 @@ export function make(
         };
         startDrainTimer(ctx);
       }
-      if (event.method === "turn/completed" || event.method === "turn/unqueued") {
+      const isInterimIncompleteTurn =
+        event.method === "turn/completed" &&
+        (event.params as { terminal?: string; reason?: string }).terminal === "failed" &&
+        (event.params as { terminal?: string; reason?: string }).reason === "incomplete";
+
+      if (
+        (event.method === "turn/completed" || event.method === "turn/unqueued") &&
+        !isInterimIncompleteTurn
+      ) {
         stopDrainTimer(ctx);
         if (ctx.settledTurns.has(event.params.turnId)) return;
         ctx.settledTurns.add(event.params.turnId);
@@ -595,6 +615,7 @@ export function make(
       }
       if (
         (event.method === "turn/completed" || event.method === "turn/unqueued") &&
+        !isInterimIncompleteTurn &&
         (!ctx.session.activeTurnId || ctx.session.activeTurnId === event.params.turnId)
       ) {
         for (const [id, item] of ctx.items.entries()) {
@@ -822,8 +843,9 @@ export function make(
             const snapshotCursor = result.history?.snapshot as
               | { cursor?: string; viewCursor?: string }
               | undefined;
-            if (snapshotCursor?.viewCursor || snapshotCursor?.cursor) {
-              ctx.lastViewCursor = snapshotCursor.viewCursor ?? snapshotCursor.cursor;
+            const foundCursor = snapshotCursor?.viewCursor ?? snapshotCursor?.cursor;
+            if (foundCursor) {
+              ctx.lastViewCursor = foundCursor;
             }
             if (ctx.session.status === "connecting") {
               const activeTurnId = result.session.activeTurnId;
@@ -1056,6 +1078,12 @@ export function make(
               issue: "Muse Code does not expose a plan mode through MSP.",
             });
           const parts: Array<Record<string, unknown>> = [];
+          const runtimeInstructions = buildRuntimeInstructions({ harness: "Muse Code" });
+          // A skill part rejects every text part, so a dispatched skill carries
+          // the runtime instructions, the user text, and file notes inside its
+          // `arguments` instead of as parts. Images stay parts: the host allows
+          // them alongside a skill part.
+          let skillDispatch: MuseSkillDispatch | undefined;
           if (input.input?.trim()) {
             const prompt = input.input;
             if (museSkillMentions(prompt).length > 0) {
@@ -1065,20 +1093,19 @@ export function make(
                 Effect.flatMap(Schema.decodeUnknownEffect(MuseSkillCatalog)),
                 Effect.mapError((cause) => requestError("skill/list", cause)),
               );
-              parts.push(
-                { type: "text", text: buildRuntimeInstructions({ harness: "Muse Code" }) },
-                ...museSkillInputParts(
-                  prompt,
-                  new Set(catalog.skills.map((skill) => skill.selector)),
-                ),
+              skillDispatch = planMuseSkillDispatch(
+                prompt,
+                new Set(catalog.skills.map((skill) => skill.selector)),
               );
-            } else {
+            }
+            if (!skillDispatch) {
               parts.push({
                 type: "text",
-                text: `${buildRuntimeInstructions({ harness: "Muse Code" })}\n\n${prompt}`,
+                text: `${runtimeInstructions}\n\n${prompt}`,
               });
             }
           }
+          const skillArgumentSections: string[] = [];
           for (const attachment of input.attachments ?? []) {
             const filePath = resolveAttachmentPath({
               attachmentsDir: config.attachmentsDir,
@@ -1100,10 +1127,13 @@ export function make(
                 base64Data: Buffer.from(bytes).toString("base64"),
               });
             } else if (attachment.type === "file") {
-              parts.push({
-                type: "text",
-                text: `Attached file: ${encodePath(filePath)}`,
-              });
+              const note = `Attached file: ${encodePath(filePath)}`;
+              if (skillDispatch) skillArgumentSections.push(note);
+              else
+                parts.push({
+                  type: "text",
+                  text: note,
+                });
             } else {
               return yield* new ProviderAdapterValidationError({
                 provider: PROVIDER,
@@ -1111,6 +1141,17 @@ export function make(
                 issue: `Unsupported attachment type: ${attachment.type}`,
               });
             }
+          }
+          if (skillDispatch) {
+            if (skillDispatch.argumentsText.trim()) {
+              skillArgumentSections.unshift(skillDispatch.argumentsText);
+            }
+            skillArgumentSections.unshift(runtimeInstructions);
+            parts.unshift({
+              type: "skill",
+              selector: skillDispatch.selector,
+              arguments: skillArgumentSections.join("\n\n"),
+            });
           }
           if (!parts.length)
             return yield* new ProviderAdapterValidationError({
@@ -1206,7 +1247,7 @@ export function make(
         const ctx = yield* requireSession(threadId);
         const target = turnId ?? ctx.session.activeTurnId;
         if (!target || (turnId && ctx.session.activeTurnId !== turnId)) {
-          if (ctx.session.status === "starting") {
+          if (ctx.session.status === "connecting") {
             yield* stopContext(ctx);
           }
           return;

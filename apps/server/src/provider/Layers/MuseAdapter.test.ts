@@ -11,6 +11,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { MuseSettings, ThreadId, type ProviderRuntimeEvent } from "@t3tools/contracts";
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
 import * as MuseAdapter from "./MuseAdapter.ts";
 
@@ -1096,6 +1097,175 @@ describe("MuseAdapter transport truncation mitigation", () => {
       expect(startCmd?.params.ifBusy).toBe("queue");
     }).pipe(Effect.provide(testLayer)),
   );
+
+  describe("MuseAdapter skill dispatch", () => {
+    const skillCatalog = (selectors: ReadonlyArray<string>) => ({
+      skills: selectors.map((selector) => ({
+        selector,
+        description: `${selector} description`,
+        displayName: selector,
+        source: "user",
+      })),
+    });
+
+    it.effect("sends a lone skill part with folded arguments for a $mention", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        mockRequestHandler = async (method: string) =>
+          method === "skill/list" ? skillCatalog(["html-communication"]) : {};
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+        });
+
+        const threadId = ThreadId.make("thread-test-skill-dispatch");
+        yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+
+        yield* adapter.sendTurn({
+          threadId,
+          input: "please $html-communication draft the release notes",
+        });
+        const startCmd = mockCommands.find((c) => c.method === "turn/start");
+        expect(startCmd).toBeDefined();
+        const input = startCmd?.params.input as Array<Record<string, unknown>>;
+        // The host rejects text parts alongside a skill part, so the runtime
+        // instructions and user text fold into the skill part's arguments.
+        expect(input.map((part) => part.type)).toEqual(["skill"]);
+        const skillPart = input[0] as { selector: string; arguments: string };
+        expect(skillPart.selector).toBe("html-communication");
+        expect(skillPart.arguments).toContain("runtime_info");
+        expect(skillPart.arguments).toContain("please draft the release notes");
+        expect(skillPart.arguments).not.toContain("$html-communication");
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.effect("dispatches the last resolving mention when several are present", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        mockRequestHandler = async (method: string) =>
+          method === "skill/list" ? skillCatalog(["alpha-skill", "beta-skill"]) : {};
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+        });
+
+        const threadId = ThreadId.make("thread-test-skill-dispatch-last");
+        yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+
+        yield* adapter.sendTurn({ threadId, input: "$alpha-skill first, then $beta-skill second" });
+        const startCmd = mockCommands.find((c) => c.method === "turn/start");
+        expect(startCmd).toBeDefined();
+        const input = startCmd?.params.input as Array<Record<string, unknown>>;
+        // The host allows at most one skill part per submission.
+        expect(input.map((part) => part.type)).toEqual(["skill"]);
+        const skillPart = input[0] as { selector: string; arguments: string };
+        expect(skillPart.selector).toBe("beta-skill");
+        expect(skillPart.arguments).toContain("$alpha-skill first, then second");
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.effect("falls back to a text part when no mention resolves", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        mockRequestHandler = async (method: string) =>
+          method === "skill/list" ? skillCatalog(["html-communication"]) : {};
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+        });
+
+        const threadId = ThreadId.make("thread-test-skill-dispatch-unknown");
+        yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+
+        yield* adapter.sendTurn({ threadId, input: "echo $HOME then done" });
+        const startCmd = mockCommands.find((c) => c.method === "turn/start");
+        expect(startCmd).toBeDefined();
+        const input = startCmd?.params.input as Array<Record<string, unknown>>;
+        expect(input.map((part) => part.type)).toEqual(["text"]);
+        expect(input[0]?.text).toContain("echo $HOME then done");
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.effect("folds file notes into arguments and keeps images as parts", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        mockRequestHandler = async (method: string) =>
+          method === "skill/list" ? skillCatalog(["html-communication"]) : {};
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+        });
+        const config = yield* ServerConfig.ServerConfig;
+        const fileAttachment = {
+          type: "file",
+          id: "thread-00000000-0000-4000-8000-000000000002-txt",
+          name: "notes.txt",
+          mimeType: "text/plain",
+          sizeBytes: 5,
+        } as const;
+        const imageAttachment = {
+          type: "image",
+          id: "thread-00000000-0000-4000-8000-000000000001",
+          name: "shot.png",
+          mimeType: "image/png",
+          sizeBytes: 68,
+        } as const;
+        const filePath = resolveAttachmentPath({
+          attachmentsDir: config.attachmentsDir,
+          attachment: fileAttachment,
+        });
+        const imagePath = resolveAttachmentPath({
+          attachmentsDir: config.attachmentsDir,
+          attachment: imageAttachment,
+        });
+        expect(filePath).not.toBeNull();
+        expect(imagePath).not.toBeNull();
+        yield* Effect.promise(() => NodeFSP.mkdir(config.attachmentsDir, { recursive: true }));
+        yield* Effect.promise(() => NodeFSP.writeFile(filePath!, "notes"));
+        yield* Effect.promise(() =>
+          NodeFSP.writeFile(
+            imagePath!,
+            Buffer.from(
+              "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jY9kAAAAASUVORK5CYII=",
+              "base64",
+            ),
+          ),
+        );
+
+        const threadId = ThreadId.make("thread-test-skill-dispatch-attachments");
+        yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+
+        yield* adapter.sendTurn({
+          threadId,
+          input: "$html-communication review this",
+          attachments: [fileAttachment, imageAttachment],
+        });
+        const startCmd = mockCommands.find((c) => c.method === "turn/start");
+        expect(startCmd).toBeDefined();
+        const input = startCmd?.params.input as Array<Record<string, unknown>>;
+        expect(input.map((part) => part.type)).toEqual(["skill", "image"]);
+        const skillPart = input[0] as { selector: string; arguments: string };
+        expect(skillPart.selector).toBe("html-communication");
+        expect(skillPart.arguments).toContain("review this");
+        expect(skillPart.arguments).toContain("Attached file:");
+        const imagePart = input[1] as { mediaType: string; base64Data: string };
+        expect(imagePart.mediaType).toBe("image/png");
+        expect(imagePart.base64Data.length).toBeGreaterThan(0);
+      }).pipe(Effect.provide(testLayer)),
+    );
+  });
 
   it.effect("synthesizes turn.started when turn/start returns steered disposition", () =>
     Effect.gen(function* () {

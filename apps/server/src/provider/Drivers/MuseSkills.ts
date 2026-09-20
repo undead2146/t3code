@@ -149,32 +149,41 @@ export function museSkillMentions(prompt: string) {
   return collectComposerInlineTokens(`${prompt} `).filter((token) => token.type === "skill");
 }
 
-/** Convert existing composer chips only when the live session offers their exact selectors. */
-export function museSkillInputParts(
+export interface MuseSkillDispatch {
+  /** Catalog selector to invoke. */
+  readonly selector: string;
+  /** Prompt with the dispatched `$token` removed; folded into the skill `arguments`. */
+  readonly argumentsText: string;
+}
+
+/**
+ * Split `prompt` around the last `$skill` mention that names a live catalog
+ * selector. Returns `undefined` when there is nothing to dispatch, in which
+ * case the prompt should go out as a plain text part. Mentions that do not
+ * match a catalog selector stay literal: a `$HOME` in prose must not become
+ * an invocation, and an unknown selector would fail the turn with the typed
+ * `skillNotFound` request error.
+ *
+ * Only the last resolving mention dispatches. Verified against the host, a
+ * turn carrying a skill part rejects every text part (`a skill input part is
+ * combinable only with image parts`) and rejects a second skill part (`at
+ * most one skill input part per submission`), so user text on either side of
+ * the token cannot travel as its own part and is folded into `arguments`
+ * instead. Earlier mentions stay literal inside `arguments`, where the model
+ * still reads them.
+ */
+export function planMuseSkillDispatch(
   prompt: string,
   selectors: ReadonlySet<string>,
-): Array<Record<string, unknown>> {
-  const mentions = museSkillMentions(prompt);
-  if (!mentions.some((token) => selectors.has(token.value)))
-    return [{ type: "text", text: prompt }];
-  const parts: Array<Record<string, unknown>> = [];
-  let cursor = 0;
-  for (const [index, mention] of mentions.entries()) {
-    const leading = prompt.slice(cursor, mention.start);
-    if (leading.trim()) parts.push({ type: "text", text: leading });
-    const end = mentions[index + 1]?.start ?? prompt.length;
-    if (!selectors.has(mention.value)) {
-      parts.push({ type: "text", text: prompt.slice(mention.start, end) });
-      cursor = end;
-      continue;
-    }
-    const argumentsText = prompt.slice(mention.end, end).trim();
-    parts.push({
-      type: "skill",
-      selector: mention.value,
-      ...(argumentsText ? { arguments: argumentsText } : {}),
-    });
-    cursor = end;
+): MuseSkillDispatch | undefined {
+  const last = museSkillMentions(prompt).findLast((token) => selectors.has(token.value));
+  if (!last) {
+    return undefined;
   }
-  return parts;
+  const leading = prompt.slice(0, last.start).trimEnd();
+  const trailing = prompt.slice(last.end).trim();
+  return {
+    selector: last.value,
+    argumentsText: leading ? (trailing ? `${leading} ${trailing}` : leading) : trailing,
+  };
 }
