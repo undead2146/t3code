@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off
+// @effect-diagnostics nodeBuiltinImport:off globalTimers:off
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
@@ -171,6 +171,9 @@ interface SessionContext {
   transportStreakCompacted: boolean;
   startInput: StartSessionInput;
   needsRestart?: boolean;
+  lastViewCursor?: string;
+  isPagingView?: boolean;
+  drainTimer?: ReturnType<typeof setInterval> | undefined;
 }
 
 // Consecutive identical truncated-stream retries after which the turn is interrupted:
@@ -350,6 +353,7 @@ export function make(
     const failSession = (ctx: SessionContext, message: string) => {
       if (ctx.stopped) return;
       ctx.stopped = true;
+      stopDrainTimer(ctx);
       const turnId = ctx.session.activeTurnId;
       ctx.session = { ...ctx.session, status: "error", lastError: message, updatedAt: nowIso() };
       if (turnId && !ctx.settledTurns.has(turnId)) {
@@ -382,18 +386,84 @@ export function make(
         ),
       ).catch(() => undefined);
     };
+
+    let drainViewPages: (ctx: SessionContext) => Promise<void>;
+
+    const startDrainTimer = (ctx: SessionContext) => {
+      if (ctx.drainTimer) return;
+      ctx.drainTimer = setInterval(() => {
+        if (ctx.stopped || ctx.session.status !== "running" || !ctx.session.activeTurnId) {
+          stopDrainTimer(ctx);
+          return;
+        }
+        void drainViewPages(ctx);
+      }, 5_000);
+    };
+
+    const stopDrainTimer = (ctx: SessionContext) => {
+      if (ctx.drainTimer) {
+        clearInterval(ctx.drainTimer);
+        ctx.drainTimer = undefined;
+      }
+    };
+
+    drainViewPages = async (ctx: SessionContext): Promise<void> => {
+      if (ctx.stopped || ctx.isPagingView || !ctx.host || !ctx.sessionId) return;
+      ctx.isPagingView = true;
+      try {
+        let currentCursor = ctx.lastViewCursor;
+        let pageCount = 0;
+        const MAX_PAGES = 50;
+
+        while (pageCount < MAX_PAGES && !ctx.stopped) {
+          pageCount++;
+          const result = (await ctx.host.connection.request("view/page", {
+            sessionId: ctx.sessionId,
+            ...(currentCursor ? { cursor: currentCursor } : {}),
+            direction: "forward",
+            limit: 200,
+          })) as
+            | {
+                events?: Array<{ method: string; params?: unknown }>;
+                nextCursor?: string | null;
+              }
+            | undefined;
+
+          if (!result || !Array.isArray(result.events) || result.events.length === 0) {
+            break;
+          }
+
+          for (const item of result.events) {
+            receive(ctx, item);
+          }
+
+          if (!result.nextCursor || result.nextCursor === currentCursor) {
+            break;
+          }
+          currentCursor = result.nextCursor;
+        }
+      } catch {
+        // Best-effort drain: connection close or transient protocol error should not fail session
+      } finally {
+        ctx.isPagingView = false;
+      }
+    };
+
     const receive = (ctx: SessionContext, input: { method: string; params?: unknown }) => {
       if (ctx.stopped) return;
       if (input.method === "view/gap") {
-        failSession(
-          ctx,
-          "Muse Code dropped session events. Send another message to resume the session.",
-        );
+        void drainViewPages(ctx);
         return;
       }
       if (!isMuseNotificationMethod(input.method)) return;
       const event = decodeMuseNotification(input);
       if (event.method !== "usage/changed" && event.params.sessionId !== ctx.sessionId) return;
+      if (
+        "viewCursor" in (event.params as Record<string, unknown>) &&
+        typeof (event.params as Record<string, unknown>).viewCursor === "string"
+      ) {
+        ctx.lastViewCursor = (event.params as Record<string, unknown>).viewCursor as string;
+      }
       if (event.method === "session/tokenUsage" && ctx.contextUsedTokens === undefined) {
         // Canonical usage is a per-turn snapshot; keep only each turn's latest notification.
         ctx.pendingTokenUsage.delete(event.params.turnId);
@@ -439,8 +509,10 @@ export function make(
           status: "running",
           activeTurnId: TurnId.make(event.params.turnId),
         };
+        startDrainTimer(ctx);
       }
       if (event.method === "turn/completed" || event.method === "turn/unqueued") {
+        stopDrainTimer(ctx);
         if (ctx.settledTurns.has(event.params.turnId)) return;
         ctx.settledTurns.add(event.params.turnId);
       }
@@ -546,6 +618,7 @@ export function make(
     const stopContext = Effect.fn("MuseAdapter.stopContext")(function* (ctx: SessionContext) {
       if (ctx.stopped) return;
       ctx.stopped = true;
+      stopDrainTimer(ctx);
       yield* Scope.close(ctx.scope, Exit.void);
       killMuseProcessTree(ctx.handshake);
       if (sessions.get(ctx.session.threadId) === ctx) sessions.delete(ctx.session.threadId);
@@ -644,6 +717,7 @@ export function make(
             yield* Effect.addFinalizer(() =>
               Effect.sync(() => {
                 ctx.stopped = true;
+                stopDrainTimer(ctx);
               }),
             );
             wireHostListeners(ctx, host);
@@ -745,6 +819,12 @@ export function make(
                 ctx.streamed.set(`${item.itemId}:summary.${index}`, text),
               );
             }
+            const snapshotCursor = result.history?.snapshot as
+              | { cursor?: string; viewCursor?: string }
+              | undefined;
+            if (snapshotCursor?.viewCursor || snapshotCursor?.cursor) {
+              ctx.lastViewCursor = snapshotCursor.viewCursor ?? snapshotCursor.cursor;
+            }
             if (ctx.session.status === "connecting") {
               const activeTurnId = result.session.activeTurnId;
               const hasActiveWorkflow = hasActiveWorkflowOrSubagent(ctx);
@@ -758,6 +838,9 @@ export function make(
                   ? { activeTurnId: TurnId.make(activeTurnId) }
                   : {}),
               };
+              if (ctx.session.status === "running" && ctx.session.activeTurnId) {
+                startDrainTimer(ctx);
+              }
             }
             // Only set approval mode post-resume when we actually resumed; session/start
             // already carries approvalMode in its params, so calling it again is redundant
@@ -880,6 +963,7 @@ export function make(
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           ctx.stopped = true;
+          stopDrainTimer(ctx);
         }),
       ).pipe(Effect.provideService(Scope.Scope, scope));
 
@@ -1100,13 +1184,15 @@ export function make(
               payload: {},
             });
           }
-          if (result.disposition !== "queued" && !ctx.settledTurns.has(result.turnId))
+          if (result.disposition !== "queued" && !ctx.settledTurns.has(result.turnId)) {
             ctx.session = {
               ...ctx.session,
               status: "running",
               activeTurnId: TurnId.make(result.turnId),
               updatedAt: nowIso(),
             };
+            startDrainTimer(ctx);
+          }
           return {
             threadId: input.threadId,
             turnId: TurnId.make(result.turnId),
@@ -1126,6 +1212,13 @@ export function make(
           return;
         }
         if (ctx.settledTurns.has(target)) return;
+
+        yield* Effect.promise(() => drainViewPages(ctx));
+        if (ctx.settledTurns.has(target)) {
+          stopDrainTimer(ctx);
+          return;
+        }
+
         const interruptedOption = yield* Effect.tryPromise({
           try: () =>
             ctx.host.connection.command("turn/interrupt", {
@@ -1138,6 +1231,13 @@ export function make(
           Effect.catch(() => Effect.succeed(Option.none())),
         );
         const interrupted = Option.isSome(interruptedOption);
+
+        yield* Effect.promise(() => drainViewPages(ctx));
+        stopDrainTimer(ctx);
+
+        if (ctx.settledTurns.has(target)) {
+          return;
+        }
 
         for (const [id, item] of ctx.items.entries()) {
           if (item.status === "inProgress") {

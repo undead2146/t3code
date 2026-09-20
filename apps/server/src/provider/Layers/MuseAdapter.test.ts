@@ -24,6 +24,7 @@ let mintCommandIdCounter = 0;
 let mockCommands: Array<{ method: string; params: any }> = [];
 let mockTurnStartResponse: any = undefined;
 let mockTurnInterruptShouldHang = false;
+let mockRequestHandler: ((method: string, params: any) => Promise<any>) | undefined;
 
 vi.mock("@muse-code/sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@muse-code/sdk")>();
@@ -74,7 +75,10 @@ vi.mock("@muse-code/sdk", async (importOriginal) => {
             }
             return {};
           }),
-          request: vi.fn(async () => ({})),
+          request: vi.fn(async (method: string, params: any) => {
+            if (mockRequestHandler) return mockRequestHandler(method, params);
+            return {};
+          }),
         },
         child: {
           exit: new Promise(() => {}),
@@ -96,6 +100,7 @@ afterEach(() => {
   mockTurnStartResponse = undefined;
   mockSessionResultHistory = undefined;
   mockCommands = [];
+  mockRequestHandler = undefined;
 });
 
 describe("MuseAdapter session lifecycle with workflow items", () => {
@@ -714,6 +719,135 @@ describe("MuseAdapter session lifecycle with workflow items", () => {
           mockTurnInterruptShouldHang = false;
         }
       }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("recovers dropped events via view/page on view/gap without failing session", () =>
+    Effect.gen(function* () {
+      const pagedRequests: Array<any> = [];
+      mockRequestHandler = async (method, params) => {
+        if (method === "view/page") {
+          pagedRequests.push(params);
+          return {
+            events: [
+              {
+                method: "item/started",
+                params: {
+                  sessionId: params.sessionId,
+                  viewCursor: "cursor-recovered",
+                  item: {
+                    itemId: "item-rec-1",
+                    kind: "agentMessage",
+                    revision: 1,
+                    status: "inProgress",
+                    turnId: "turn-gap",
+                    text: "Recovered message",
+                  },
+                },
+              },
+            ],
+            nextCursor: null,
+          };
+        }
+        return {};
+      };
+
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-gap");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+      yield* adapter.sendTurn({ threadId, input: "Turn with gap" });
+
+      const collected = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "item.started"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      mockNotificationCallback!({
+        method: "view/gap",
+        params: { sessionId, after: "cursor-1", next: "cursor-3" },
+      });
+
+      const events = yield* Fiber.join(collected);
+      expect(events).toHaveLength(1);
+      expect(pagedRequests.length).toBeGreaterThanOrEqual(1);
+
+      const sessions = yield* adapter.listSessions();
+      const current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("running");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("interruptTurn drains completed turn from view/page instead of cancelling it", () =>
+    Effect.gen(function* () {
+      let turnId = "";
+      let pagedCalled = false;
+      mockRequestHandler = async (method, params) => {
+        if (method === "view/page") {
+          pagedCalled = true;
+          return {
+            events: [
+              {
+                method: "turn/completed",
+                params: {
+                  sessionId: params.sessionId,
+                  viewCursor: "cursor-complete",
+                  turnId,
+                  terminal: "completed",
+                },
+              },
+            ],
+            nextCursor: null,
+          };
+        }
+        return {};
+      };
+
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-interrupt-drain");
+      yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({ threadId, input: "Turn that finished while silent" });
+      turnId = turn.turnId;
+
+      const collected = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+            event.type === "turn.completed",
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.interruptTurn(threadId, turn.turnId);
+      const events = yield* Fiber.join(collected);
+
+      expect(pagedCalled).toBe(true);
+      expect(events).toHaveLength(1);
+      expect(events[0]?.payload.state).toBe("completed");
+
+      const sessions = yield* adapter.listSessions();
+      const current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("ready");
+      expect(current?.activeTurnId).toBeUndefined();
+    }).pipe(Effect.provide(testLayer)),
   );
 });
 
