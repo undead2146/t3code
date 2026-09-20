@@ -79,7 +79,14 @@ const expectedExits = new WeakSet();
 const watchers = [];
 
 function killChildTreeByPid(pid, signal) {
-  if (hostPlatform === "win32" || typeof pid !== "number") {
+  if (typeof pid !== "number") {
+    return;
+  }
+
+  if (hostPlatform === "win32") {
+    NodeChildProcess.spawnSync("taskkill.exe", ["/pid", String(pid), "/t", "/f"], {
+      stdio: "ignore",
+    });
     return;
   }
 
@@ -88,6 +95,20 @@ function killChildTreeByPid(pid, signal) {
 
 function cleanupStaleDevApps() {
   if (hostPlatform === "win32") {
+    try {
+      NodeChildProcess.spawnSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*--t3code-dev-root=*" -and $_.ProcessId -ne ${process.pid} } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`,
+        ],
+        { stdio: "ignore", timeout: 3000 },
+      );
+    } catch {
+      // Ignore cleanup failures
+    }
     return;
   }
 
