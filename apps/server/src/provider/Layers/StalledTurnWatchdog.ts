@@ -21,7 +21,7 @@ import {
   type StalledTurnWatchdogShape,
 } from "../Services/StalledTurnWatchdog.ts";
 
-const DEFAULT_STALL_THRESHOLD_MS = 15 * 60 * 1000;
+const DEFAULT_STALL_THRESHOLD_MS = 30 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 export interface StalledTurnWatchdogLiveOptions {
@@ -40,7 +40,8 @@ export interface StalledTurn {
  * (messages, activities, usage, session transitions all bump updatedAt)
  * for longer than the threshold is wedged, not busy: every provider emits
  * something observable within minutes while a turn is alive. Turns blocked
- * on the user (pending approvals / input) are never stalled.
+ * on the user (pending approvals / input) or active in background tasks/subagents
+ * (backgroundLiveness is "working" or "monitoring") are never stalled.
  */
 export function selectStalledTurns(
   threads: ReadonlyArray<OrchestrationThreadShell>,
@@ -57,6 +58,9 @@ export function selectStalledTurns(
       continue;
     }
     if (thread.hasPendingApprovals || thread.hasPendingUserInput) {
+      continue;
+    }
+    if (thread.backgroundLiveness != null) {
       continue;
     }
     const updatedMs = Date.parse(thread.updatedAt);

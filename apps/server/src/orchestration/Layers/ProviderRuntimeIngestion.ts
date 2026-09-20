@@ -1597,6 +1597,21 @@ const make = Effect.gen(function* () {
   const processRuntimeEvent = (event: ProviderRuntimeEvent) =>
     Effect.gen(function* () {
       if (event.type === "content.delta" && event.payload.streamKind !== "assistant_text") {
+        if (
+          event.payload.streamKind === "reasoning_text" ||
+          event.payload.streamKind === "reasoning_summary_text"
+        ) {
+          const thread = yield* resolveThreadRuntimeContext(event.threadId);
+          if (thread) {
+            threadBackgroundLiveness.recordTaskLiveness({
+              threadId: thread.id,
+              taskId: `reasoning:${event.turnId ?? thread.id}`,
+              taskType: undefined,
+              status: "running",
+              kind: "progress",
+            });
+          }
+        }
         return;
       }
 
@@ -2174,7 +2189,27 @@ const make = Effect.gen(function* () {
         case "session.exited":
           threadBackgroundLiveness.clearThreadLiveness(thread.id);
           break;
+        case "item.completed":
+          if (event.turnId) {
+            threadBackgroundLiveness.recordTaskLiveness({
+              threadId: thread.id,
+              taskId: `reasoning:${event.turnId}`,
+              taskType: undefined,
+              status: "completed",
+              kind: "completed",
+            });
+          }
+          break;
         default:
+          if (isTerminalTurn && event.turnId) {
+            threadBackgroundLiveness.recordTaskLiveness({
+              threadId: thread.id,
+              taskId: `reasoning:${event.turnId}`,
+              taskType: undefined,
+              status: "completed",
+              kind: "completed",
+            });
+          }
           break;
       }
 

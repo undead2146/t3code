@@ -1128,4 +1128,60 @@ describe("MuseAdapter path and symlink utilities", () => {
       mockStartShouldFail = false;
     }).pipe(Effect.provide(testLayer)),
   );
+
+  it.effect("interruptTurn triggers clean restart on next sendTurn without wedging", () =>
+    Effect.gen(function* () {
+      mockCommands = [];
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-interrupt-restart");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      const turn1 = yield* adapter.sendTurn({
+        threadId,
+        input: "Turn 1 to be interrupted",
+      });
+
+      // Interrupt turn 1
+      yield* adapter.interruptTurn(threadId, turn1.turnId);
+
+      let sessions = yield* adapter.listSessions();
+      let current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("ready");
+      expect(current?.activeTurnId).toBeUndefined();
+
+      const initialStartCommands = mockCommands.filter((c) => c.method === "session/start");
+      expect(initialStartCommands).toHaveLength(1);
+
+      // Now send Turn 2: should transparently re-initialize and start a new session before turn/start
+      const turn2 = yield* adapter.sendTurn({
+        threadId,
+        input: "Turn 2 after interrupt",
+      });
+
+      const secondStartCommands = mockCommands.filter((c) => c.method === "session/start");
+      expect(secondStartCommands).toHaveLength(2);
+
+      const turnCommands = mockCommands.filter((c) => c.method === "turn/start");
+      expect(turnCommands).toHaveLength(2);
+
+      sessions = yield* adapter.listSessions();
+      current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("running");
+      expect(current?.activeTurnId).toBe(turn2.turnId);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it("killMuseProcessTree safely handles empty, invalid, and mock inputs without error", () => {
+    expect(() => MuseAdapter.killMuseProcessTree(null)).not.toThrow();
+    expect(() => MuseAdapter.killMuseProcessTree(undefined)).not.toThrow();
+    expect(() => MuseAdapter.killMuseProcessTree({})).not.toThrow();
+    expect(() => MuseAdapter.killMuseProcessTree({ child: { pid: -1 } })).not.toThrow();
+  });
 });

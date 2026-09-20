@@ -101,6 +101,25 @@ describe("selectStalledTurns", () => {
     expect(selectStalledTurns(threads, nowMs, STALL_THRESHOLD_MS)).toHaveLength(0);
   });
 
+  it("ignores running turns with active background work (backgroundLiveness is not null)", () => {
+    const silentAt = minutesBefore(now, 60);
+    const threads = [
+      makeShell({
+        id: threadId,
+        updatedAt: silentAt,
+        backgroundLiveness: "working",
+        session: runningSession(threadId, turnId, silentAt),
+      }),
+      makeShell({
+        id: ThreadId.make("thread-monitoring"),
+        updatedAt: silentAt,
+        backgroundLiveness: "monitoring",
+        session: runningSession(ThreadId.make("thread-monitoring"), turnId, silentAt),
+      }),
+    ];
+    expect(selectStalledTurns(threads, nowMs, STALL_THRESHOLD_MS)).toHaveLength(0);
+  });
+
   it("ignores silent turns blocked on the user, settled sessions, and archived threads", () => {
     const silentAt = minutesBefore(now, 60);
     const threads = [
@@ -217,7 +236,7 @@ describe("StalledTurnWatchdog sweep", () => {
   }
 
   function silentShell(now: DateTime.Utc, id: ThreadId, turnId: TurnId) {
-    const silentAt = DateTime.formatIso(DateTime.subtract(now, { minutes: 30 }));
+    const silentAt = DateTime.formatIso(DateTime.subtract(now, { minutes: 40 }));
     return makeShell({ id, updatedAt: silentAt, session: runningSession(id, turnId, silentAt) });
   }
 

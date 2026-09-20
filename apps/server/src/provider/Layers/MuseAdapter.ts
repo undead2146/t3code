@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import {
@@ -107,6 +108,45 @@ type Approval = Extract<
   MuseNotification,
   { method: "approval/requested" | "approval/updated" }
 >["params"];
+export function killMuseProcessTree(childOrHandshake: unknown): void {
+  if (process.platform !== "win32" || !childOrHandshake) return;
+  try {
+    const candidate = (childOrHandshake as { child?: unknown })?.child ?? childOrHandshake;
+    let pid: number | undefined;
+
+    if (typeof (candidate as { pid?: unknown }).pid === "number") {
+      pid = (candidate as { pid: number }).pid;
+    }
+
+    if (pid === undefined) {
+      const proto = Object.getPrototypeOf(candidate);
+      const symbols = proto ? Object.getOwnPropertySymbols(proto) : [];
+      for (const sym of symbols) {
+        if (sym.description === "MuseServeChild.transport" || String(sym).includes("transport")) {
+          const transportGetter = (candidate as Record<symbol, () => { child?: { pid?: number } }>)[
+            sym
+          ];
+          const transport =
+            typeof transportGetter === "function" ? transportGetter.call(candidate) : undefined;
+          if (typeof transport?.child?.pid === "number") {
+            pid = transport.child.pid;
+            break;
+          }
+        }
+      }
+    }
+
+    if (typeof pid === "number" && pid > 0) {
+      NodeChildProcess.spawnSync("taskkill.exe", ["/pid", String(pid), "/t", "/f"], {
+        stdio: "ignore",
+      });
+    }
+  } catch {
+    // Best-effort process tree termination
+  }
+}
+
+type StartSessionInput = Parameters<Adapter["startSession"]>[0];
 type UserInput = Extract<MuseNotification, { method: "userInput/requested" }>["params"];
 interface SessionContext {
   session: ProviderSession;
@@ -129,6 +169,8 @@ interface SessionContext {
   transportRetryStreak: { turnId: string; signature: string; count: number } | undefined;
   lastTransportMitigationTurnId: string | undefined;
   transportStreakCompacted: boolean;
+  startInput: StartSessionInput;
+  needsRestart?: boolean;
 }
 
 // Consecutive identical truncated-stream retries after which the turn is interrupted:
@@ -301,7 +343,7 @@ export function make(
     };
     const requireSession = Effect.fn("MuseAdapter.requireSession")(function* (threadId: ThreadId) {
       const ctx = sessions.get(threadId);
-      if (!ctx || ctx.stopped)
+      if (!ctx || (ctx.stopped && !ctx.needsRestart))
         return yield* new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId });
       return ctx;
     });
@@ -502,8 +544,10 @@ export function make(
       }
     };
     const stopContext = Effect.fn("MuseAdapter.stopContext")(function* (ctx: SessionContext) {
+      if (ctx.stopped) return;
       ctx.stopped = true;
       yield* Scope.close(ctx.scope, Exit.void);
+      killMuseProcessTree(ctx.handshake);
       if (sessions.get(ctx.session.threadId) === ctx) sessions.delete(ctx.session.threadId);
       emit({
         ...base(ctx),
@@ -540,7 +584,14 @@ export function make(
                   }),
                 catch: (cause) => requestError("spawn", cause),
               }),
-              (child) => Effect.tryPromise(() => child.close()).pipe(Effect.ignore),
+              (child) =>
+                Effect.tryPromise(async () => {
+                  try {
+                    await child.close();
+                  } finally {
+                    killMuseProcessTree(child);
+                  }
+                }).pipe(Effect.ignore),
             );
             const host = yield* attempt("initialize", () =>
               handshake.initialize({
@@ -587,52 +638,15 @@ export function make(
               transportRetryStreak: undefined,
               lastTransportMitigationTurnId: undefined,
               transportStreakCompacted: false,
+              startInput: input,
+              needsRestart: false,
             };
             yield* Effect.addFinalizer(() =>
               Effect.sync(() => {
                 ctx.stopped = true;
               }),
             );
-            host.connection.onNotification((notification) => {
-              try {
-                receive(ctx, notification);
-              } catch {
-                failSession(ctx, "Muse Code sent an invalid notification.");
-              }
-            });
-            host.connection.onProtocolError(() =>
-              failSession(ctx, "Muse Code sent an invalid protocol frame."),
-            );
-            host.connection.onServerRequest(async (request) => {
-              const method =
-                request.method === "approval/request"
-                  ? "approval/requested"
-                  : request.method === "userInput/request"
-                    ? "userInput/requested"
-                    : undefined;
-              if (!method) throw new Error(`Unsupported Muse Code request: ${request.method}`);
-              try {
-                receive(ctx, { method, params: request.params });
-              } catch (cause) {
-                failSession(ctx, "Muse Code sent an invalid server request.");
-                throw cause;
-              }
-              return {};
-            });
-            void host.connection.closed.then(() => {
-              if (!ctx.stopped)
-                failSession(
-                  ctx,
-                  "Muse Code closed its connection. Resume the thread to reconnect.",
-                );
-            });
-            void host.child.exit.then((exit) => {
-              if (!ctx.stopped)
-                failSession(
-                  ctx,
-                  `Muse Code exited (${exit.kind}). Resume the thread to reconnect.`,
-                );
-            });
+            wireHostListeners(ctx, host);
             const mode =
               input.approvalPolicy === "never" ||
               (input.approvalPolicy === undefined && input.runtimeMode === "full-access")
@@ -783,10 +797,169 @@ export function make(
           );
         }),
       );
+    const wireHostListeners = (ctx: SessionContext, host: SpawnedMspConnection) => {
+      host.connection.onNotification((notification) => {
+        try {
+          receive(ctx, notification);
+        } catch {
+          failSession(ctx, "Muse Code sent an invalid notification.");
+        }
+      });
+      host.connection.onProtocolError(() =>
+        failSession(ctx, "Muse Code sent an invalid protocol frame."),
+      );
+      host.connection.onServerRequest(async (request) => {
+        const method =
+          request.method === "approval/request"
+            ? "approval/requested"
+            : request.method === "userInput/request"
+              ? "userInput/requested"
+              : undefined;
+        if (!method) throw new Error(`Unsupported Muse Code request: ${request.method}`);
+        try {
+          receive(ctx, { method, params: request.params });
+        } catch (cause) {
+          failSession(ctx, "Muse Code sent an invalid server request.");
+          throw cause;
+        }
+        return {};
+      });
+      void host.connection.closed.then(() => {
+        if (!ctx.stopped && !ctx.needsRestart)
+          failSession(ctx, "Muse Code closed its connection. Resume the thread to reconnect.");
+      });
+      void host.child.exit.then((exit) => {
+        if (!ctx.stopped && !ctx.needsRestart)
+          failSession(ctx, `Muse Code exited (${exit.kind}). Resume the thread to reconnect.`);
+      });
+    };
+
+    const restartSession = Effect.fn("MuseAdapter.restartSession")(function* (ctx: SessionContext) {
+      if (!ctx.needsRestart) return;
+      const scope = yield* Scope.make();
+      const input = ctx.startInput;
+      const cwd = input.cwd ?? config.cwd;
+      yield* Effect.promise(() => healWindowsSkillSymlinks(cwd));
+      const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
+      const args = ["serve", "--trust-workspace"];
+      if (
+        input.sandboxMode === "danger-full-access" ||
+        (input.sandboxMode === undefined && input.runtimeMode === "full-access")
+      )
+        args.push("--disable-sandbox");
+      if (input.sandboxMode === "read-only") args.push("--disable-write", "--disable-shell");
+      const handshake = yield* Effect.acquireRelease(
+        Effect.try({
+          try: () =>
+            spawnMspConnection({
+              command: settings.binaryPath || "muse",
+              args,
+              cwd,
+              env: McpProviderSession.withAgentDeviceEnvironment(environment, mcp),
+              shutdownTimeoutMs: 2_000,
+            }),
+          catch: (cause) => requestError("spawn", cause),
+        }),
+        (child) =>
+          Effect.tryPromise(async () => {
+            try {
+              await child.close();
+            } finally {
+              killMuseProcessTree(child);
+            }
+          }).pipe(Effect.ignore),
+      ).pipe(Effect.provideService(Scope.Scope, scope));
+      const host = yield* attempt("initialize", () =>
+        handshake.initialize({
+          clientInfo: { name: "t3_code", version: "0.0.0" },
+          capabilities: { requestedCapabilities: mcp ? ["sessionMcp"] : [] },
+        }),
+      );
+
+      ctx.stopped = false;
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          ctx.stopped = true;
+        }),
+      ).pipe(Effect.provideService(Scope.Scope, scope));
+
+      wireHostListeners(ctx, host);
+
+      const mode =
+        input.approvalPolicy === "never" ||
+        (input.approvalPolicy === undefined && input.runtimeMode === "full-access")
+          ? "allowAll"
+          : input.approvalPolicy === "untrusted" || input.runtimeMode === "approval-required"
+            ? "promptUnmatched"
+            : "onRequest";
+      const model = ctx.selectedModel;
+      const initialSelection =
+        model && model !== MUSE_DEFAULT_MODEL
+          ? yield* resolveModelSelection(host, model)
+          : undefined;
+      const sessionConfig = mcp
+        ? {
+            mcpServers: {
+              "t3-code": {
+                transport: "streamableHttp" as const,
+                url: mcp.endpoint,
+                headers: { Authorization: mcp.authorizationHeader },
+                mode: "required" as const,
+              },
+            },
+          }
+        : undefined;
+
+      const freshSessionId = host.connection.mintCommandId();
+      yield* attempt("session/start", () =>
+        host.connection.command("session/start", {
+          sessionId: freshSessionId,
+          ...(sessionConfig ? { config: sessionConfig } : {}),
+          workspaceRoot: cwd,
+          approvalMode: mode,
+          ...(initialSelection
+            ? {
+                modelId: initialSelection.modelId,
+                ...("providerId" in initialSelection
+                  ? { providerId: initialSelection.providerId }
+                  : {}),
+              }
+            : {}),
+        }),
+      );
+
+      ctx.scope = scope;
+      ctx.host = host;
+      ctx.handshake = handshake;
+      ctx.sessionId = freshSessionId;
+      ctx.session = {
+        ...ctx.session,
+        status: "ready",
+        resumeCursor: {
+          schemaVersion: 1,
+          sessionId: freshSessionId,
+          selectedModel: ctx.selectedModel,
+        },
+        updatedAt: nowIso(),
+      };
+      ctx.items.clear();
+      ctx.streamed.clear();
+      ctx.deltaCursors.clear();
+      ctx.approvals.clear();
+      ctx.questions.clear();
+      ctx.pendingTokenUsage.clear();
+      ctx.needsRestart = false;
+    });
+
     const sendTurn: Adapter["sendTurn"] = Effect.fn("MuseAdapter.sendTurn")(function* (input) {
-      const ctx = yield* requireSession(input.threadId);
+      let ctx = yield* requireSession(input.threadId);
       return yield* ctx.lock.withPermit(
         Effect.gen(function* () {
+          if (ctx.needsRestart) {
+            yield* restartSession(ctx);
+            ctx = yield* requireSession(input.threadId);
+          }
+
           if (ctx.stopped)
             return yield* requestError(
               "turn/start",
@@ -1012,6 +1185,13 @@ export function make(
           type: "session.state.changed",
           payload: { state: "ready" },
         });
+
+        // Terminate the underlying muse serve process immediately so file and git locks are released.
+        // The session state remains ready, and needsRestart ensures the next turn runs on a fresh process.
+        ctx.needsRestart = true;
+        yield* Scope.close(ctx.scope, Exit.void);
+        killMuseProcessTree(ctx.handshake);
+        ctx.stopped = false;
       },
     );
     const respondToRequest: Adapter["respondToRequest"] = Effect.fn("MuseAdapter.respondToRequest")(
