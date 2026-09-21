@@ -9004,23 +9004,31 @@ export default function ChatView(props: ChatViewProps) {
       setRespondingRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
       );
-      const result = await respondToThreadApproval({
-        environmentId,
-        input: {
-          threadId: activeThreadId,
-          requestId,
-          decision,
-        },
-      });
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThreadId,
-          error instanceof Error ? error.message : "Failed to submit approval decision.",
-        );
+      try {
+        const result = await respondToThreadApproval({
+          environmentId,
+          input: {
+            threadId: activeThreadId,
+            requestId,
+            decision,
+          },
+        });
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          const message =
+            error instanceof Error ? error.message : "Failed to submit approval decision.";
+          const isStale =
+            message.includes("no longer pending") ||
+            message.includes("already been answered") ||
+            message.includes("already answered");
+          if (!isStale) {
+            setThreadError(activeThreadId, message);
+          }
+        }
+        return result;
+      } finally {
+        setRespondingRequestIds((existing) => existing.filter((id) => id !== requestId));
       }
-      setRespondingRequestIds((existing) => existing.filter((id) => id !== requestId));
-      return result;
     },
     [activeThreadId, environmentId, respondToThreadApproval, setThreadError],
   );
@@ -9062,27 +9070,34 @@ export default function ChatView(props: ChatViewProps) {
       setRespondingUserInputRequestIds((existing) =>
         existing.includes(requestId) ? existing : [...existing, requestId],
       );
-      const result = await respondToThreadUserInput({
-        environmentId,
-        input: {
-          threadId: activeThreadId,
-          requestId,
-          answers,
-          ...(attachmentsByQuestionId.size > 0
-            ? { attachmentsByQuestionId: Object.fromEntries(attachmentsByQuestionId) }
-            : {}),
-        },
-      });
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThreadId,
-          error instanceof Error ? error.message : "Failed to submit user input.",
-        );
+      try {
+        const result = await respondToThreadUserInput({
+          environmentId,
+          input: {
+            threadId: activeThreadId,
+            requestId,
+            answers,
+            ...(attachmentsByQuestionId.size > 0
+              ? { attachmentsByQuestionId: Object.fromEntries(attachmentsByQuestionId) }
+              : {}),
+          },
+        });
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          const message = error instanceof Error ? error.message : "Failed to submit user input.";
+          const isStale =
+            message.includes("no longer pending") ||
+            message.includes("already been answered") ||
+            message.includes("already answered");
+          if (!isStale) {
+            setThreadError(activeThreadId, message);
+          }
+        }
+        return result;
+      } finally {
+        userInputResponsesInFlight.current.delete(responseKey);
+        setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
       }
-      userInputResponsesInFlight.current.delete(responseKey);
-      setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
-      return result;
     },
     [
       activeThreadId,

@@ -1599,6 +1599,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       });
       const request = userInputActivity;
       const attachments = Object.values(command.attachmentsByQuestionId ?? {}).flat();
+      if (
+        attachments.length === 0 &&
+        (request?.kind === "user-input.resolved" || request?.kind === "user-input.dismissed")
+      ) {
+        return [];
+      }
       let questionTextById: Record<string, string> = {};
       if (attachments.length > 0) {
         const payload =

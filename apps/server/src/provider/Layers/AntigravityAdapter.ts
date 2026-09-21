@@ -909,6 +909,7 @@ interface SessionContext {
   readonly respawnLock: Semaphore.Semaphore;
   readonly approvals: Map<ApprovalRequestId, PendingApproval>;
   readonly questions: Map<ApprovalRequestId, PendingQuestion>;
+  readonly recentlyResolvedRequests: Set<ApprovalRequestId>;
   readonly commands: Map<string, OpenCommand>;
   /** Keep only IDs after settlement or MCP exclusion so merged late updates cannot change identity. */
   readonly subagents: Map<string, OpenSubagent | "finished" | "mcp">;
@@ -938,6 +939,17 @@ interface SessionContext {
 }
 
 const CLIENT_FILE_MAX_BYTES = 8 * 1024 * 1024;
+
+function recordRecentlyResolvedRequest(
+  context: SessionContext,
+  requestId: ApprovalRequestId,
+): void {
+  context.recentlyResolvedRequests.add(requestId);
+  if (context.recentlyResolvedRequests.size > 200) {
+    const oldest = context.recentlyResolvedRequests.values().next().value;
+    if (oldest) context.recentlyResolvedRequests.delete(oldest);
+  }
+}
 
 function isInsideRoot(path: Path.Path, root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
@@ -1464,6 +1476,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           raw: { source: "acp.jsonrpc", method: "session/request_permission", payload: rawPayload },
         });
         const answer = yield* Deferred.await(response);
+        recordRecentlyResolvedRequest(context, requestId);
         yield* emit({
           type: "user-input.resolved",
           ...(yield* stamp),
@@ -1511,6 +1524,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         }),
       );
       const answer = yield* Deferred.await(response);
+      recordRecentlyResolvedRequest(context, requestId);
       yield* emit(
         makeAcpRequestResolvedEvent({
           stamp: yield* stamp,
@@ -2544,6 +2558,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             respawnLock: yield* Semaphore.make(1),
             approvals: new Map(),
             questions: new Map(),
+            recentlyResolvedRequests: new Set(),
             commands: new Map(),
             turns: [],
             subagents: new Map(),
@@ -3406,12 +3421,19 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       const context = yield* requireSession(threadId);
       const pending = context.approvals.get(requestId);
       if (!pending) {
+        if (context.recentlyResolvedRequests.has(requestId)) {
+          yield* Effect.logDebug(
+            `Approval request '${requestId}' was already resolved; ignoring duplicate response.`,
+          );
+          return;
+        }
         return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,
           method: "session/request_permission",
           detail: "This approval request is no longer pending.",
         });
       }
+      recordRecentlyResolvedRequest(context, requestId);
       const optionId =
         decision === "cancel"
           ? undefined
@@ -3438,12 +3460,19 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       const context = yield* requireSession(threadId);
       const pending = context.questions.get(requestId);
       if (!pending) {
+        if (context.recentlyResolvedRequests.has(requestId)) {
+          yield* Effect.logDebug(
+            `User input request '${requestId}' was already resolved; ignoring duplicate response.`,
+          );
+          return;
+        }
         return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,
           method: "session/request_permission",
           detail: "This question is no longer pending.",
         });
       }
+      recordRecentlyResolvedRequest(context, requestId);
       const result = makeAntigravityUserInputResponse(pending.request, answers);
       if (!result) {
         return yield* new ProviderAdapterValidationError({

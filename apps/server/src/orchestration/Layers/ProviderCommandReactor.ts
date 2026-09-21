@@ -157,14 +157,18 @@ function isUnknownPendingApprovalRequestError(cause: Cause.Cause<ProviderService
     return (
       detail.includes("unknown pending approval request") ||
       detail.includes("unknown pending permission request") ||
-      detail.includes("unknown pending codex approval request")
+      detail.includes("unknown pending codex approval request") ||
+      detail.includes("this approval request is no longer pending") ||
+      detail.includes("is no longer pending")
     );
   }
   const message = Cause.pretty(cause).toLowerCase();
   return (
     message.includes("unknown pending approval request") ||
     message.includes("unknown pending permission request") ||
-    message.includes("unknown pending codex approval request")
+    message.includes("unknown pending codex approval request") ||
+    message.includes("this approval request is no longer pending") ||
+    message.includes("is no longer pending")
   );
 }
 
@@ -175,14 +179,18 @@ function isUnknownPendingUserInputRequestError(cause: Cause.Cause<ProviderServic
     return (
       detail.includes("unknown pending user-input request") ||
       detail.includes("unknown pending user input request") ||
-      detail.includes("unknown pending codex user input request")
+      detail.includes("unknown pending codex user input request") ||
+      detail.includes("this question is no longer pending") ||
+      detail.includes("is no longer pending")
     );
   }
   const message = Cause.pretty(cause).toLowerCase();
   return (
     message.includes("unknown pending user-input request") ||
     message.includes("unknown pending user input request") ||
-    message.includes("unknown pending codex user input request")
+    message.includes("unknown pending codex user input request") ||
+    message.includes("this question is no longer pending") ||
+    message.includes("is no longer pending")
   );
 }
 
@@ -1715,19 +1723,22 @@ const make = Effect.gen(function* () {
         decision: event.payload.decision,
       })
       .pipe(
-        Effect.catchCause((cause) =>
-          appendProviderFailureActivity({
+        Effect.catchCause((cause) => {
+          if (isUnknownPendingApprovalRequestError(cause)) {
+            return Effect.logWarning(
+              `Stale or already resolved approval request '${event.payload.requestId}'; ignoring duplicate response.`,
+            );
+          }
+          return appendProviderFailureActivity({
             threadId: event.payload.threadId,
             kind: "provider.approval.respond.failed",
             summary: "Provider approval response failed",
-            detail: isUnknownPendingApprovalRequestError(cause)
-              ? stalePendingRequestDetail("approval", event.payload.requestId)
-              : Cause.pretty(cause),
+            detail: Cause.pretty(cause),
             turnId: null,
             createdAt: event.payload.createdAt,
             requestId: event.payload.requestId,
-          }),
-        ),
+          });
+        }),
       );
   });
 
@@ -1762,19 +1773,22 @@ const make = Effect.gen(function* () {
             : {}),
         })
         .pipe(
-          Effect.catchCause((cause) =>
-            appendProviderFailureActivity({
+          Effect.catchCause((cause) => {
+            if (isUnknownPendingUserInputRequestError(cause)) {
+              return Effect.logWarning(
+                `Stale or already resolved user input request '${event.payload.requestId}'; ignoring duplicate response.`,
+              );
+            }
+            return appendProviderFailureActivity({
               threadId: event.payload.threadId,
               kind: "provider.user-input.respond.failed",
               summary: "Provider user input response failed",
-              detail: isUnknownPendingUserInputRequestError(cause)
-                ? stalePendingRequestDetail("user-input", event.payload.requestId)
-                : Cause.pretty(cause),
+              detail: Cause.pretty(cause),
               turnId: null,
               createdAt: event.payload.createdAt,
               requestId: event.payload.requestId,
-            }),
-          ),
+            });
+          }),
         );
     },
   );

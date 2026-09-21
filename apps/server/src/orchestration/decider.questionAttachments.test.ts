@@ -107,6 +107,26 @@ it.layer(NodeServices.layer)("question attachment answers", (it) => {
       });
     }),
   );
+  it.effect(
+    "treats responses to already-resolved requests without attachments as idempotent no-ops",
+    () =>
+      Effect.gen(function* () {
+        const commandWithoutAttachments = {
+          ...command,
+          attachmentsByQuestionId: undefined,
+        };
+        const resolvedRequest = {
+          ...request,
+          kind: "user-input.resolved" as const,
+        };
+        const result = yield* decideOrchestrationCommand({
+          readModel,
+          command: commandWithoutAttachments,
+          userInputActivity: resolvedRequest,
+        });
+        expect(result).toEqual([]);
+      }),
+  );
   it.effect("rejects attachments for a resolved or unknown request", () =>
     Effect.gen(function* () {
       const result = yield* decideOrchestrationCommand({ readModel, command }).pipe(Effect.result);
