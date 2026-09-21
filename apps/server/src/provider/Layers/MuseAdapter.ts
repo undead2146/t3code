@@ -1581,7 +1581,7 @@ export function make(
         // runPromise begins synchronously inside receive(), before the
         // session-ready transition below runs. Yield first so the guards
         // observe the settled post-notification state, not the mid-receive one.
-        yield* Effect.yieldNow();
+        yield* Effect.yieldNow;
         if (delayMs > 0) yield* Effect.sleep(Duration.millis(delayMs));
         if (sessions.get(ctx.session.threadId) !== ctx || ctx.stopped) return;
         if (ctx.transientRetryPending !== record || record.cancelled) return;
@@ -1606,7 +1606,10 @@ export function make(
             ).pipe(
               Effect.flatMap(Schema.decodeUnknownEffect(TurnResult)),
               Effect.mapError((cause) => requestError("turn/start", cause)),
-              Effect.either,
+              Effect.match({
+                onFailure: (left) => ({ _tag: "Left", left }) as const,
+                onSuccess: (right) => ({ _tag: "Right", right }) as const,
+              }),
             );
             if (started._tag === "Left") {
               emit({

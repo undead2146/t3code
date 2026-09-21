@@ -1255,7 +1255,7 @@ describe("MuseAdapter transport truncation mitigation", () => {
         }
         expect(turnStartCommands()).toHaveLength(4);
 
-        const exhaustedFiber = adapter.streamEvents.pipe(
+        const exhaustedFiber = yield* adapter.streamEvents.pipe(
           Stream.filter(
             (event): event is Extract<ProviderRuntimeEvent, { type: "runtime.warning" }> =>
               event.type === "runtime.warning" &&
