@@ -1098,6 +1098,206 @@ describe("MuseAdapter transport truncation mitigation", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  describe("MuseAdapter transient failure auto-retry", () => {
+    const OVERLOADED_503 =
+      "API error 503 [request_id=6406c2fd-21a5-44b5-b82b-2eb3cd4f5841]: The backend is temporarily overloaded. Please retry. (server_error) (after 10 provider attempts)";
+
+    const makeAdapter = () =>
+      MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+        transientRetryDelaysMs: [0, 0, 0],
+      });
+
+    const startThread = (
+      adapter: Effect.Success<ReturnType<typeof MuseAdapter.make>>,
+      threadId: string,
+    ) =>
+      Effect.gen(function* () {
+        const session = yield* adapter.startSession({
+          threadId: ThreadId.make(threadId),
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+        return (session.resumeCursor as { sessionId: string }).sessionId;
+      });
+
+    const failTurn = (
+      turnId: string,
+      sessionId: string,
+      cursor: string,
+      message: string,
+      retryable: boolean,
+    ) =>
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: cursor,
+          turnId,
+          terminal: "failed",
+          error: { kind: "modelError", message, retryable },
+        },
+      });
+
+    const completeTurn = (turnId: string, sessionId: string, cursor: string) =>
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: cursor,
+          turnId,
+          terminal: "completed",
+        },
+      });
+
+    const collectRetryWarning = (
+      adapter: Effect.Success<ReturnType<typeof MuseAdapter.make>>,
+      turnId: string,
+    ) =>
+      adapter.streamEvents.pipe(
+        Stream.filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "runtime.warning" }> =>
+            event.type === "runtime.warning" &&
+            event.turnId === turnId &&
+            /retrying automatically/.test(event.payload.message),
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+    const collectTurnStarted = (
+      adapter: Effect.Success<ReturnType<typeof MuseAdapter.make>>,
+      turnId: string,
+    ) =>
+      adapter.streamEvents.pipe(
+        Stream.filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "turn.started" }> =>
+            event.type === "turn.started" && event.turnId === turnId,
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+    const turnStartCommands = () =>
+      mockCommands.filter((command) => command.method === "turn/start");
+
+    it.live("redrives a transiently failed turn with identical input", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeAdapter();
+        const threadId = ThreadId.make("thread-test-transient-retry");
+        const sessionId = yield* startThread(adapter, "thread-test-transient-retry");
+
+        const turn = yield* adapter.sendTurn({ threadId, input: "Flaky prompt" });
+        const warningFiber = yield* collectRetryWarning(adapter, turn.turnId);
+        mockTurnStartResponse = { status: "accepted", turnId: "retry-turn-1" };
+        failTurn(turn.turnId, sessionId, "cursor-fail-1", OVERLOADED_503, true);
+
+        const warning = yield* Fiber.join(warningFiber).pipe(Effect.timeoutOption("5 seconds"));
+        expect(Option.isSome(warning)).toBe(true);
+        if (Option.isSome(warning)) {
+          const [first] = Array.from(warning.value);
+          expect(first?.payload.message).toMatch(/attempt 1 of 3/);
+        }
+        const startedFiber = yield* collectTurnStarted(adapter, "retry-turn-1");
+        const started = yield* Fiber.join(startedFiber).pipe(Effect.timeoutOption("5 seconds"));
+        expect(Option.isSome(started)).toBe(true);
+
+        const starts = turnStartCommands();
+        expect(starts).toHaveLength(2);
+        expect(starts[1]?.params.input).toEqual(starts[0]?.params.input);
+
+        completeTurn("retry-turn-1", sessionId, "cursor-ok");
+        const sessions = yield* adapter.listSessions();
+        expect(sessions.find((s) => s.threadId === threadId)?.status).toBe("ready");
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("leaves fatal and vetoed failures alone", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeAdapter();
+        const threadId = ThreadId.make("thread-test-transient-fatal");
+        const sessionId = yield* startThread(adapter, "thread-test-transient-fatal");
+
+        const first = yield* adapter.sendTurn({ threadId, input: "Auth failure" });
+        failTurn(first.turnId, sessionId, "cursor-fail-auth", "authentication expired", false);
+        const second = yield* adapter.sendTurn({ threadId, input: "Vetoed overload" });
+        failTurn(second.turnId, sessionId, "cursor-fail-veto", OVERLOADED_503, false);
+
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 50)));
+        expect(turnStartCommands()).toHaveLength(2);
+        const sessions = yield* adapter.listSessions();
+        expect(sessions.find((s) => s.threadId === threadId)?.status).toBe("ready");
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("stops redriving after exhausting the retry budget", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeAdapter();
+        const threadId = ThreadId.make("thread-test-transient-exhausted");
+        const sessionId = yield* startThread(adapter, "thread-test-transient-exhausted");
+
+        const first = yield* adapter.sendTurn({ threadId, input: "Doomed prompt" });
+        let currentTurnId: string = first.turnId;
+        for (let attempt = 1; attempt <= 3; attempt += 1) {
+          const nextTurnId = `retry-turn-${attempt}`;
+          mockTurnStartResponse = { status: "accepted", turnId: nextTurnId };
+          const startedFiber = yield* collectTurnStarted(adapter, nextTurnId);
+          failTurn(currentTurnId, sessionId, `cursor-fail-${attempt}`, OVERLOADED_503, true);
+          expect(
+            Option.isSome(yield* Fiber.join(startedFiber).pipe(Effect.timeoutOption("5 seconds"))),
+          ).toBe(true);
+          currentTurnId = nextTurnId;
+        }
+        expect(turnStartCommands()).toHaveLength(4);
+
+        const exhaustedFiber = adapter.streamEvents.pipe(
+          Stream.filter(
+            (event): event is Extract<ProviderRuntimeEvent, { type: "runtime.warning" }> =>
+              event.type === "runtime.warning" &&
+              event.turnId === currentTurnId &&
+              /persisted through 3 automatic retries/.test(event.payload.message),
+          ),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        failTurn(currentTurnId, sessionId, "cursor-fail-final", OVERLOADED_503, true);
+        expect(
+          Option.isSome(yield* Fiber.join(exhaustedFiber).pipe(Effect.timeoutOption("5 seconds"))),
+        ).toBe(true);
+
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 50)));
+        expect(turnStartCommands()).toHaveLength(4);
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("lets a user send supersede a pending retry", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+          transientRetryDelaysMs: [50],
+        });
+        const threadId = ThreadId.make("thread-test-transient-superseded");
+        const sessionId = yield* startThread(adapter, "thread-test-transient-superseded");
+
+        const first = yield* adapter.sendTurn({ threadId, input: "Original prompt" });
+        failTurn(first.turnId, sessionId, "cursor-fail-1", OVERLOADED_503, true);
+        yield* adapter.sendTurn({ threadId, input: "Follow-up prompt" });
+
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 150)));
+        const starts = turnStartCommands();
+        expect(starts).toHaveLength(2);
+        expect(JSON.stringify(starts[1]?.params.input)).toContain("Follow-up prompt");
+      }).pipe(Effect.provide(testLayer)),
+    );
+  });
+
   describe("MuseAdapter skill dispatch", () => {
     const skillCatalog = (selectors: ReadonlyArray<string>) => ({
       skills: selectors.map((selector) => ({

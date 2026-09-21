@@ -8,6 +8,7 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 import {
   decodeMuseNotification,
+  isRetryableMuseError,
   mapMuseNotification,
   museTransportTruncationSignature,
   type MuseEventContext,
@@ -545,6 +546,33 @@ describe("MuseRuntimeEvents", () => {
     });
   });
 
+  describe("retryable error classification", () => {
+    const OVERLOADED_503 =
+      "API error 503 [request_id=6406c2fd-21a5-44b5-b82b-2eb3cd4f5841]: The backend is temporarily overloaded. Please retry. (server_error) (after 10 provider attempts)";
+
+    it("classifies transient backend, capacity, rate-limit, and network failures as retryable", () => {
+      expect(isRetryableMuseError(OVERLOADED_503)).toBe(true);
+      expect(isRetryableMuseError("request failed (code 503): No capacity available")).toBe(true);
+      expect(isRetryableMuseError("API error 429: rate limit exceeded, backing off")).toBe(true);
+      expect(isRetryableMuseError("API error 502: bad gateway")).toBe(true);
+      expect(isRetryableMuseError("fetch failed: socket hang up")).toBe(true);
+      expect(isRetryableMuseError("model request timed out after 120s")).toBe(true);
+      expect(isRetryableMuseError("rate limited, backing off")).toBe(true);
+    });
+
+    it("fails fast on fatal, quota, and deterministic failures", () => {
+      expect(isRetryableMuseError("authentication expired, re-authenticate")).toBe(false);
+      expect(isRetryableMuseError("API error 401: unauthorized")).toBe(false);
+      expect(isRetryableMuseError("API error 402: quota exhausted for this period")).toBe(false);
+      expect(isRetryableMuseError("usage limit reached, upgrade your plan")).toBe(false);
+      expect(isRetryableMuseError("request exceeds context length, compact first")).toBe(false);
+      expect(isRetryableMuseError(TRUNCATED_STREAM_FAILURE)).toBe(false);
+      expect(isRetryableMuseError("something else went wrong")).toBe(false);
+      expect(isRetryableMuseError("")).toBe(false);
+      expect(isRetryableMuseError(undefined)).toBe(false);
+    });
+  });
+
   describe("turn/completed mapping", () => {
     it("drops interim incomplete turn completions so outer turn stays active", () => {
       const raw = {
@@ -601,6 +629,69 @@ describe("MuseRuntimeEvents", () => {
       if (eventsFailed[0]?.type === "turn.completed") {
         expect(eventsFailed[0].payload.state).toBe("failed");
         expect(eventsFailed[0].payload.stopReason).toBe("error");
+      }
+    });
+
+    it("propagates the CLI retryable flag on failed turns", () => {
+      const rawRetryable = {
+        method: "turn/completed",
+        params: {
+          sessionId: "sess-1",
+          viewCursor: "cur-103",
+          turnId: "turn-retryable",
+          terminal: "failed",
+          error: { kind: "modelError", message: "API error 503: overloaded", retryable: true },
+        },
+      };
+      const eventsRetryable = mapMuseNotification(
+        decodeMuseNotification(rawRetryable),
+        createMockContext(),
+      );
+      expect(eventsRetryable).toHaveLength(1);
+      expect(eventsRetryable[0]?.type).toBe("turn.completed");
+      if (eventsRetryable[0]?.type === "turn.completed") {
+        expect(eventsRetryable[0].payload.state).toBe("failed");
+        expect(eventsRetryable[0].payload.errorMessage).toBe("API error 503: overloaded");
+        expect(eventsRetryable[0].payload.retryable).toBe(true);
+      }
+
+      const rawFatal = {
+        method: "turn/completed",
+        params: {
+          sessionId: "sess-1",
+          viewCursor: "cur-104",
+          turnId: "turn-fatal",
+          terminal: "failed",
+          error: { kind: "authError", message: "authentication expired", retryable: false },
+        },
+      };
+      const eventsFatal = mapMuseNotification(
+        decodeMuseNotification(rawFatal),
+        createMockContext(),
+      );
+      expect(eventsFatal).toHaveLength(1);
+      expect(eventsFatal[0]?.type).toBe("turn.completed");
+      if (eventsFatal[0]?.type === "turn.completed") {
+        expect(eventsFatal[0].payload.retryable).toBe(false);
+      }
+    });
+
+    it("omits retryable when the CLI reports no error", () => {
+      const raw = {
+        method: "turn/completed",
+        params: {
+          sessionId: "sess-1",
+          viewCursor: "cur-105",
+          turnId: "turn-no-error",
+          terminal: "failed",
+          reason: "error",
+        },
+      };
+      const events = mapMuseNotification(decodeMuseNotification(raw), createMockContext());
+      expect(events).toHaveLength(1);
+      expect(events[0]?.type).toBe("turn.completed");
+      if (events[0]?.type === "turn.completed") {
+        expect(events[0].payload.retryable).toBeUndefined();
       }
     });
   });

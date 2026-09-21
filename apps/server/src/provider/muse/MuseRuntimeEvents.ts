@@ -264,6 +264,64 @@ export function museTransportTruncationSignature(message: string | undefined): s
   return MUSE_TRANSPORT_TRUNCATION_SIGNATURE;
 }
 
+const MUSE_TRANSIENT_FAILURE_MARKERS = [
+  "temporarily overloaded",
+  "overloaded",
+  "server_error",
+  "server error",
+  "bad gateway",
+  "service unavailable",
+  "gateway timeout",
+  "temporarily unavailable",
+  "try again",
+  "please retry",
+  "high demand",
+  "capacity",
+  "unreachable",
+  "rate limit",
+  "rate_limit",
+  "too many requests",
+  "timed out",
+  "timeout",
+  "econnreset",
+  "etimedout",
+  "socket hang up",
+  "fetch failed",
+  "network error",
+  "connection reset",
+  "connection aborted",
+];
+const MUSE_FATAL_FAILURE_MARKERS = [
+  "unauthorized",
+  "authentication",
+  "invalid api key",
+  "invalid key",
+  "forbidden",
+  "quota",
+  "billing",
+  "payment",
+  "insufficient",
+  "usage limit",
+  "context length",
+  "too many tokens",
+  "max tokens",
+  "invalid request",
+  "validation",
+];
+// Classifies turn failures worth a T3-level automatic retry: transient backend,
+// capacity, rate-limit, and network failures where an identical redrive can
+// succeed. Fatal markers (auth, quota/billing, context limits, malformed
+// requests) and deterministic transport truncation fail fast instead, since
+// retrying those unchanged can never succeed.
+export function isRetryableMuseError(message: string | undefined): boolean {
+  if (!message) return false;
+  const lowered = message.toLowerCase();
+  if (MUSE_FATAL_FAILURE_MARKERS.some((marker) => lowered.includes(marker))) return false;
+  if (museTransportTruncationSignature(message) !== undefined) return false;
+  if (/\b50[234]\b/.test(lowered) || /\b429\b/.test(lowered)) return true;
+  return MUSE_TRANSIENT_FAILURE_MARKERS.some((marker) => lowered.includes(marker));
+}
+
 export function museApprovalDecision(
   decision: string,
   scope?: string,
@@ -763,6 +821,7 @@ export function mapMuseNotification(
                   : "failed",
             ...(params.reason ? { stopReason: params.reason } : {}),
             ...(params.error?.message ? { errorMessage: params.error.message } : {}),
+            ...(params.error?.retryable !== undefined ? { retryable: params.error.retryable } : {}),
             ...(params.usage ? { usage: params.usage } : {}),
           },
         },

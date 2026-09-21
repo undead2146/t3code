@@ -58,6 +58,7 @@ import {
 import {
   decodeMuseNotification,
   isMuseNotificationMethod,
+  isRetryableMuseError,
   itemType,
   mapMuseNotification,
   MuseItem,
@@ -174,6 +175,9 @@ interface SessionContext {
   transportRetryStreak: { turnId: string; signature: string; count: number } | undefined;
   lastTransportMitigationTurnId: string | undefined;
   transportStreakCompacted: boolean;
+  lastTurnStart: { parts: Array<Record<string, unknown>>; reasoningEffort?: string } | undefined;
+  transientFailureStreak: { count: number } | undefined;
+  transientRetryPending: { failedTurnId: string; attempt: number; cancelled: boolean } | undefined;
   startInput: StartSessionInput;
   needsRestart?: boolean;
   lastViewCursor?: string;
@@ -185,6 +189,27 @@ interface SessionContext {
 // transient blips recover within an attempt or two, while a deterministic cutoff fails
 // all ten CLI attempts the same way.
 const TRANSPORT_TRUNCATION_INTERRUPT_STREAK = 4;
+
+// T3-level redrives of turns the CLI failed with a transient backend error
+// (503/overloaded/rate-limit/network). The CLI already burned its own ten
+// attempts, so this is a small second budget with backoff, mirroring the
+// Antigravity adapter's MAX_TURN_RETRIES — but patient: post-exhaustion
+// implies an outage measured in minutes, and each redrive can itself fail
+// slowly, so attempts wait for the backend to plausibly recover instead of
+// hammering it. Deterministic failures (truncation, auth, quota) never
+// consume it.
+const MUSE_TRANSIENT_RETRY_DELAYS_MS = [15_000, 60_000, 300_000];
+
+// Item kinds whose presence means the turn already acted on the world: an
+// automatic redrive would execute them twice, so those turns fail with
+// retryable:true for a manual resend instead.
+const TRANSIENT_RETRY_SIDE_EFFECT_KINDS: ReadonlySet<string> = new Set([
+  "userShell",
+  "toolCall",
+  "subagent",
+  "workflow",
+  "reminderChild",
+]);
 
 function hasActiveWorkflowOrSubagent(ctx: SessionContext): boolean {
   for (const item of ctx.items.values()) {
@@ -237,6 +262,7 @@ export function make(
   options?: {
     environment?: NodeJS.ProcessEnv;
     instanceId?: ProviderInstanceId;
+    transientRetryDelaysMs?: ReadonlyArray<number>;
   },
 ) {
   return Effect.gen(function* () {
@@ -251,6 +277,7 @@ export function make(
     const lifecycle = yield* Semaphore.make(1);
     const mintEventId = createUuidV7Mint();
     const nextEventId = () => EventId.make(mintEventId());
+    const transientRetryDelays = options?.transientRetryDelaysMs ?? MUSE_TRANSIENT_RETRY_DELAYS_MS;
     const requestError = (method: string, cause: unknown) => {
       let detail = "Muse Code rejected the request or its response was invalid.";
       if (typeof cause === "string" && cause.trim().length > 0) {
@@ -591,8 +618,42 @@ export function make(
         if (event.params.terminal === "completed") {
           ctx.lastTransportMitigationTurnId = undefined;
           ctx.transportStreakCompacted = false;
+          ctx.transientFailureStreak = undefined;
+          ctx.transientRetryPending = undefined;
+          ctx.lastTurnStart = undefined;
         } else if (museTransportTruncationSignature(event.params.error?.message)) {
+          ctx.transientFailureStreak = undefined;
           mitigateTransportTruncation(ctx, event.params.turnId, false);
+        } else if (
+          transientRetryDelays.length > 0 &&
+          event.params.error?.retryable !== false &&
+          isRetryableMuseError(event.params.error?.message) &&
+          ctx.lastTurnStart
+        ) {
+          const used = ctx.transientFailureStreak?.count ?? 0;
+          if (used >= transientRetryDelays.length) {
+            ctx.transientFailureStreak = undefined;
+            emit({
+              ...base(ctx),
+              type: "runtime.warning",
+              turnId: TurnId.make(event.params.turnId),
+              payload: {
+                message: `Muse backend errors persisted through ${transientRetryDelays.length} automatic retries. The turn failed — resend your message to try again; the error above carries the provider request id for support.`,
+              },
+            });
+          } else {
+            // A refused redrive (tools already ran) ends the streak without
+            // consuming budget, so a later manual resend retries fresh.
+            const scheduled = scheduleTransientRetry(
+              ctx,
+              event.params.turnId,
+              event.params.error?.message ?? "unknown error",
+              used + 1,
+            );
+            ctx.transientFailureStreak = scheduled ? { count: used + 1 } : undefined;
+          }
+        } else {
+          ctx.transientFailureStreak = undefined;
         }
       }
       if (event.method === "approval/resolved") ctx.approvals.delete(event.params.approvalId);
@@ -732,6 +793,9 @@ export function make(
               transportRetryStreak: undefined,
               lastTransportMitigationTurnId: undefined,
               transportStreakCompacted: false,
+              lastTurnStart: undefined,
+              transientFailureStreak: undefined,
+              transientRetryPending: undefined,
               startInput: input,
               needsRestart: false,
             };
@@ -1061,6 +1125,7 @@ export function make(
       let ctx = yield* requireSession(input.threadId);
       return yield* ctx.lock.withPermit(
         Effect.gen(function* () {
+          cancelTransientRetry(ctx);
           if (ctx.needsRestart) {
             yield* restartSession(ctx);
             ctx = yield* requireSession(input.threadId);
@@ -1189,6 +1254,10 @@ export function make(
           const effort = input.modelSelection
             ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
             : undefined;
+          ctx.lastTurnStart = {
+            parts,
+            ...(effort ? { reasoningEffort: effort } : {}),
+          };
           const result = yield* attempt(
             "turn/start",
             () =>
@@ -1245,6 +1314,7 @@ export function make(
     const interruptTurn: Adapter["interruptTurn"] = Effect.fn("MuseAdapter.interruptTurn")(
       function* (threadId, turnId) {
         const ctx = yield* requireSession(threadId);
+        cancelTransientRetry(ctx);
         const target = turnId ?? ctx.session.activeTurnId;
         if (!target || (turnId && ctx.session.activeTurnId !== turnId)) {
           if (ctx.session.status === "connecting") {
@@ -1456,6 +1526,125 @@ export function make(
           },
         });
     });
+    // A user send or interrupt supersedes a scheduled automatic redrive: the
+    // pending task observes the cancellation at fire time and stays silent.
+    const cancelTransientRetry = (ctx: SessionContext) => {
+      if (ctx.transientRetryPending) {
+        ctx.transientRetryPending.cancelled = true;
+        ctx.transientRetryPending = undefined;
+      }
+      ctx.transientFailureStreak = undefined;
+    };
+    // Redrives a turn the CLI failed with a transient backend error as a new
+    // turn/start with identical input, so checkpoints and the work log record
+    // each attempt honestly and only the terminal outcome settles the thread.
+    const scheduleTransientRetry = (
+      ctx: SessionContext,
+      failedTurnId: string,
+      message: string,
+      attemptNumber: number,
+    ): boolean => {
+      const delayMs = transientRetryDelays[attemptNumber - 1] ?? 30_000;
+      for (const item of ctx.items.values()) {
+        if (item.turnId === failedTurnId && TRANSIENT_RETRY_SIDE_EFFECT_KINDS.has(item.kind)) {
+          emit({
+            ...base(ctx),
+            type: "runtime.warning",
+            turnId: TurnId.make(failedTurnId),
+            payload: {
+              message:
+                "Muse backend error is transient, but the failed turn already executed tools, so it was not retried automatically — re-running them could apply side effects twice. Resend your message to retry manually.",
+            },
+          });
+          return false;
+        }
+      }
+      const record = { failedTurnId, attempt: attemptNumber, cancelled: false };
+      ctx.transientRetryPending = record;
+      emit({
+        ...base(ctx),
+        type: "session.state.changed",
+        payload: {
+          state: "running",
+          reason: `api_retry:${attemptNumber}/${transientRetryDelays.length}`,
+        },
+      });
+      emit({
+        ...base(ctx),
+        type: "runtime.warning",
+        turnId: TurnId.make(failedTurnId),
+        payload: {
+          message: `Muse backend error — retrying automatically in ${delayMs / 1_000}s (attempt ${attemptNumber} of ${transientRetryDelays.length}): ${message}`,
+        },
+      });
+      const task = Effect.gen(function* () {
+        // runPromise begins synchronously inside receive(), before the
+        // session-ready transition below runs. Yield first so the guards
+        // observe the settled post-notification state, not the mid-receive one.
+        yield* Effect.yieldNow();
+        if (delayMs > 0) yield* Effect.sleep(Duration.millis(delayMs));
+        if (sessions.get(ctx.session.threadId) !== ctx || ctx.stopped) return;
+        if (ctx.transientRetryPending !== record || record.cancelled) return;
+        const redrive = ctx.lastTurnStart;
+        if (!redrive || ctx.needsRestart) return;
+        if (ctx.session.status !== "ready" || ctx.session.activeTurnId) return;
+        yield* ctx.lock.withPermit(
+          Effect.gen(function* () {
+            if (sessions.get(ctx.session.threadId) !== ctx || ctx.stopped) return;
+            if (ctx.transientRetryPending !== record || record.cancelled) return;
+            const live = ctx.lastTurnStart;
+            if (!live || ctx.needsRestart) return;
+            if (ctx.session.status !== "ready" || ctx.session.activeTurnId) return;
+            ctx.transientRetryPending = undefined;
+            const started = yield* attempt("turn/start", () =>
+              ctx.host.connection.command("turn/start", {
+                sessionId: ctx.sessionId,
+                input: live.parts,
+                ifBusy: "queue",
+                ...(live.reasoningEffort ? { reasoningEffort: live.reasoningEffort } : {}),
+              }),
+            ).pipe(
+              Effect.flatMap(Schema.decodeUnknownEffect(TurnResult)),
+              Effect.mapError((cause) => requestError("turn/start", cause)),
+              Effect.either,
+            );
+            if (started._tag === "Left") {
+              emit({
+                ...base(ctx),
+                type: "runtime.warning",
+                turnId: TurnId.make(failedTurnId),
+                payload: {
+                  message: `Automatic retry ${attemptNumber} of ${transientRetryDelays.length} failed to start a new turn: ${started.left.detail}. Resend your message to try again.`,
+                },
+              });
+              return;
+            }
+            const result = started.right;
+            if (result.disposition !== "queued") {
+              ctx.settledTurns.delete(result.turnId);
+              emit({
+                ...base(ctx),
+                type: "turn.started",
+                turnId: TurnId.make(result.turnId),
+                payload: {},
+              });
+            }
+            if (result.disposition !== "queued" && !ctx.settledTurns.has(result.turnId)) {
+              ctx.session = {
+                ...ctx.session,
+                status: "running",
+                activeTurnId: TurnId.make(result.turnId),
+                updatedAt: nowIso(),
+              };
+              startDrainTimer(ctx);
+            }
+          }),
+        );
+      });
+      // MSP invokes this at its native callback boundary, outside an Effect fiber.
+      void Effect.runPromise(task).catch(() => undefined);
+      return true;
+    };
     // Breaks a deterministic truncated-stream failure streak: the CLI replays the same
     // cutoff on every attempt, so retrying unchanged cannot succeed. Compacts once per
     // streak, then escalates to guidance instead of compacting in a loop.
@@ -1527,6 +1716,7 @@ export function make(
       // MSP invokes this at its native callback boundary, outside an Effect fiber.
       void Effect.runPromise(task).catch(() => undefined);
     };
+
     yield* Effect.addFinalizer(() => stopAll().pipe(Effect.ensuring(Queue.shutdown(events))));
     return {
       provider: PROVIDER,

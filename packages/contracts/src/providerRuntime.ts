@@ -367,6 +367,9 @@ const TurnCompletedPayload = Schema.Struct({
   modelUsage: Schema.optional(UnknownRecordSchema),
   totalCostUsd: Schema.optional(Schema.Number),
   errorMessage: Schema.optional(TrimmedNonEmptyStringSchema),
+  // Set when the provider classified the failure as transient (e.g. Muse's
+  // turn/completed error.retryable): resending the turn may succeed.
+  retryable: Schema.optional(Schema.Boolean),
   tokenUsage: Schema.optional(TurnTokenUsage),
 });
 export type TurnCompletedPayload = typeof TurnCompletedPayload.Type;

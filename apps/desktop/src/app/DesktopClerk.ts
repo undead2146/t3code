@@ -153,6 +153,8 @@ export const make = Effect.gen(function* () {
             const mainWindow = yield* electronWindow.currentMainOrFirst;
             if (Option.isSome(mainWindow)) {
               yield* electronWindow.reveal(mainWindow.value);
+            } else {
+              yield* desktopWindow.revealOrCreateMain;
             }
           }),
         );

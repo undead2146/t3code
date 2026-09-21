@@ -233,6 +233,49 @@ describe("DesktopClerk", () => {
     );
   });
 
+  it.effect("handles second-instance by creating or revealing main when none exists", () => {
+    storageMock.mockReturnValue(storageAdapter);
+    createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
+    let secondInstanceListener: ((event: unknown, argv: readonly string[]) => void) | undefined;
+    const electronApp = {
+      quit: Effect.void,
+      on: (eventName: string, listener: any) =>
+        Effect.sync(() => {
+          if (eventName === "second-instance") {
+            secondInstanceListener = listener;
+          }
+        }),
+    } as unknown as ElectronApp.ElectronApp["Service"];
+    let mainRevealedOrCreate = false;
+    const electronWindow = {
+      currentMainOrFirst: Effect.succeed(Option.none()),
+      reveal: () => Effect.void,
+    } as unknown as ElectronWindow.ElectronWindow["Service"];
+    const desktopWindow = {
+      revealOrCreateMain: Effect.sync(() => {
+        mainRevealedOrCreate = true;
+        return {} as Electron.BrowserWindow;
+      }),
+      openPullRequests: Effect.void,
+    } as unknown as DesktopWindow.DesktopWindow["Service"];
+
+    return Effect.gen(function* () {
+      const clerk = yield* DesktopClerk.DesktopClerk;
+      yield* clerk.configure;
+
+      assert.isFunction(secondInstanceListener);
+      secondInstanceListener?.({}, ["app"]);
+      yield* Effect.yieldNow;
+      assert.isTrue(mainRevealedOrCreate);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(makeDesktopClerkLayer()),
+      Effect.provideService(ElectronApp.ElectronApp, electronApp),
+      Effect.provideService(ElectronWindow.ElectronWindow, electronWindow),
+      Effect.provideService(DesktopWindow.DesktopWindow, desktopWindow),
+    );
+  });
+
   it.effect("quits and interrupts startup in a secondary instance", () => {
     storageMock.mockReturnValue(storageAdapter);
     createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: false });
