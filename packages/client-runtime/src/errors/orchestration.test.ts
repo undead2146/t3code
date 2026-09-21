@@ -5,6 +5,7 @@ import {
   isBootstrapThreadAlreadyExists,
   shouldRotateBootstrapThreadId,
   wasBootstrapThreadDeleted,
+  wasBootstrapThreadNotCreated,
 } from "./orchestration.ts";
 
 describe("wasBootstrapThreadDeleted", () => {
@@ -72,5 +73,32 @@ describe("shouldRotateBootstrapThreadId", () => {
         new OrchestrationDispatchCommandError({ message: "Network error" }),
       ),
     ).toBe(false);
+  });
+});
+
+describe("wasBootstrapThreadNotCreated", () => {
+  it("accepts only a confirmed never-created bootstrap thread", () => {
+    const notCreated = new OrchestrationDispatchCommandError({
+      message: "A separate worktree requires a base commit.",
+      bootstrapThreadDisposition: "not-created",
+    });
+    expect(wasBootstrapThreadNotCreated(notCreated)).toBe(true);
+    expect(wasBootstrapThreadDeleted(notCreated)).toBe(false);
+    expect(
+      wasBootstrapThreadNotCreated(
+        new OrchestrationDispatchCommandError({
+          message: "Failed to create worktree.",
+          bootstrapThreadDisposition: "deleted",
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      wasBootstrapThreadNotCreated(
+        new OrchestrationDispatchCommandError({
+          message: "Failed to create worktree.",
+        }),
+      ),
+    ).toBe(false);
+    expect(wasBootstrapThreadNotCreated(new Error("connection lost"))).toBe(false);
   });
 });

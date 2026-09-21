@@ -27,3 +27,9 @@ export function isBootstrapThreadAlreadyExists(error: unknown): boolean {
 export function shouldRotateBootstrapThreadId(error: unknown): boolean {
   return wasBootstrapThreadDeleted(error) || isBootstrapThreadAlreadyExists(error);
 }
+
+export function wasBootstrapThreadNotCreated(error: unknown): boolean {
+  return (
+    isOrchestrationDispatchCommandError(error) && error.bootstrapThreadDisposition === "not-created"
+  );
+}
