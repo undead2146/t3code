@@ -740,7 +740,7 @@ const SidebarDraftRow = memo(function SidebarDraftRow(props: {
       ? promptPreview
       : attachmentCount > 0
         ? `${attachmentCount} attachment${attachmentCount === 1 ? "" : "s"}`
-        : session.promotedTo && props.isSubmitting
+        : session.promotedTo
           ? "Starting thread..."
           : "New thread";
   const handleActivate = useCallback(() => onNavigate(draftId), [draftId, onNavigate]);
@@ -901,30 +901,29 @@ const SidebarDraftBlock = memo(function SidebarDraftBlock(props: {
       const composer = draftsByThreadKey[draftKey];
       const isSubmitting =
         session.promotedTo != null &&
-        backgroundSubmissionThreadKeys[scopedThreadKey(session.promotedTo)] === true;
+        (backgroundSubmissionThreadKeys[scopedThreadKey(session.promotedTo)] === true ||
+          readThreadShell(session.promotedTo) === null);
       if (session.promotedTo != null) {
-        if (isSubmitting) {
-          rows.push({
-            draftId: DraftId.make(draftKey),
-            session,
-            composer: composer ?? {
-              prompt: "",
-              images: [],
-              files: [],
-              nonPersistedImageIds: [],
-              persistedAttachments: [],
-              terminalContexts: [],
-              previewAnnotations: [],
-              reviewComments: [],
-              modelSelectionByProvider: {},
-              activeProvider: null,
-              runtimeMode: null,
-              interactionMode: null,
-            },
-            isSubmitting: true,
-          });
-          continue;
-        }
+        rows.push({
+          draftId: DraftId.make(draftKey),
+          session,
+          composer: composer ?? {
+            prompt: "",
+            images: [],
+            files: [],
+            nonPersistedImageIds: [],
+            persistedAttachments: [],
+            terminalContexts: [],
+            previewAnnotations: [],
+            reviewComments: [],
+            modelSelectionByProvider: {},
+            activeProvider: null,
+            runtimeMode: null,
+            interactionMode: null,
+          },
+          isSubmitting: true,
+        });
+        continue;
       }
       if (!composer || !composerDraftHasUserContent(composer)) {
         continue;
@@ -2523,10 +2522,8 @@ export default function Sidebar() {
         if (readThreadShell(session.promotedTo) !== null) {
           continue;
         }
-        if (store.backgroundSubmissionThreadKeys[scopedThreadKey(session.promotedTo)] === true) {
-          count += 1;
-          continue;
-        }
+        count += 1;
+        continue;
       }
       if (!composerDraftHasUserContent(store.draftsByThreadKey[draftKey])) {
         continue;
@@ -2703,7 +2700,15 @@ export default function Sidebar() {
       settledThreads: sortSettledThreadsForSidebar(settled),
       snoozeNow: preciseNow,
     };
-  }, [nowMinute, optimisticDrop, scopedProjectKeys, serverConfigs, snoozeWakeTick, threads]);
+  }, [
+    nowMinute,
+    optimisticDrop,
+    routeThreadKey,
+    scopedProjectKeys,
+    serverConfigs,
+    snoozeWakeTick,
+    threads,
+  ]);
 
   const threadSearchInputRef = useRef<HTMLInputElement>(null);
   const [threadSearchQuery, setThreadSearchQuery] = useState("");
@@ -2991,7 +2996,7 @@ export default function Sidebar() {
         setOpenMobile(false);
       }
       const session = useComposerDraftStore.getState().getDraftSession(draftId);
-      if (session?.promotedTo && readThreadShell(session.promotedTo) !== null) {
+      if (session?.promotedTo) {
         void router.navigate({
           to: "/$environmentId/$threadId",
           params: buildThreadRouteParams(session.promotedTo),

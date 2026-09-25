@@ -8780,7 +8780,10 @@ export default function ChatView(props: ChatViewProps) {
           markPromotedDraftThreadByRef(scopeThreadRef(environmentId, threadIdForSend));
         }
         if (backgroundThreadRef) {
-          if (backgroundDraftOpened || currentRouteThreadKeyRef.current !== routeThreadKey) {
+          if (
+            (backgroundDraftOpened || currentRouteThreadKeyRef.current !== routeThreadKey) &&
+            readThreadShell(backgroundThreadRef) !== null
+          ) {
             finalizePromotedDraftThreadByRef(backgroundThreadRef);
           } else {
             clearBackgroundDraftSubmissionByRef(backgroundThreadRef);

@@ -165,6 +165,10 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
     }
     const draftId = useComposerDraftStore.getState().getDraftIdByRef(target.threadRef);
     if (draftId) {
+      const session = useComposerDraftStore.getState().getDraftSession(draftId);
+      if (session?.promotedTo) {
+        return;
+      }
       void navigate({ to: "/draft/$draftId", params: { draftId }, replace: true });
       return;
     }
@@ -207,7 +211,7 @@ export function ThreadRouteView({ target }: { target: ThreadRouteTarget }) {
         />
       );
     }
-  } else if (serverThreadShell !== null && (renderState === "ready" || renderState === "loading")) {
+  } else if (renderState === "ready" || (renderState === "loading" && serverThreadShell !== null)) {
     view = (
       <ChatView
         {...(nextChatViewKey ? { key: nextChatViewKey.key } : {})}
