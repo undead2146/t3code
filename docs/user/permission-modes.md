@@ -30,4 +30,6 @@ actions still require approval.
 Antigravity can still send native approval requests in **Full access**. It only offers remembered
 approvals for actions that support them.
 
+Kiro asks before each tool it does not already trust, and T3 Code answers according to the mode. Tools the Kiro agent trusts on its own, such as reads and searches, never ask.
+
 See the [provider guides](./install.md#providers) for setup and provider-specific limits.

@@ -12,6 +12,7 @@ import {
   sessionUpdateIsReplay,
   syntheticLoadSessionResponseFromInitialize,
   toolCallProgressLength,
+  withKnownToolCall,
   type AcpToolCallState,
 } from "./AcpRuntimeModel.ts";
 
@@ -876,6 +877,74 @@ describe("AcpRuntimeModel", () => {
           skippedSinceEmit,
         }),
       ).toEqual({ emit: true, skippedSinceEmit: 0 });
+    });
+  });
+  describe("withKnownToolCall", () => {
+    it("fills missing kind, title, and locations from known tool call state", () => {
+      const baseRequest = {
+        sessionId: "session-1",
+        options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" as const }],
+        toolCall: {
+          toolCallId: "tool-1",
+          status: "pending" as const,
+        },
+      };
+      const known: AcpToolCallState = {
+        toolCallId: "tool-1",
+        title: "Edit file",
+        kind: "edit",
+        status: "pending",
+        data: {
+          title: "Edit file",
+          locations: [{ path: "src/index.ts" }],
+        },
+      };
+
+      const result = withKnownToolCall(baseRequest, known);
+      expect(result.toolCall.kind).toBe("edit");
+      expect(result.toolCall.title).toBe("Edit file");
+      expect(result.toolCall.locations).toEqual([{ path: "src/index.ts" }]);
+    });
+
+    it("preserves explicit kind, title, and locations from the permission request", () => {
+      const baseRequest = {
+        sessionId: "session-1",
+        options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" as const }],
+        toolCall: {
+          toolCallId: "tool-1",
+          kind: "execute" as const,
+          title: "Run command",
+          status: "pending" as const,
+          locations: [{ path: "other.ts" }],
+        },
+      };
+      const known: AcpToolCallState = {
+        toolCallId: "tool-1",
+        title: "Edit file",
+        kind: "edit",
+        status: "pending",
+        data: {
+          title: "Edit file",
+          locations: [{ path: "src/index.ts" }],
+        },
+      };
+
+      const result = withKnownToolCall(baseRequest, known);
+      expect(result.toolCall.kind).toBe("execute");
+      expect(result.toolCall.title).toBe("Run command");
+      expect(result.toolCall.locations).toEqual([{ path: "other.ts" }]);
+    });
+
+    it("returns request unchanged when known state is undefined", () => {
+      const baseRequest = {
+        sessionId: "session-1",
+        options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" as const }],
+        toolCall: {
+          toolCallId: "tool-1",
+          status: "pending" as const,
+        },
+      };
+      expect(withKnownToolCall(baseRequest, undefined)).toBe(baseRequest);
     });
   });
 });

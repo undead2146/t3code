@@ -148,6 +148,7 @@ const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER_KIND = ProviderDriverKind.make("cursor");
 const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
+const KIRO_DRIVER_KIND = ProviderDriverKind.make("kiro");
 
 export const DEFAULT_MODEL = "gpt-6-astra";
 
@@ -174,6 +175,8 @@ export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, strin
   [CURSOR_DRIVER_KIND]: "auto",
   // Product slug, not an ACP model id. The Grok adapter treats it as "the session's current model".
   [GROK_DRIVER_KIND]: "grok-build",
+  // Kiro's own "auto" model id: the CLI picks a model per task.
+  [KIRO_DRIVER_KIND]: "auto",
   [ProviderDriverKind.make("muse")]: MUSE_DEFAULT_MODEL,
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
   [ProviderDriverKind.make("antigravity")]: ANTIGRAVITY_DEFAULT_MODEL,
@@ -216,7 +219,7 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
   [OPENCODE_DRIVER_KIND]: {},
 };
 
-// ── Provider display names ────────────────────────────────────────────
+// ── Provider display names ───────────────────────────────────────────────────
 
 export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>> = {
   [ProviderDriverKind.make("antigravity")]: "Antigravity",
@@ -224,6 +227,7 @@ export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>>
   [CLAUDE_DRIVER_KIND]: "Claude",
   [CURSOR_DRIVER_KIND]: "Cursor",
   [GROK_DRIVER_KIND]: "Grok",
+  [KIRO_DRIVER_KIND]: "Kiro",
   [ProviderDriverKind.make("muse")]: "Muse Code",
   [OPENCODE_DRIVER_KIND]: "OpenCode",
 };

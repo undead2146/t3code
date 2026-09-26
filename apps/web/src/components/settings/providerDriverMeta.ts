@@ -4,6 +4,7 @@ import {
   CodexSettings,
   CursorSettings,
   GrokSettings,
+  KiroSettings,
   MuseSettings,
   OpenCodeSettings,
   ProviderDriverKind,
@@ -15,6 +16,7 @@ import {
   CursorIcon,
   GrokIcon,
   type Icon,
+  KiroIcon,
   MetaIcon,
   OpenAI,
   OpenCodeIcon,
@@ -85,6 +87,12 @@ const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
     settingsSchema: OpenCodeSettings,
   },
   {
+    value: ProviderDriverKind.make("kiro"),
+    label: "Kiro",
+    icon: KiroIcon,
+    settingsSchema: KiroSettings,
+  },
+  {
     value: ProviderDriverKind.make("muse"),
     label: "Muse Code",
     icon: MetaIcon,
@@ -108,7 +116,6 @@ export type DriverOption = ProviderClientDefinition;
  * Returns `undefined` for fork / unknown drivers so callers can decide how
  * to render them — typically by falling back to a generic card.
  */
-export function getDriverOption(driver: ProviderDriverKind | undefined): DriverOption | undefined {
-  if (driver === undefined) return undefined;
-  return PROVIDER_CLIENT_DEFINITION_BY_VALUE[driver];
+export function getDriverOption(driver: ProviderDriverKind): DriverOption | undefined {
+  return DRIVER_OPTION_BY_VALUE[driver];
 }
