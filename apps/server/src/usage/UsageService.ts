@@ -1,14 +1,14 @@
 /**
  * UsageService - scans provider transcripts and returns priced usage buckets.
  *
- * The scan reads the provider CLIs' own session files (Claude Code, Codex, and
- * Grok Build) rather than T3 Code's orchestration projections, so usage covers
- * turns driven outside T3 Code too. This is the approach `ccusage` takes.
+ * The scan reads native session files and databases, including work driven
+ * outside T3 Code. Cursor's local records provide only partial coverage.
  *
- * Transcripts are append-only, so parsed records are memoised per file by
+ * JSONL transcripts are append-only, so parsed records are memoised per file by
  * `(size, mtime)`. A cold 30-day scan of ~1.4 GB lands around 2-3 seconds; warm
  * scans only reparse files that changed, and a file that merely grew resumes
  * from its cached parse position so only the appended bytes are read.
+ * SQLite readers query live databases each scan so WAL writes remain visible.
  *
  * @module UsageService
  */
@@ -25,7 +25,6 @@ import {
   type ServerSettings as ServerSettingsValue,
   type UsageProviderKind,
   type UsageSource,
-  type UsageSourceStatus,
   type UsagePricing,
   type UsageSummary,
   type UsageSummaryInput,
@@ -35,6 +34,7 @@ import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hos
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -50,11 +50,11 @@ import { ServerConfig } from "../config.ts";
 import { expandHomePath } from "../pathExpansion.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
-import { resolveAntigravityProfileDirectory } from "../provider/antigravityAuthSupport.ts";
+import { resolveAntigravityInstanceDirectories } from "../provider/antigravityAuthSupport.ts";
+import { mergeProviderInstanceEnvironment } from "../provider/ProviderInstanceEnvironment.ts";
 import { readOpenCodeUsage } from "./opencodeUsageReader.ts";
 import { readAntigravityUsage } from "./antigravityUsageReader.ts";
 import { readCursorAccountUsage } from "./cursorUsageReader.ts";
-import { mergeProviderInstanceEnvironment } from "../provider/ProviderInstanceEnvironment.ts";
 import { UsageAggregator } from "./usageAggregation.ts";
 import {
   createOverrideRateTable,
@@ -158,6 +158,7 @@ export const layerTest = Layer.succeed(
 );
 
 export const make = Effect.gen(function* () {
+  const crypto = yield* Crypto.Crypto;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const config = yield* ServerConfig;
@@ -240,7 +241,7 @@ export const make = Effect.gen(function* () {
 
     yield* encodeRatesCache({ fetchedAtMs: now, document: fetched }).pipe(
       Effect.flatMap((serialized) => fileSystem.writeFileString(ratesCachePath, serialized)),
-      Effect.catchCause(() => Effect.void),
+      Effect.ignoreCause,
     );
   });
 
@@ -465,7 +466,7 @@ export const make = Effect.gen(function* () {
         cacheDirty = false;
       }),
       // A cache we cannot write is a slower next start, not a failed read.
-      Effect.catchCause(() => Effect.void),
+      Effect.ignoreCause,
     );
   });
 
@@ -539,9 +540,10 @@ export const make = Effect.gen(function* () {
     readonly provider: UsageProviderKind;
     readonly dir: string;
     readonly volumeId: string;
-    readonly status?: UsageSourceStatus;
-    readonly message?: string;
     readonly hostId?: string;
+    readonly status?: UsageSource["status"];
+    readonly message?: string;
+    readonly action?: UsageSource["action"];
     /** Parsed records per file, or `null` when the directory does not exist. */
     readonly files:
       | readonly { readonly path: string; readonly records: readonly UsageRecord[] }[]
@@ -579,19 +581,22 @@ export const make = Effect.gen(function* () {
     }
 
     const home = NodeOS.homedir();
-    const envRoots = (key: string, defaults: readonly string[]) => {
+    const envRoots = Effect.fnUntraced(function* (key: string, defaults: readonly string[]) {
       const roots = hostEnvironment[key]
         ?.split(",")
         .map((value) => value.trim())
         .filter(Boolean);
-      return [
-        ...new Set(
-          (roots?.length ? roots : defaults).map((root) => path.resolve(expandHomePath(root))),
-        ),
-      ];
-    };
+      const canonical = new Set<string>();
+      for (const root of roots?.length ? roots : defaults) {
+        const resolved = path.resolve(expandHomePath(root));
+        canonical.add(
+          yield* fileSystem.realPath(resolved).pipe(Effect.orElseSucceed(() => resolved)),
+        );
+      }
+      return [...canonical];
+    });
     const dataHome = hostEnvironment["XDG_DATA_HOME"]?.trim();
-    for (const dir of envRoots("OPENCODE_DATA_DIR", [
+    for (const dir of yield* envRoots("OPENCODE_DATA_DIR", [
       path.join(
         dataHome && path.isAbsolute(dataHome) ? dataHome : path.join(home, ".local", "share"),
         "opencode",
@@ -607,7 +612,7 @@ export const make = Effect.gen(function* () {
         ...(result.error ? { message: "Some OpenCode history could not be read." } : {}),
       });
     }
-    const antigravityRoots = envRoots("ANTIGRAVITY_DATA_DIR", [
+    const antigravityRoots = yield* envRoots("ANTIGRAVITY_DATA_DIR", [
       ...["antigravity", "antigravity-cli", "antigravity-ide", "antigravity-backup"].map((name) =>
         path.join(home, ".gemini", name),
       ),
@@ -615,26 +620,34 @@ export const make = Effect.gen(function* () {
     ]);
     for (const [instanceId, instance] of Object.entries(settings.providerInstances)) {
       if (instance.driver === "antigravity") {
-        antigravityRoots.push(
-          path.join(
-            resolveAntigravityProfileDirectory(
-              config.stateDir,
-              ProviderInstanceId.make(instanceId),
-            ),
-            "antigravity-acp",
+        const directories = yield* resolveAntigravityInstanceDirectories(
+          config.stateDir,
+          ProviderInstanceId.make(instanceId),
+        ).pipe(
+          Effect.provideService(Crypto.Crypto, crypto),
+          Effect.provideService(Path.Path, path),
+          Effect.mapError(
+            (cause) =>
+              new UsageReadError({
+                reason: "scanFailed",
+                detail: "Antigravity profile directory could not be resolved.",
+                cause,
+              }),
           ),
         );
+        antigravityRoots.push(path.join(directories.profile, "antigravity-acp"));
       }
     }
     const antigravityDirs = new Set<string>();
-    for (const root of new Set(antigravityRoots)) {
-      const nested = path.join(root, "conversations");
+    for (const root of antigravityRoots) {
+      const resolvedRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
+      const nested = path.join(resolvedRoot, "conversations");
       const dir = (yield* fileSystem
         .exists(nested)
         .pipe(Effect.catchCause(() => Effect.succeed(false))))
         ? nested
-        : root;
-      antigravityDirs.add(dir);
+        : resolvedRoot;
+      antigravityDirs.add(yield* fileSystem.realPath(dir).pipe(Effect.orElseSucceed(() => dir)));
     }
     const antigravity = yield* Effect.promise(() =>
       readAntigravityUsage([...antigravityDirs], windowStartMs),
@@ -655,23 +668,59 @@ export const make = Effect.gen(function* () {
         ...(failed ? { message: "Some Antigravity history could not be read." } : {}),
       });
     }
+    const cursorUserHome =
+      (platform === "win32" ? hostEnvironment["USERPROFILE"] : hostEnvironment["HOME"]) || home;
     const configHome = hostEnvironment["XDG_CONFIG_HOME"]?.trim();
     const cursorHome =
       platform === "darwin"
-        ? path.join(home, "Library", "Application Support")
+        ? path.join(cursorUserHome, "Library", "Application Support")
         : platform === "win32"
-          ? hostEnvironment["APPDATA"] || path.join(home, "AppData", "Roaming")
+          ? hostEnvironment["APPDATA"] || path.join(cursorUserHome, "AppData", "Roaming")
           : configHome && path.isAbsolute(configHome)
             ? configHome
-            : path.join(home, ".config");
+            : path.join(cursorUserHome, ".config");
     const cursorAuthPath =
       platform === "darwin"
-        ? path.join(home, ".cursor", "auth.json")
+        ? path.join(cursorUserHome, ".cursor", "auth.json")
         : path.join(cursorHome, platform === "win32" ? "Cursor" : "cursor", "auth.json");
+    const credentialStore = hostEnvironment["AGENT_CLI_CREDENTIAL_STORE"];
+    const loginUnavailable =
+      Boolean(hostEnvironment["CURSOR_AUTH_TOKEN"]?.trim()) ||
+      Boolean(hostEnvironment["CURSOR_API_KEY"]?.trim()) ||
+      credentialStore === "memory";
+    if (
+      platform === "darwin" &&
+      credentialStore !== "file" &&
+      !loginUnavailable &&
+      !settings.cursorKeychainUsageEnabled
+    ) {
+      scanned.push({
+        provider: "cursor",
+        dir: cursorAuthPath,
+        volumeId: "",
+        files: null,
+        message: "Cursor account usage is off on this environment.",
+        action: "enableCursorKeychain",
+      });
+      return scanned;
+    }
     const cursorUntilMs = yield* Clock.currentTimeMillis;
-    const account = yield* Effect.promise(() =>
-      readCursorAccountUsage(cursorAuthPath, windowStartMs, cursorUntilMs),
-    );
+    const account = loginUnavailable
+      ? {
+          accountKey: null,
+          records: [],
+          missing: true,
+          error: "Cursor account history needs a Cursor CLI login on this server.",
+        }
+      : yield* Effect.promise(() =>
+          readCursorAccountUsage(
+            platform === "darwin" && credentialStore !== "file"
+              ? { kind: "keychain" }
+              : cursorAuthPath,
+            windowStartMs,
+            cursorUntilMs,
+          ),
+        );
     if (account.accountKey !== null && account.error === null && !account.missing) {
       // The same account includes CLI and desktop history from every machine.
       // A stable remote fingerprint prevents connected environments counting it twice.
@@ -797,6 +846,7 @@ export const make = Effect.gen(function* () {
       files,
       status,
       message,
+      action,
       hostId: sourceHostId,
     } of scannedDirs) {
       const retainedFiles = [...(files ?? [])];
@@ -842,8 +892,8 @@ export const make = Effect.gen(function* () {
             codexEventOccurrences.set(key, occurrence);
             usageRecord = { ...record, dedupeKey: key + ":" + occurrence };
           }
-          // Only sessions that contributed in-window count: the mtime slack
-          // admits boundary files whose records fall outside the range.
+          // Only sessions contributing in-window count; the mtime slack can
+          // admit boundary files whose records fall outside the range.
           if (aggregator.add(usageRecord, dir) && record.sessionId.length > 0) {
             sessionIds.add(record.sessionId);
           }
@@ -852,9 +902,7 @@ export const make = Effect.gen(function* () {
 
       sources.push({
         fingerprint: { hostId: sourceHostId ?? hostId, provider, resolvedHomePath: dir, volumeId },
-        // A directory with no live files reports missing even when the scan
-        // produced a status; saved records still keep it an available source.
-        // Clients exclude missing sources, so retained usage stays visible.
+        // Clients exclude missing sources, so saved records remain an available source.
         status: files === null && scannedFiles === 0 ? "missing" : (status ?? "ok"),
         scannedFiles,
         skippedFiles,
@@ -862,6 +910,7 @@ export const make = Effect.gen(function* () {
         distinctSessions: sessionIds.size,
         message:
           message ?? (files === null ? "No transcript directory on this environment." : null),
+        ...(action ? { action } : {}),
       });
     }
 
@@ -908,6 +957,7 @@ export const make = Effect.gen(function* () {
   const scanKey = (
     input: UsageSummaryInput,
     priceOverrides: ServerSettingsValue["usagePriceOverrides"],
+    cursorKeychainUsageEnabled: boolean,
   ): string =>
     JSON.stringify([
       input.timeZone,
@@ -917,11 +967,12 @@ export const make = Effect.gen(function* () {
       input.sinceTime ?? null,
       input.untilTime ?? null,
       priceOverrides,
+      cursorKeychainUsageEnabled,
     ]);
 
   const readSummary = Effect.fn("UsageService.readSummary")(function* (input: UsageSummaryInput) {
     const settings = yield* readSettings;
-    const key = scanKey(input, settings.usagePriceOverrides);
+    const key = scanKey(input, settings.usagePriceOverrides, settings.cursorKeychainUsageEnabled);
     const deferred = yield* Effect.uninterruptible(
       Effect.gen(function* () {
         const existing = inflightScans.get(key);

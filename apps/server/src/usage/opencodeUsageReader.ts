@@ -1,3 +1,4 @@
+// node:sqlite reads live OpenCode databases; Node fs walks legacy JSON history.
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
@@ -21,7 +22,7 @@ function text(value: unknown): string {
 }
 
 /** OpenCode stores uncached input and reasoning separately from input/output. */
-export function parseOpenCodeMessage(
+function parseOpenCodeMessage(
   source: string,
   fallback: {
     readonly id?: string;
@@ -63,6 +64,7 @@ export function parseOpenCodeMessage(
     // OpenCode writes zero for models without a known rate, including paid
     // subscription models. Let the shared price table estimate those records.
     reportedCostUsd: typeof cost === "number" && Number.isFinite(cost) && cost > 0 ? cost : null,
+    fast: false,
     dedupeKey: id ? `opencode:${id}` : null,
   };
 }

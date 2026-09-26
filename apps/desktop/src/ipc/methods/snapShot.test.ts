@@ -52,7 +52,7 @@ describe("window capture IPC", () => {
       Effect.provide(
         Layer.mergeAll(
           Layer.succeed(ElectronWindow.ElectronWindow, {
-            main: Effect.succeed(Option.some({ webContents: { id: 7 } })),
+            main: Effect.succeedSome({ webContents: { id: 7 } }),
           } as ElectronWindow.ElectronWindow["Service"]),
           Layer.succeed(DesktopSnapShot.DesktopSnapShot, {
             previewConfig: () =>
@@ -88,7 +88,7 @@ describe("window capture IPC", () => {
       Effect.provide(
         Layer.mergeAll(
           Layer.succeed(ElectronWindow.ElectronWindow, {
-            main: Effect.succeed(Option.some({ webContents: { id: 7 } })),
+            main: Effect.succeedSome({ webContents: { id: 7 } }),
           } as ElectronWindow.ElectronWindow["Service"]),
           Layer.succeed(DesktopSnapShot.DesktopSnapShot, {
             state: Effect.succeed({
@@ -121,7 +121,7 @@ describe("window capture IPC", () => {
       Effect.provide(
         Layer.mergeAll(
           Layer.succeed(ElectronWindow.ElectronWindow, {
-            main: Effect.succeed(Option.some({ webContents: { id: 7 } })),
+            main: Effect.succeedSome({ webContents: { id: 7 } }),
           } as ElectronWindow.ElectronWindow["Service"]),
           Layer.succeed(DesktopSnapShot.DesktopSnapShot, {
             state: Effect.succeed({ linuxBackend: "niri" }),
@@ -157,13 +157,11 @@ describe("window capture IPC", () => {
       Layer.succeed(
         ElectronWindow.ElectronWindow,
         ElectronWindow.ElectronWindow.of({
-          main: Effect.succeed(
-            Option.some({
-              getBounds: () => ({ x: 100, y: 80, width: 1_000, height: 700 }),
-              getContentBounds: () => ({ x: 100, y: 118, width: 1_000, height: 662 }),
-              webContents,
-            }),
-          ),
+          main: Effect.succeedSome({
+            getBounds: () => ({ x: 100, y: 80, width: 1_000, height: 700 }),
+            getContentBounds: () => ({ x: 100, y: 118, width: 1_000, height: 662 }),
+            webContents,
+          }),
         } as ElectronWindow.ElectronWindow["Service"]),
       ),
       Layer.succeed(
@@ -221,7 +219,7 @@ describe("window capture IPC", () => {
       Layer.succeed(
         ElectronWindow.ElectronWindow,
         ElectronWindow.ElectronWindow.of({
-          main: Effect.succeed(Option.some({ webContents })),
+          main: Effect.succeedSome({ webContents }),
         } as ElectronWindow.ElectronWindow["Service"]),
       ),
       Layer.succeed(
@@ -257,7 +255,7 @@ describe("window capture IPC", () => {
       Effect.provideService(
         ElectronWindow.ElectronWindow,
         ElectronWindow.ElectronWindow.of({
-          main: Effect.succeed(Option.some({ webContents: { id: 7 } })),
+          main: Effect.succeedSome({ webContents: { id: 7 } }),
         } as ElectronWindow.ElectronWindow["Service"]),
       ),
       Effect.provideService(DesktopSnapShot.DesktopSnapShot, null as never),
@@ -278,7 +276,7 @@ describe("window capture IPC", () => {
       Effect.provide(
         Layer.mergeAll(
           Layer.succeed(ElectronWindow.ElectronWindow, {
-            main: Effect.succeed(Option.some({ webContents: { id: 7 } })),
+            main: Effect.succeedSome({ webContents: { id: 7 } }),
           } as ElectronWindow.ElectronWindow["Service"]),
           Layer.succeed(DesktopSnapShot.DesktopSnapShot, {
             setup: (action: string) =>
@@ -296,7 +294,7 @@ describe("window capture IPC", () => {
       Layer.succeed(
         ElectronWindow.ElectronWindow,
         ElectronWindow.ElectronWindow.of({
-          main: Effect.succeed(Option.some({ webContents: { id: 7 } })),
+          main: Effect.succeedSome({ webContents: { id: 7 } }),
         } as ElectronWindow.ElectronWindow["Service"]),
       ),
       Layer.succeed(
@@ -321,7 +319,7 @@ describe("window capture IPC", () => {
       Layer.succeed(
         ElectronWindow.ElectronWindow,
         ElectronWindow.ElectronWindow.of({
-          main: Effect.succeed(Option.some({ webContents: { id: 7 } })),
+          main: Effect.succeedSome({ webContents: { id: 7 } }),
         } as ElectronWindow.ElectronWindow["Service"]),
       ),
       Layer.succeed(

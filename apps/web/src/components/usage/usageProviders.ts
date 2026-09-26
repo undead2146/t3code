@@ -39,26 +39,10 @@ export const PROVIDER_PRESENTATION = {
     color: "color-mix(in oklab, var(--contrast-foreground) 72%, var(--background))",
     mark: GrokIcon,
   },
-  cursor: {
-    label: "Cursor",
-    color: "#8b8b8b",
-    mark: CursorIcon,
-  },
-  opencode: {
-    label: "OpenCode",
-    color: "#5b9bbd",
-    mark: OpenCodeIcon,
-  },
-  antigravity: {
-    label: "Antigravity",
-    color: "#4285f4",
-    mark: AntigravityIcon,
-  },
-  muse: {
-    label: "Muse Code",
-    color: "#6088d9",
-    mark: MetaIcon,
-  },
+  cursor: { label: "Cursor", color: "#8b8b8b", mark: CursorIcon },
+  opencode: { label: "OpenCode", color: "#5b9bbd", mark: OpenCodeIcon },
+  antigravity: { label: "Antigravity", color: "#8c7bd1", mark: AntigravityIcon },
+  muse: { label: "Muse Code", color: "#6088d9", mark: MetaIcon },
 } satisfies Record<UsageProviderKind, UsageProviderPresentation>;
 
 /** Stable provider reading order across charts, summaries, tables, and hover rows. */

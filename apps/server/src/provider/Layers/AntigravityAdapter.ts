@@ -3398,6 +3398,11 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       if (!context) {
         return;
       }
+      // A command that outlived its turn keeps running in the agent, and
+      // session/cancel only stops a prompt. Stop with nothing else running
+      // ends the session so the agent kills its background commands.
+      const idleWithCommands =
+        !context.promptFiber && [...context.commands.values()].some((c) => c.promoted);
       yield* cancelRequests(context);
       yield* Effect.ignore(context.runtime.cancel);
       const promptFiber = context.promptFiber;
@@ -3413,6 +3418,10 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           state: "cancelled",
           stopReason: "cancelled",
         });
+      }
+      if (idleWithCommands) {
+        context.stopped = true;
+        yield* withThreadLock(threadId, stopContext(context)).pipe(Effect.ignore);
       }
     });
 

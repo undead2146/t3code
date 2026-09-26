@@ -1,5 +1,4 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
@@ -7,7 +6,9 @@ import * as NodePath from "node:path";
 import type { AntigravityAuthMethod, ProviderInstanceId } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { resolveNodeExecutable, nodeRuntimeUnavailableMessage } from "@t3tools/shared/nodeRuntime";
+import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Encoding from "effect/Encoding";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -190,19 +191,32 @@ export function isAntigravitySignInRequiredError(error: unknown): boolean {
   );
 }
 
-/** Keeps case-sensitive instance IDs separate on case-insensitive filesystems. */
-export function resolveAntigravityProfileDirectory(
-  stateDir: string,
-  instanceId: ProviderInstanceId,
-): string {
-  const directoryName = NodeCrypto.createHash("sha256").update(instanceId).digest("hex");
-  return NodePath.join(stateDir, "providers", "antigravity", directoryName);
+export interface AntigravityInstanceDirectories {
+  /** GEMINI_HOME for the agent. Holds the instance's Google sign-in. */
+  readonly profile: string;
+  /**
+   * Parent of the per-process directories the agent unpacks into. It sits
+   * beside the profile, not inside it: the agent unpacks members up to 120
+   * characters deep, and the profile's longer name would push them past
+   * Windows' 260-character path limit.
+   */
+  readonly runtimeTemp: string;
 }
 
-/** Parent of the per-process runtime temp directories inside a profile. */
-export function resolveAntigravityRuntimeTempDirectory(profileDirectory: string): string {
-  return NodePath.join(profileDirectory, "antigravity-acp", "tmp");
-}
+/** Hashes the instance ID so case-only differences stay separate on case-insensitive filesystems. */
+export const resolveAntigravityInstanceDirectories = Effect.fn(
+  "resolveAntigravityInstanceDirectories",
+)(function* (stateDir: string, instanceId: ProviderInstanceId) {
+  const crypto = yield* Crypto.Crypto;
+  const path = yield* Path.Path;
+  const key = Encoding.encodeHex(
+    yield* crypto.digest("SHA-256", new TextEncoder().encode(instanceId)),
+  );
+  return {
+    profile: path.join(stateDir, "providers", "antigravity", key),
+    runtimeTemp: path.join(stateDir, "antigravity-tmp", key.slice(0, 12)),
+  } satisfies AntigravityInstanceDirectories;
+});
 
 function quoteBrowserArgument(value: string, platform?: NodeJS.Platform): string {
   if (platform === "win32") {
@@ -377,9 +391,7 @@ const linkAntigravityUserSkills = Effect.fn("linkAntigravityUserSkills")(functio
     yield* Effect.gen(function* () {
       const existing = yield* fs.readLink(link).pipe(
         Effect.map((value): string | undefined => path.resolve(path.dirname(link), value)),
-        Effect.catch((error) =>
-          error.reason._tag === "NotFound" ? Effect.succeed(undefined) : Effect.fail(error),
-        ),
+        Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
       );
       if (existing === target) return;
       if (existing !== undefined) {
@@ -413,6 +425,8 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   /** Home the agent expands `~` against. Defaults to the launch environment's. */
   readonly userHome?: string;
   readonly skipBrowserPreflight?: boolean;
+  /** Parent of per-process temp directories. Defaults to one inside the profile. */
+  readonly tempDirectory?: string;
 }) {
   const auth = input.auth ?? ANTIGRAVITY_PERSONAL_AUTH;
   const fs = yield* FileSystem.FileSystem;
@@ -453,7 +467,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   const geminiHome = path.resolve(input.profileDirectory);
   const acpDirectory = path.join(geminiHome, "antigravity-acp");
   const configSkillsDirectory = path.join(geminiHome, "config", "skills");
-  const tempDirectory = resolveAntigravityRuntimeTempDirectory(geminiHome);
+  const tempDirectory = input.tempDirectory ?? path.join(acpDirectory, "tmp");
   const profile: AntigravityProfile = {
     platform,
     geminiHome,

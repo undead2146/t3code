@@ -1,9 +1,11 @@
+// Node fs reads CLI credentials, and crypto hashes account IDs for deduplication.
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFSP from "node:fs/promises";
 import * as NodeCrypto from "node:crypto";
 import * as NodeTimersPromises from "node:timers/promises";
 
 import type { UsageRecord } from "./usageTranscripts.ts";
+import { readMacCursorAccessToken } from "../provider/cursorCredentialStore.ts";
 
 function object(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -13,6 +15,18 @@ function object(value: unknown): Record<string, unknown> {
 
 function tokens(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0;
+}
+
+/**
+ * Maps Cursor's tiered names (`cursor-grok-4.6-high-fast`,
+ * `claude-fable-5-1-thinking-high`) to the base model's rate-table key.
+ * Grok resolves through xAI's first-party entry, which has no bare alias.
+ */
+export function cursorRateModel(model: string): string {
+  const base = model
+    .replace(/^cursor-/, "")
+    .replace(/(?:-thinking)?(?:-(?:none|minimal|low|medium|high|xhigh|max))?(?:-fast)?$/, "");
+  return base.startsWith("grok-") ? `xai/${base}` : base;
 }
 
 export interface CursorAccountUsageReadResult {
@@ -50,29 +64,45 @@ function boundaryOverlap(previous: readonly string[], current: readonly string[]
 
 /** Dashboard usage includes headless agents and reports fresh input separately from cache reads. */
 export async function readCursorAccountUsage(
-  authPath: string,
+  credentialSource: string | { readonly kind: "keychain" },
   sinceMs: number,
   endDate: number,
   request: (url: string, init: RequestInit) => Promise<Response> = globalThis.fetch,
+  keychainToken: () => Promise<string | null> = readMacCursorAccessToken,
 ): Promise<CursorAccountUsageReadResult> {
-  let auth: Record<string, unknown>;
+  let accessToken: unknown;
   try {
-    auth = object(JSON.parse(await NodeFSP.readFile(authPath, "utf8")));
+    accessToken =
+      typeof credentialSource === "string"
+        ? object(JSON.parse(await NodeFSP.readFile(credentialSource, "utf8"))).accessToken
+        : await keychainToken();
   } catch (cause) {
-    const missing = object(cause).code === "ENOENT";
+    const missing = typeof credentialSource === "string" && object(cause).code === "ENOENT";
     return {
       accountKey: null,
       records: [],
       missing,
-      error: missing ? null : "Cursor credentials could not be read.",
+      error: missing
+        ? null
+        : typeof credentialSource === "string"
+          ? "Cursor credentials could not be read."
+          : "Cursor Keychain credentials could not be read.",
     };
   }
-  if (typeof auth.accessToken !== "string" || !auth.accessToken) {
-    return { accountKey: null, records: [], missing: true, error: null };
+  if (typeof accessToken !== "string" || !accessToken) {
+    return {
+      accountKey: null,
+      records: [],
+      missing: true,
+      error:
+        typeof credentialSource === "string"
+          ? null
+          : "Cursor account history needs a macOS Keychain CLI login on this server.",
+    };
   }
   let accountKey: string | null = null;
   try {
-    const payload = auth.accessToken.split(".")[1];
+    const payload = accessToken.split(".")[1];
     const subject = object(
       JSON.parse(Buffer.from(payload ?? "", "base64url").toString("utf8")),
     ).sub;
@@ -82,22 +112,27 @@ export async function readCursorAccountUsage(
     accountKey = accountHash(subject);
     if (!Number.isFinite(sinceMs) || !Number.isFinite(endDate) || sinceMs < 0 || sinceMs > endDate)
       throw new Error("Invalid date window");
-    const signal = AbortSignal.timeout(10_000);
+    const deadline = AbortSignal.timeout(60_000);
     const records: UsageRecord[] = [];
     const occurrences = new Map<string, number>();
     const pages: unknown[][] = [];
     let completed = false;
     const pageSize = 1000;
     let total: number | undefined;
-    for (let page = 1; page <= 100; page++) {
+    for (let page = 1; ; page++) {
+      // A count can include overlapping page boundaries. Allow room to
+      // reconcile them without imposing a fixed account-size limit.
+      if (page > (total === undefined ? 1000 : Math.ceil(total / pageSize) * 2 + 1)) {
+        throw new Error("Account usage page limit exceeded");
+      }
       const response = await request("https://cursor.com/api/dashboard/get-filtered-usage-events", {
         method: "POST",
         redirect: "error",
-        signal,
+        signal: AbortSignal.any([deadline, AbortSignal.timeout(10_000)]),
         headers: {
           "Content-Type": "application/json",
           Origin: "https://cursor.com",
-          Cookie: `WorkosCursorSessionToken=${encodeURIComponent(`${userId}::${auth.accessToken}`)}`,
+          Cookie: `WorkosCursorSessionToken=${encodeURIComponent(`${userId}::${accessToken}`)}`,
         },
         body: JSON.stringify({
           page,
@@ -133,7 +168,6 @@ export async function readCursorAccountUsage(
           (typeof count !== "number" ||
             !Number.isSafeInteger(count) ||
             count < 0 ||
-            count > pageSize * 100 ||
             (total !== undefined && count !== total))) ||
         !Array.isArray(events) ||
         events.length > pageSize ||
@@ -210,9 +244,11 @@ export async function readCursorAccountUsage(
           provider: "cursor",
           timestampMs,
           model: event.model,
+          rateModel: cursorRateModel(event.model),
           sessionId,
           totals,
           reportedCostUsd,
+          fast: false,
           dedupeKey: `cursor-account:${accountKey}:${key}:${occurrence}`,
         });
       }

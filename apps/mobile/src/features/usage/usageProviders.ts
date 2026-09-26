@@ -37,7 +37,7 @@ export function useProviderColors(): Record<UsageProviderKind, string> {
     grok: scheme === "dark" ? "#a1a1aa" : "#52525b",
     cursor: "#8b8b8b",
     opencode: "#5b9bbd",
-    antigravity: "#4285f4",
+    antigravity: "#8c7bd1",
     muse: "#6088d9",
   };
 }

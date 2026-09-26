@@ -1,3 +1,4 @@
+// node:sqlite reads live conversation databases while Node fs discovers them.
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
@@ -6,7 +7,8 @@ import * as NodeTimersPromises from "node:timers/promises";
 
 import type { UsageRecord } from "./usageTranscripts.ts";
 
-type Fields = Map<number, Array<number | Uint8Array>>;
+type FieldValue = number | bigint | Uint8Array;
+type Fields = Map<number, FieldValue[]>;
 
 /** Antigravity stores usage metadata as protobuf, independently of conversation text. */
 function fields(bytes: Uint8Array): Fields {
@@ -21,23 +23,23 @@ function fields(bytes: Uint8Array): Fields {
       }
       value |= BigInt(byte & 127) << shift;
       if (byte < 128) {
-        return value > BigInt(Number.MAX_SAFE_INTEGER)
-          ? Number(BigInt.asIntN(32, value))
-          : Number(value);
+        return value > BigInt(Number.MAX_SAFE_INTEGER) ? value : Number(value);
       }
     }
     throw new Error("Invalid Antigravity protobuf varint");
   };
   while (offset < bytes.length) {
     const tag = varint();
+    if (typeof tag !== "number") throw new Error("Invalid protobuf field");
     const number = Math.floor(tag / 8);
     const wire = tag % 8;
     if (number === 0) throw new Error("Invalid protobuf field");
-    let value: number | Uint8Array;
+    let value: FieldValue;
     if (wire === 0) {
       value = varint();
     } else if (wire === 1 || wire === 5 || wire === 2) {
       const length = wire === 2 ? varint() : wire === 1 ? 8 : 4;
+      if (typeof length !== "number") throw new Error("Invalid protobuf field length");
       if (length > bytes.length - offset) throw new Error("Truncated protobuf field");
       value = bytes.subarray(offset, offset + length);
       offset += length;
@@ -62,7 +64,7 @@ const bytesAt = (value: Fields, key: number) => {
 };
 const nested = (value: Fields, key: number) => {
   const bytes = bytesAt(value, key);
-  return bytes === undefined ? new Map<number, Array<number | Uint8Array>>() : fields(bytes);
+  return bytes === undefined ? new Map<number, FieldValue[]>() : fields(bytes);
 };
 const textAt = (value: Fields, key: number) => {
   const bytes = bytesAt(value, key);
@@ -170,15 +172,16 @@ async function readDatabase(path: string, fallbackTimestamp: number): Promise<Us
       throw new Error("Missing Antigravity usage tables");
     }
     const readMetadata = async (query: string, column: string, step: boolean) => {
-      const entries: Metadata[] = [];
+      const entries: Array<{ idx: number; entry: Metadata }> = [];
       for (const row of db.prepare(query).iterate()) {
-        entries.push(metadata(blob(row[column]), step));
+        if (typeof row.idx !== "number") throw new Error("Invalid Antigravity metadata index");
+        entries.push({ idx: row.idx, entry: metadata(blob(row[column]), step) });
         if (entries.length % 256 === 0) await NodeTimersPromises.setImmediate();
       }
       return entries;
     };
     const generations = tables.has("gen_metadata")
-      ? await readMetadata("SELECT data FROM gen_metadata ORDER BY idx", "data", false)
+      ? await readMetadata("SELECT idx, data FROM gen_metadata ORDER BY idx", "data", false)
       : [];
     let trajectoryTimestamp: number | null = null;
     if (tables.has("trajectory_metadata_blob")) {
@@ -188,21 +191,19 @@ async function readDatabase(path: string, fallbackTimestamp: number): Promise<Us
     }
     const steps = tables.has("steps")
       ? await readMetadata(
-          "SELECT metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx",
+          "SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx",
           "metadata",
           true,
         )
       : [];
     const sessionId = NodePath.basename(path, ".db");
     const records: UsageCandidate[] = [];
-    let currentModel = "";
-    const generationModel = generations.findLast((entry) => entry.model)?.model ?? "";
+    const generationModels = new Map(generations.map(({ idx, entry }) => [idx, entry.model]));
     for (const [source, entries] of [
       ["step", steps],
       ["generation", generations],
     ] as const) {
-      for (const [index, entry] of entries.entries()) {
-        if (entry.model) currentModel = entry.model;
+      for (const [index, { idx, entry }] of entries.entries()) {
         for (const [usageIndex, usage] of entry.usages.entries()) {
           const outputTokens = Math.max(
             numberAt(usage, 3),
@@ -234,11 +235,12 @@ async function readDatabase(path: string, fallbackTimestamp: number): Promise<Us
             model:
               MODEL_IDS[numberAt(usage, 1)] ||
               entry.model ||
-              (source === "step" ? generationModel : currentModel) ||
+              (source === "step" ? generationModels.get(idx) : "") ||
               modelName("", numberAt(usage, 1)) ||
               "antigravity-unknown",
             totals,
             reportedCostUsd: null,
+            fast: false,
             dedupeKey: keys[0] ?? `antigravity:${sessionId}:${source}:${index}:${usageIndex}`,
           };
           records.push({
@@ -248,7 +250,6 @@ async function readDatabase(path: string, fallbackTimestamp: number): Promise<Us
           });
         }
       }
-      currentModel = "";
     }
     return records;
   } finally {
