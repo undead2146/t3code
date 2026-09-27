@@ -165,6 +165,7 @@ interface SessionContext {
   streamed: Map<string, string>;
   deltaCursors: Map<string, Set<string>>;
   approvals: Map<string, Approval>;
+  autoApprovedApprovals: Set<string>;
   questions: Map<string, UserInput>;
   settledTurns: Set<string>;
   selectedModel: string;
@@ -183,6 +184,13 @@ interface SessionContext {
   lastViewCursor?: string;
   isPagingView?: boolean;
   drainTimer?: ReturnType<typeof setInterval> | undefined;
+}
+
+function isAutoApproveSession(ctx: SessionContext): boolean {
+  return (
+    ctx.startInput.approvalPolicy === "never" ||
+    (ctx.startInput.approvalPolicy === undefined && ctx.session.runtimeMode === "full-access")
+  );
 }
 
 // Consecutive identical truncated-stream retries after which the turn is interrupted:
@@ -534,6 +542,32 @@ export function make(
         const prior = ctx.approvals.get(event.params.approvalId);
         if (prior?.viewCursor === event.params.viewCursor) return;
         ctx.approvals.set(event.params.approvalId, event.params);
+
+        if (isAutoApproveSession(ctx)) {
+          ctx.autoApprovedApprovals.add(event.params.approvalId);
+          const approvedChoice =
+            event.params.availableChoices.find(
+              (choice) =>
+                choice.decision === "approved" ||
+                choice.decision === "approvedForSession" ||
+                choice.decision === "approvedPolicyAmendment",
+            ) ?? event.params.availableChoices[0];
+          if (approvedChoice) {
+            void ctx.host.connection
+              .command("approval/decide", {
+                sessionId: ctx.sessionId,
+                approvalId: event.params.approvalId,
+                requirementId: event.params.currentRequirementId,
+                choiceId: approvedChoice.choiceId,
+              })
+              .catch(() => {});
+          }
+          return;
+        }
+      }
+      if (event.method === "approval/resolved") {
+        ctx.approvals.delete(event.params.approvalId);
+        if (ctx.autoApprovedApprovals.delete(event.params.approvalId)) return;
       }
       if (event.method === "userInput/requested") {
         if (ctx.questions.get(event.params.userInputId)?.viewCursor === event.params.viewCursor)
@@ -721,12 +755,31 @@ export function make(
             yield* Effect.promise(() => healWindowsSkillSymlinks(cwd));
             const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
             const args = ["serve", "--trust-workspace"];
+            const isFullAccess =
+              input.sandboxMode === "danger-full-access" ||
+              (input.sandboxMode === undefined && input.runtimeMode === "full-access") ||
+              input.approvalPolicy === "never";
             if (
               input.sandboxMode === "danger-full-access" ||
               (input.sandboxMode === undefined && input.runtimeMode === "full-access")
             )
               args.push("--disable-sandbox");
             if (input.sandboxMode === "read-only") args.push("--disable-write", "--disable-shell");
+            const baseEnv = {
+              ...environment,
+              MUSE_NO_AUTO_UPDATE: "1",
+              TBH_STREAM_IDLE_TIMEOUT_SECS: "600",
+              TBH_STREAM_FIRST_EVENT_TIMEOUT_SECS: "600",
+            };
+            const sessionEnv = isFullAccess
+              ? {
+                  ...baseEnv,
+                  MUSE_APPROVAL_MODE: "never",
+                  APPROVAL_MODE: "never",
+                  MUSE_DISABLE_APPROVAL_JUDGE: "1",
+                  APPROVAL_JUDGE: "off",
+                }
+              : baseEnv;
             const handshake = yield* Effect.acquireRelease(
               Effect.try({
                 try: () =>
@@ -734,7 +787,7 @@ export function make(
                     command: settings.binaryPath || "muse",
                     args,
                     cwd,
-                    env: McpProviderSession.withAgentDeviceEnvironment(environment, mcp),
+                    env: McpProviderSession.withAgentDeviceEnvironment(sessionEnv, mcp),
                     shutdownTimeoutMs: 2_000,
                   }),
                 catch: (cause) => requestError("spawn", cause),
@@ -785,6 +838,7 @@ export function make(
               streamed: new Map(),
               deltaCursors: new Map(),
               approvals: new Map(),
+              autoApprovedApprovals: new Set(),
               questions: new Map(),
               settledTurns: new Set(),
               pendingTokenUsage: new Map(),
@@ -978,6 +1032,30 @@ export function make(
         failSession(ctx, "Muse Code sent an invalid protocol frame."),
       );
       host.connection.onServerRequest(async (request) => {
+        if (request.method === "approval/request" && isAutoApproveSession(ctx)) {
+          const params = request.params as Approval;
+          if (params?.approvalId) {
+            ctx.autoApprovedApprovals.add(params.approvalId);
+            const approvedChoice =
+              params.availableChoices?.find(
+                (choice) =>
+                  choice.decision === "approved" ||
+                  choice.decision === "approvedForSession" ||
+                  choice.decision === "approvedPolicyAmendment",
+              ) ?? params.availableChoices?.[0];
+            if (approvedChoice) {
+              void ctx.host.connection
+                .command("approval/decide", {
+                  sessionId: ctx.sessionId,
+                  approvalId: params.approvalId,
+                  requirementId: params.currentRequirementId,
+                  choiceId: approvedChoice.choiceId,
+                })
+                .catch(() => {});
+            }
+            return {};
+          }
+        }
         const method =
           request.method === "approval/request"
             ? "approval/requested"
@@ -1011,12 +1089,31 @@ export function make(
       yield* Effect.promise(() => healWindowsSkillSymlinks(cwd));
       const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
       const args = ["serve", "--trust-workspace"];
+      const isFullAccess =
+        input.sandboxMode === "danger-full-access" ||
+        (input.sandboxMode === undefined && input.runtimeMode === "full-access") ||
+        input.approvalPolicy === "never";
       if (
         input.sandboxMode === "danger-full-access" ||
         (input.sandboxMode === undefined && input.runtimeMode === "full-access")
       )
         args.push("--disable-sandbox");
       if (input.sandboxMode === "read-only") args.push("--disable-write", "--disable-shell");
+      const baseEnv = {
+        ...environment,
+        MUSE_NO_AUTO_UPDATE: "1",
+        TBH_STREAM_IDLE_TIMEOUT_SECS: "600",
+        TBH_STREAM_FIRST_EVENT_TIMEOUT_SECS: "600",
+      };
+      const sessionEnv = isFullAccess
+        ? {
+            ...baseEnv,
+            MUSE_APPROVAL_MODE: "never",
+            APPROVAL_MODE: "never",
+            MUSE_DISABLE_APPROVAL_JUDGE: "1",
+            APPROVAL_JUDGE: "off",
+          }
+        : baseEnv;
       const handshake = yield* Effect.acquireRelease(
         Effect.try({
           try: () =>
@@ -1024,7 +1121,7 @@ export function make(
               command: settings.binaryPath || "muse",
               args,
               cwd,
-              env: McpProviderSession.withAgentDeviceEnvironment(environment, mcp),
+              env: McpProviderSession.withAgentDeviceEnvironment(sessionEnv, mcp),
               shutdownTimeoutMs: 2_000,
             }),
           catch: (cause) => requestError("spawn", cause),
@@ -1116,6 +1213,7 @@ export function make(
       ctx.streamed.clear();
       ctx.deltaCursors.clear();
       ctx.approvals.clear();
+      ctx.autoApprovedApprovals.clear();
       ctx.questions.clear();
       ctx.pendingTokenUsage.clear();
       ctx.needsRestart = false;

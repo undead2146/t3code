@@ -26,67 +26,74 @@ let mockCommands: Array<{ method: string; params: any }> = [];
 let mockTurnStartResponse: any = undefined;
 let mockTurnInterruptShouldHang = false;
 let mockRequestHandler: ((method: string, params: any) => Promise<any>) | undefined;
+let mockServerRequestHandler: ((request: any) => Promise<any>) | undefined;
+let lastSpawnOptions: any = undefined;
 
 vi.mock("@muse-code/sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@muse-code/sdk")>();
   return {
     ...actual,
-    spawnMspConnection: () => ({
-      close: vi.fn(async () => {}),
-      initialize: vi.fn(async () => ({
-        connection: {
-          onNotification: vi.fn((cb) => {
-            mockNotificationCallback = cb;
-          }),
-          onProtocolError: vi.fn(() => {}),
-          onServerRequest: vi.fn(() => {}),
-          closed: new Promise(() => {}),
-          mintCommandId: () => `cmd-${++mintCommandIdCounter}`,
-          command: vi.fn(async (method: string, params: any) => {
-            mockCommands.push({ method, params });
-            if (method === "turn/interrupt" && mockTurnInterruptShouldHang)
-              return new Promise(() => {});
-            if (method === "session/compact") return { status: "accepted" };
-            if (method === "session/start" && mockStartShouldFail)
-              throw new Error(mockStartShouldFail);
-            if (method === "session/resume" && mockResumeShouldFail)
-              throw new Error("Session not found");
-            if (method === "session/start" || method === "session/resume") {
-              return {
-                session: {
-                  sessionId: params.sessionId ?? `cmd-${mintCommandIdCounter}`,
-                  workspaceRoot: params.workspaceRoot ?? "Z:\\test-workspace",
-                  modelId: "default",
-                  status: "ready",
-                  activeTurnId: null,
-                },
-                history: mockSessionResultHistory,
-              };
-            }
-            if (method === "turn/start") {
-              if (mockTurnStartResponse) {
-                const res = mockTurnStartResponse;
-                mockTurnStartResponse = undefined;
-                return res;
+    spawnMspConnection: (options: any) => (
+      (lastSpawnOptions = options),
+      {
+        close: vi.fn(async () => {}),
+        initialize: vi.fn(async () => ({
+          connection: {
+            onNotification: vi.fn((cb) => {
+              mockNotificationCallback = cb;
+            }),
+            onProtocolError: vi.fn(() => {}),
+            onServerRequest: vi.fn((cb) => {
+              mockServerRequestHandler = cb;
+            }),
+            closed: new Promise(() => {}),
+            mintCommandId: () => `cmd-${++mintCommandIdCounter}`,
+            command: vi.fn(async (method: string, params: any) => {
+              mockCommands.push({ method, params });
+              if (method === "turn/interrupt" && mockTurnInterruptShouldHang)
+                return new Promise(() => {});
+              if (method === "session/compact") return { status: "accepted" };
+              if (method === "session/start" && mockStartShouldFail)
+                throw new Error(mockStartShouldFail);
+              if (method === "session/resume" && mockResumeShouldFail)
+                throw new Error("Session not found");
+              if (method === "session/start" || method === "session/resume") {
+                return {
+                  session: {
+                    sessionId: params.sessionId ?? `cmd-${mintCommandIdCounter}`,
+                    workspaceRoot: params.workspaceRoot ?? "Z:\\test-workspace",
+                    modelId: "default",
+                    status: "ready",
+                    activeTurnId: null,
+                  },
+                  history: mockSessionResultHistory,
+                };
               }
-              return {
-                status: "accepted",
-                turnId: `turn-${++mintCommandIdCounter}`,
-              };
-            }
-            return {};
-          }),
-          request: vi.fn(async (method: string, params: any) => {
-            if (mockRequestHandler) return mockRequestHandler(method, params);
-            return {};
-          }),
-        },
-        child: {
-          exit: new Promise(() => {}),
-          close: vi.fn(async () => {}),
-        },
-      })),
-    }),
+              if (method === "turn/start") {
+                if (mockTurnStartResponse) {
+                  const res = mockTurnStartResponse;
+                  mockTurnStartResponse = undefined;
+                  return res;
+                }
+                return {
+                  status: "accepted",
+                  turnId: `turn-${++mintCommandIdCounter}`,
+                };
+              }
+              return {};
+            }),
+            request: vi.fn(async (method: string, params: any) => {
+              if (mockRequestHandler) return mockRequestHandler(method, params);
+              return {};
+            }),
+          },
+          child: {
+            exit: new Promise(() => {}),
+            close: vi.fn(async () => {}),
+          },
+        })),
+      }
+    ),
   };
 });
 
@@ -102,6 +109,8 @@ afterEach(() => {
   mockSessionResultHistory = undefined;
   mockCommands = [];
   mockRequestHandler = undefined;
+  mockServerRequestHandler = undefined;
+  lastSpawnOptions = undefined;
 });
 
 describe("MuseAdapter session lifecycle with workflow items", () => {
@@ -1553,6 +1562,173 @@ describe("MuseAdapter transport truncation mitigation", () => {
       expect(current?.status).toBe("running");
       expect(current?.activeTurnId).toBe("turn-queued-456");
     }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "auto-approves tool approvals and suppresses approval prompts in full-access mode via notification",
+    () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+        });
+
+        const threadId = ThreadId.make("thread-test-auto-approve-notif");
+        const session = yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+
+        const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Run command in full access",
+        });
+
+        let openedApprovalEvent: ProviderRuntimeEvent | undefined;
+        const sub = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event): event is Extract<ProviderRuntimeEvent, { type: "request.opened" }> =>
+              event.type === "request.opened",
+          ),
+          Stream.tap((event) =>
+            Effect.sync(() => {
+              openedApprovalEvent = event;
+            }),
+          ),
+          Stream.runDrain,
+          Effect.forkChild,
+        );
+
+        mockNotificationCallback!({
+          method: "approval/requested",
+          params: {
+            sessionId,
+            viewCursor: "cursor-approval",
+            turnId: "turn-test",
+            itemId: "item-tool-1",
+            toolName: "shell",
+            rawArgs: JSON.stringify({ command: "dir" }),
+            approvalId: "appr-1",
+            currentRequirementId: { approvalId: "appr-1", sourceIndex: 0 },
+            availableChoices: [
+              { choiceId: "c-allow", decision: "approved", label: "Allow", scope: "turn" },
+              { choiceId: "c-deny", decision: "denied", label: "Deny", scope: "turn" },
+            ],
+            subject: { kind: "shell", command: "dir" },
+          },
+        });
+
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 50)));
+
+        const decideCommand = mockCommands.find((c) => c.method === "approval/decide");
+        expect(decideCommand).toBeDefined();
+        expect(decideCommand?.params).toEqual({
+          sessionId,
+          approvalId: "appr-1",
+          requirementId: { approvalId: "appr-1", sourceIndex: 0 },
+          choiceId: "c-allow",
+        });
+
+        expect(openedApprovalEvent).toBeUndefined();
+        yield* Fiber.interrupt(sub);
+      }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "auto-approves tool approvals and suppresses approval prompts in full-access mode via server request",
+    () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+        });
+
+        const threadId = ThreadId.make("thread-test-auto-approve-req");
+        const session = yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+
+        const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Run command in full access",
+        });
+
+        let openedApprovalEvent: ProviderRuntimeEvent | undefined;
+        const sub = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event): event is Extract<ProviderRuntimeEvent, { type: "request.opened" }> =>
+              event.type === "request.opened",
+          ),
+          Stream.tap((event) =>
+            Effect.sync(() => {
+              openedApprovalEvent = event;
+            }),
+          ),
+          Stream.runDrain,
+          Effect.forkChild,
+        );
+
+        expect(mockServerRequestHandler).toBeDefined();
+        const res = yield* Effect.promise(() =>
+          mockServerRequestHandler!({
+            method: "approval/request",
+            params: {
+              sessionId,
+              viewCursor: "cursor-approval-req",
+              approvalId: "appr-2",
+              currentRequirementId: { approvalId: "appr-2", sourceIndex: 0 },
+              availableChoices: [
+                { choiceId: "c-allow-session", decision: "approvedForSession", scope: "session" },
+                { choiceId: "c-deny", decision: "denied", scope: "turn" },
+              ],
+              subject: { kind: "shell", command: "git push" },
+            },
+          }),
+        );
+        expect(res).toEqual({});
+
+        yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 50)));
+
+        const decideCommand = mockCommands.find(
+          (c) => c.method === "approval/decide" && c.params?.approvalId === "appr-2",
+        );
+        expect(decideCommand).toBeDefined();
+        expect(decideCommand?.params).toEqual({
+          sessionId,
+          approvalId: "appr-2",
+          requirementId: { approvalId: "appr-2", sourceIndex: 0 },
+          choiceId: "c-allow-session",
+        });
+
+        expect(openedApprovalEvent).toBeUndefined();
+        yield* Fiber.interrupt(sub);
+      }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "configures stream timeout and auto update environment variables for muse process",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+        });
+
+        const threadId = ThreadId.make("thread-test-env-timeouts");
+        yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+        });
+
+        expect(lastSpawnOptions).toBeDefined();
+        expect(lastSpawnOptions.env.MUSE_NO_AUTO_UPDATE).toBe("1");
+        expect(lastSpawnOptions.env.TBH_STREAM_IDLE_TIMEOUT_SECS).toBe("600");
+        expect(lastSpawnOptions.env.TBH_STREAM_FIRST_EVENT_TIMEOUT_SECS).toBe("600");
+      }).pipe(Effect.provide(testLayer)),
   );
 });
 
