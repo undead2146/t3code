@@ -142,6 +142,19 @@ const ProviderSessionRuntimeRawDbRowSchema = Schema.Struct({
   runtimePayload: Schema.Unknown,
 });
 
+const normalizeRuntimeRow = (
+  row: typeof ProviderSessionRuntimeRawDbRowSchema.Type,
+): typeof ProviderSessionRuntimeRawDbRowSchema.Type => {
+  const status =
+    row.status === "starting" ||
+    row.status === "running" ||
+    row.status === "error" ||
+    row.status === "stopped"
+      ? row.status
+      : "stopped";
+  return { ...row, status };
+};
+
 const decodeRuntimeRow = Schema.decodeUnknownEffect(ProviderSessionRuntimeDbRowSchema);
 
 const GetRuntimeRequestSchema = Schema.Struct({
@@ -403,13 +416,24 @@ export const make = Effect.gen(function* () {
       Effect.flatMap((runtimeRowOption) =>
         Option.match(runtimeRowOption, {
           onNone: () => Effect.succeedNone,
-          onSome: (row) =>
-            decodeRuntimeRow(row).pipe(
+          onSome: (rawRow) =>
+            decodeRuntimeRow(normalizeRuntimeRow(rawRow)).pipe(
               Effect.mapError((cause) =>
                 PersistenceDecodeError.fromSchemaError(
                   "ProviderSessionRuntimeRepository.getByThreadId:decodeRow",
                   cause,
                   { threadId: input.threadId },
+                ),
+              ),
+              Effect.catch((cause) =>
+                Effect.logWarning("provider.session.runtime.decode-failed-clearing-stale", {
+                  threadId: input.threadId,
+                  error: cause.message,
+                }).pipe(
+                  Effect.flatMap(() =>
+                    deleteRuntimeByThreadId({ threadId: input.threadId }).pipe(Effect.ignore),
+                  ),
+                  Effect.as(Option.none<ProviderSessionRuntime>()),
                 ),
               ),
               Effect.asSome,
@@ -430,16 +454,16 @@ export const make = Effect.gen(function* () {
         // Skip rows that no longer decode (e.g. written by an older build)
         // instead of failing the whole list — one stale row must not disable
         // every consumer that enumerates sessions, such as the reaper.
-        Effect.forEach(rows, (row) =>
-          decodeRuntimeRow(row).pipe(
+        Effect.forEach(rows, (rawRow) =>
+          decodeRuntimeRow(normalizeRuntimeRow(rawRow)).pipe(
             Effect.asSome,
             Effect.catch((cause) =>
               Effect.logWarning("provider.session.runtime.row-skipped", {
-                threadId: row.threadId,
+                threadId: rawRow.threadId,
                 error: PersistenceDecodeError.fromSchemaError(
                   "ProviderSessionRuntimeRepository.list:decodeRows",
                   cause,
-                  { threadId: row.threadId },
+                  { threadId: rawRow.threadId },
                 ).message,
               }).pipe(Effect.as(Option.none<ProviderSessionRuntime>())),
             ),
