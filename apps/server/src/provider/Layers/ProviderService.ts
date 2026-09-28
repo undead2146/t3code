@@ -384,7 +384,7 @@ function toRuntimeStatus(session: ProviderSession): "starting" | "running" | "st
 }
 
 function toRuntimePayloadFromSession(
-  session: ProviderSession,
+  session: Partial<ProviderSession>,
   extra?: {
     readonly modelSelection?: unknown;
     readonly continueAfterServerUpdate?: TurnId;
@@ -1520,6 +1520,25 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
         yield* clearTurnAnalyticsSession(resolvedInstanceId, threadId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
+        yield* directory.upsert({
+          threadId,
+          provider: resolvedProvider,
+          providerInstanceId: resolvedInstanceId,
+          runtimeMode: input.runtimeMode,
+          status: "starting",
+          ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
+          runtimePayload: toRuntimePayloadFromSession(
+            {
+              threadId,
+              provider: resolvedProvider,
+              providerInstanceId: resolvedInstanceId,
+              runtimeMode: input.runtimeMode,
+              status: "connecting",
+              cwd: effectiveCwd,
+            },
+            { modelSelection: input.modelSelection },
+          ),
+        });
         const session = yield* adapter
           .startSession({
             ...input,

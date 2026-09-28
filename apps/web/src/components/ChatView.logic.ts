@@ -653,7 +653,9 @@ export function buildRunningThreadTurnInterruptInput(
   thread: Pick<Thread, "id" | "session"> | null | undefined,
   phase: SessionPhase,
 ): { threadId: ThreadId; turnId?: TurnId } | null {
-  if (phase !== "running" || thread?.session?.status !== "running") {
+  const isRunning = phase === "running" && thread?.session?.status === "running";
+  const isStarting = phase === "connecting" && thread?.session?.status === "starting";
+  if (!isRunning && !isStarting) {
     return null;
   }
   return buildThreadTurnInterruptInput(thread);

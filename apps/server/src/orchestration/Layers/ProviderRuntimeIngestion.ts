@@ -1864,7 +1864,13 @@ const make = Effect.gen(function* () {
             // A named completion can recover a lost turn.started event.
             // An abort needs an active turn so a delayed stop cannot replace
             // a ready session or clear a newer pending start.
-            return event.type === "turn.completed" && eventTurnId !== undefined;
+            return (
+              event.type === "turn.completed" &&
+              (eventTurnId !== undefined ||
+                (hasPendingTurnStart &&
+                  (event.payload.state === "cancelled" ||
+                    event.payload.stopReason === "cancelled")))
+            );
           default:
             return true;
         }

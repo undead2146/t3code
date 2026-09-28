@@ -1295,7 +1295,22 @@ const make = Effect.gen(function* () {
 
     const handleTurnStartFailure = (cause: Cause.Cause<unknown>) => {
       if (Cause.hasInterruptsOnly(cause)) {
-        return Effect.void;
+        return Effect.gen(function* () {
+          const currentThread = yield* resolveThreadShell(event.payload.threadId);
+          if (currentThread?.session?.status === "starting") {
+            yield* setThreadSession({
+              threadId: event.payload.threadId,
+              session: {
+                ...currentThread.session,
+                status: "ready",
+                activeTurnId: null,
+                lastError: null,
+                updatedAt: event.payload.createdAt,
+              },
+              createdAt: event.payload.createdAt,
+            });
+          }
+        }).pipe(Effect.asVoid);
       }
       const detail = formatFailureDetail(cause);
       return setThreadSessionErrorOnTurnStartFailure({
@@ -1393,7 +1408,9 @@ const make = Effect.gen(function* () {
             .stopSession({ threadId: event.payload.threadId })
             .pipe(Effect.catchCause(recoverTurnStartFailure));
         }
-        yield* appendProviderActivity({
+        yield* orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId: yield* serverCommandId("provider-interrupted-activity"),
           threadId: event.payload.threadId,
           activity: {
             id: yield* serverEventId(),
@@ -1624,6 +1641,11 @@ const make = Effect.gen(function* () {
       event.payload.threadId,
       "Context compaction was interrupted. Send this message again to continue.",
     );
+    const inFlight = startingTurnFibers.get(event.payload.threadId);
+    if (inFlight) {
+      startingTurnFibers.delete(event.payload.threadId);
+      yield* Fiber.interrupt(inFlight);
+    }
     const thread = yield* resolveThreadShell(event.payload.threadId);
     if (!thread) {
       return;

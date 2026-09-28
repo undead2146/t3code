@@ -1470,6 +1470,20 @@ describe("buildRunningThreadTurnInterruptInput", () => {
 
     expect(buildRunningThreadTurnInterruptInput(runningThread, "running")).toEqual({ threadId });
   });
+
+  it("targets a starting thread during connecting phase", () => {
+    const startingThread = makeThread({
+      session: {
+        ...readySession,
+        status: "starting",
+        activeTurnId: null,
+      },
+    });
+
+    expect(buildRunningThreadTurnInterruptInput(startingThread, "connecting")).toEqual({
+      threadId,
+    });
+  });
 });
 
 describe("deriveComposerSendState", () => {
