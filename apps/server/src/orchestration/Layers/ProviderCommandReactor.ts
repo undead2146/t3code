@@ -850,6 +850,20 @@ const make = Effect.gen(function* () {
         shouldRestartForModelSelectionChange,
         hasResumeCursor: resumeCursor !== undefined,
       });
+      yield* setThreadSession({
+        threadId,
+        session: {
+          threadId,
+          status: "starting",
+          providerName: activeSession?.provider ?? preferredProvider ?? "antigravity",
+          providerInstanceId: desiredInstanceId,
+          runtimeMode: activeSession?.runtimeMode ?? desiredRuntimeMode,
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+        createdAt,
+      });
       const restartedSession = yield* startProviderSession(
         resumeCursor !== undefined ? { resumeCursor } : undefined,
       );
@@ -1617,25 +1631,15 @@ const make = Effect.gen(function* () {
         return;
       }
 
-      let sendFiber: Fiber.Fiber<void, unknown> | undefined;
-      const send = providerService.sendTurn(sendTurnRequest.value).pipe(
-        Effect.asVoid,
-        Effect.catchCause(recoverTurnStartFailure),
-        Effect.ensuring(
-          Effect.sync(() => {
-            if (sendFiber && startingTurnFibers.get(event.payload.threadId) === sendFiber) {
-              startingTurnFibers.delete(event.payload.threadId);
-            }
-          }),
-        ),
-      );
+      const send = providerService
+        .sendTurn(sendTurnRequest.value)
+        .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure));
       // The forked send settles `sent` from here on, so drop the entry the post-processing hook uses.
       if (resumed && event.commandId !== null) resumedTurnStarts.delete(event.commandId);
-      sendFiber = yield* send.pipe(
+      yield* send.pipe(
         Effect.ensuring(resumed ? Deferred.succeed(resumed.sent, undefined) : Effect.void),
         Effect.forkScoped,
       );
-      startingTurnFibers.set(event.payload.threadId, sendFiber);
     }).pipe(
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
@@ -1675,26 +1679,6 @@ const make = Effect.gen(function* () {
       return;
     }
     const session = thread.session;
-    if (inFlight && (!session || session.status === "stopped")) {
-      yield* providerService
-        .interruptTurn({ threadId: event.payload.threadId })
-        .pipe(Effect.ignore);
-      yield* setThreadSession({
-        threadId: event.payload.threadId,
-        session: {
-          threadId: event.payload.threadId,
-          status: "stopped",
-          providerName: session?.providerName ?? "antigravity",
-          providerInstanceId: session?.providerInstanceId,
-          runtimeMode: session?.runtimeMode ?? "full-access",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: event.payload.createdAt,
-        },
-        createdAt: event.payload.createdAt,
-      });
-      return;
-    }
     if (!session || session.status === "stopped") {
       return yield* appendProviderFailureActivity({
         threadId: event.payload.threadId,
@@ -1780,6 +1764,25 @@ const make = Effect.gen(function* () {
     yield* providerService
       .interruptTurn({ threadId: event.payload.threadId })
       .pipe(Effect.catchCause(recoverInterruptFailure));
+
+    const currentThread = yield* resolveThreadShell(event.payload.threadId);
+    if (currentThread?.session?.status === "starting") {
+      yield* providerService.stopSession({ threadId: event.payload.threadId }).pipe(Effect.ignore);
+      yield* setThreadSession({
+        threadId: event.payload.threadId,
+        session: {
+          threadId: event.payload.threadId,
+          status: "stopped",
+          providerName: currentThread.session.providerName,
+          providerInstanceId: currentThread.session.providerInstanceId,
+          runtimeMode: currentThread.session.runtimeMode,
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: event.payload.createdAt,
+        },
+        createdAt: event.payload.createdAt,
+      });
+    }
   });
 
   const processApprovalResponseRequested = Effect.fn("processApprovalResponseRequested")(function* (
