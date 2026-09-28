@@ -928,6 +928,8 @@ interface SessionContext {
   disconnected: boolean;
   lastActivityAtMillis: number;
   activeToolCalls: Set<string>;
+  hasStreamedThisTurn?: boolean;
+  activeAssistantItemId?: string | undefined;
   pendingRetry?: { readonly error: string } | undefined;
   fatalHarnessError?: string | undefined;
   createAndStartRuntime: (
@@ -1600,6 +1602,11 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         return;
       case "AssistantItemStarted":
       case "AssistantItemCompleted":
+        if (event._tag === "AssistantItemStarted") {
+          context.activeAssistantItemId = event.itemId;
+        } else if (context.activeAssistantItemId === event.itemId) {
+          context.activeAssistantItemId = undefined;
+        }
         yield* emit(
           makeAcpAssistantItemEvent({
             stamp: yield* stamp,
@@ -1613,6 +1620,10 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         return;
       case "ThoughtDelta":
       case "ContentDelta":
+        context.hasStreamedThisTurn = true;
+        if (event._tag === "ContentDelta" && event.itemId) {
+          context.activeAssistantItemId = event.itemId;
+        }
         if (event.text) {
           context.tokenTracker.agentResponsesChars += event.text.length;
           context.tokenTracker.totalLifetimeProcessedTokens += Math.round(event.text.length / 4);
@@ -2585,6 +2596,8 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             disconnected: false,
             lastActivityAtMillis: yield* Clock.currentTimeMillis,
             activeToolCalls: new Set(),
+            hasStreamedThisTurn: false,
+            activeAssistantItemId: undefined,
             createAndStartRuntime: (targetSessionId) =>
               createAndStartRuntime(targetSessionId).pipe(
                 Effect.provideService(Scope.Scope, sessionScope),
@@ -2849,6 +2862,8 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           intent = turn;
           context.activeTurnIntent = turn;
           context.activeTurnId = turnId;
+          context.hasStreamedThisTurn = false;
+          context.activeAssistantItemId = undefined;
           if (!steering) {
             context.tokenTracker.userMessagesChars += prompt.length;
             context.tokenTracker.totalLifetimeProcessedTokens += Math.round(prompt.length / 4);
@@ -2920,6 +2935,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       const toolTimeout =
         options.activeToolInactivityTimeoutMs ??
         DEFAULT_ANTIGRAVITY_ACTIVE_TOOL_INACTIVITY_TIMEOUT_MS;
+      const POST_STREAM_GRACE_TIMEOUT_MS = 20_000;
 
       const makeWatchdog = (
         activeFiber: Fiber.Fiber<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>,
@@ -2931,11 +2947,48 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               yield* Effect.sleep("1 second");
               continue;
             }
-            const limit = context.activeToolCalls.size > 0 ? toolTimeout : turnTimeout;
+            const hasPendingWork =
+              context.activeToolCalls.size > 0 ||
+              context.trackedSubagents.size > 0 ||
+              [...context.subagents.values()].some((s) => s !== "finished" && s !== "mcp");
+            const isPostStreamIdle = Boolean(context.hasStreamedThisTurn && !hasPendingWork);
+            const limit = hasPendingWork
+              ? toolTimeout
+              : isPostStreamIdle
+                ? POST_STREAM_GRACE_TIMEOUT_MS
+                : turnTimeout;
             const now = yield* Clock.currentTimeMillis;
             const elapsed = now - context.lastActivityAtMillis;
             const remaining = limit - elapsed;
             if (remaining <= 0) {
+              if (isPostStreamIdle) {
+                if (context.activeAssistantItemId) {
+                  yield* emit(
+                    makeAcpAssistantItemEvent({
+                      stamp: yield* stamp,
+                      provider: PROVIDER,
+                      threadId: context.threadId,
+                      turnId: context.activeTurnId,
+                      itemId: context.activeAssistantItemId,
+                      lifecycle: "item.completed",
+                    }),
+                  );
+                  context.activeAssistantItemId = undefined;
+                }
+                yield* context.promptLock.withPermit(
+                  finishTurn(launch.turn, {
+                    state: "completed",
+                    stopReason: "end_turn",
+                  }),
+                );
+                yield* Fiber.interrupt(activeFiber).pipe(Effect.ignore);
+                yield* context.runtime.cancel.pipe(
+                  Effect.timeoutOption("3 seconds"),
+                  Effect.ignore,
+                  Effect.forkIn(context.scope),
+                );
+                return { stopReason: "end_turn" } as EffectAcpSchema.PromptResponse;
+              }
               const errorMessage = `Antigravity response timed out after ${Math.max(1, Math.round(limit / 60000))} minutes of inactivity. The connection to the model may have stalled.`;
               yield* context.promptLock.withPermit(
                 finishTurn(launch.turn, {

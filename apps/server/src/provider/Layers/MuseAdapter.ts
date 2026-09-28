@@ -14,6 +14,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeItemId,
+  RuntimeTaskId,
   TurnId,
   type MuseSettings,
   type ProviderRuntimeEvent,
@@ -327,7 +328,7 @@ export function make(
     const attempt = <A>(
       method: string,
       run: () => Promise<A>,
-      timeoutDuration: Duration.Duration | string | number = "60 seconds",
+      timeoutDuration: Duration.Input = "60 seconds",
     ) =>
       Effect.tryPromise({ try: run, catch: (cause) => requestError(method, cause) }).pipe(
         Effect.timeoutOrElse({
@@ -734,11 +735,26 @@ export function make(
             item.kind !== "subagent"
           ) {
             ctx.items.set(id, { ...item, status: "completed" });
+            emit({
+              ...base(ctx),
+              type: "item.completed",
+              turnId: TurnId.make(event.params.turnId),
+              itemId: RuntimeItemId.make(id),
+              payload: {
+                itemType: itemType(item),
+                status: "completed",
+              },
+            });
           }
         }
         if (!hasActiveWorkflowOrSubagent(ctx)) {
           const { activeTurnId: _, ...rest } = ctx.session;
           ctx.session = { ...rest, status: "ready", updatedAt: nowIso() };
+          emit({
+            ...base(ctx),
+            type: "session.state.changed",
+            payload: { state: "ready" },
+          });
         } else {
           ctx.session = { ...ctx.session, status: "running", updatedAt: nowIso() };
         }
@@ -1482,64 +1498,49 @@ export function make(
         const ctx = yield* requireSession(threadId);
         cancelTransientRetry(ctx);
         const target = turnId ?? ctx.session.activeTurnId;
-        if (!target || (turnId && ctx.session.activeTurnId !== turnId)) {
+        const hasWedgedBackground =
+          hasActiveWorkflowOrSubagent(ctx) ||
+          ctx.session.status === "running" ||
+          [...ctx.items.values()].some((i) => i.status === "inProgress");
+
+        if (!target && !hasWedgedBackground) {
           if (ctx.session.status === "connecting") {
             yield* stopContext(ctx);
           }
           return;
         }
-        if (ctx.settledTurns.has(target)) return;
 
-        yield* Effect.promise(() => drainViewPages(ctx));
-        if (ctx.settledTurns.has(target)) {
-          stopDrainTimer(ctx);
-          return;
+        if (target) {
+          yield* Effect.promise(() => drainViewPages(ctx));
+          if (ctx.settledTurns.has(target) && !hasWedgedBackground) {
+            stopDrainTimer(ctx);
+            return;
+          }
         }
 
-        const interruptedOption = yield* Effect.tryPromise({
-          try: () =>
-            ctx.host.connection.command("turn/interrupt", {
-              sessionId: ctx.sessionId,
-              turnId: target,
-            }),
-          catch: (cause) => requestError("turn/interrupt", cause),
-        }).pipe(
-          Effect.timeoutOption("5 seconds"),
-          Effect.catch(() => Effect.succeed(Option.none())),
-        );
-        const interrupted = Option.isSome(interruptedOption);
+        let interrupted = false;
+        if (target) {
+          const interruptedOption = yield* Effect.tryPromise({
+            try: () =>
+              ctx.host.connection.command("turn/interrupt", {
+                sessionId: ctx.sessionId,
+                turnId: target,
+              }),
+            catch: (cause) => requestError("turn/interrupt", cause),
+          }).pipe(
+            Effect.timeoutOption("3 seconds"),
+            Effect.catch(() => Effect.succeed(Option.none())),
+          );
+          interrupted = Option.isSome(interruptedOption);
+        } else {
+          interrupted = true;
+        }
 
         yield* Effect.promise(() => drainViewPages(ctx));
         stopDrainTimer(ctx);
 
-        if (ctx.settledTurns.has(target)) {
+        if (target && ctx.settledTurns.has(target) && !hasWedgedBackground) {
           return;
-        }
-
-        for (const [id, item] of ctx.items.entries()) {
-          if (item.status === "inProgress") {
-            ctx.items.set(id, { ...item, status: "completed" });
-            emit({
-              ...base(ctx),
-              type: "item.completed",
-              turnId: target,
-              itemId: RuntimeItemId.make(id),
-              payload: {
-                itemType: itemType(item),
-                status: "completed",
-              },
-            });
-          }
-        }
-
-        if (!ctx.settledTurns.has(target)) {
-          ctx.settledTurns.add(target);
-          emit({
-            ...base(ctx),
-            type: "turn.completed",
-            turnId: target,
-            payload: { state: "cancelled", stopReason: "interrupted" },
-          });
         }
 
         if (!interrupted) {
@@ -1553,6 +1554,46 @@ export function make(
           );
           yield* stopContext(ctx);
           return;
+        }
+
+        for (const [id, item] of ctx.items.entries()) {
+          if (item.status === "inProgress") {
+            ctx.items.set(id, { ...item, status: "completed" });
+            emit({
+              ...base(ctx),
+              type: "item.completed",
+              turnId: target ?? TurnId.make(item.turnId),
+              itemId: RuntimeItemId.make(id),
+              payload: {
+                itemType: itemType(item),
+                status: "completed",
+              },
+            });
+            if (item.kind === "workflow" || item.kind === "subagent") {
+              emit({
+                ...base(ctx),
+                type: "task.completed",
+                turnId: target ?? TurnId.make(item.turnId),
+                itemId: RuntimeItemId.make(id),
+                payload: {
+                  taskId: RuntimeTaskId.make(id),
+                  taskType: item.kind === "workflow" ? "local_workflow" : "subagent",
+                  status: "stopped",
+                  summary: "Workflow interrupted by user",
+                },
+              });
+            }
+          }
+        }
+
+        if (target && !ctx.settledTurns.has(target)) {
+          ctx.settledTurns.add(target);
+          emit({
+            ...base(ctx),
+            type: "turn.completed",
+            turnId: target,
+            payload: { state: "cancelled", stopReason: "interrupted" },
+          });
         }
 
         const { activeTurnId: _, ...rest } = ctx.session;

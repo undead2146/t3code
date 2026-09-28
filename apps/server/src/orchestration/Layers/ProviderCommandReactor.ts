@@ -850,6 +850,20 @@ const make = Effect.gen(function* () {
         shouldRestartForModelSelectionChange,
         hasResumeCursor: resumeCursor !== undefined,
       });
+      yield* setThreadSession({
+        threadId,
+        session: {
+          threadId,
+          status: "starting",
+          providerName: activeSession?.provider ?? preferredProvider ?? "antigravity",
+          providerInstanceId: desiredInstanceId,
+          runtimeMode: desiredRuntimeMode,
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+        createdAt,
+      });
       const restartedSession = yield* startProviderSession(
         resumeCursor !== undefined ? { resumeCursor } : undefined,
       );
@@ -866,6 +880,20 @@ const make = Effect.gen(function* () {
     }
 
     const resumeCursor = activeSession?.resumeCursor ?? undefined;
+    yield* setThreadSession({
+      threadId,
+      session: {
+        threadId,
+        status: "starting",
+        providerName: preferredProvider ?? "antigravity",
+        providerInstanceId: desiredInstanceId,
+        runtimeMode: desiredRuntimeMode,
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: createdAt,
+      },
+      createdAt,
+    });
     const startedSession = yield* startProviderSession(
       resumeCursor !== undefined ? { resumeCursor } : undefined,
     );
@@ -1651,6 +1679,26 @@ const make = Effect.gen(function* () {
       return;
     }
     const session = thread.session;
+    if (inFlight || session?.status === "starting") {
+      yield* providerService
+        .interruptTurn({ threadId: event.payload.threadId })
+        .pipe(Effect.ignore);
+      yield* setThreadSession({
+        threadId: event.payload.threadId,
+        session: {
+          threadId: event.payload.threadId,
+          status: "stopped",
+          providerName: session?.providerName ?? "antigravity",
+          providerInstanceId: session?.providerInstanceId,
+          runtimeMode: session?.runtimeMode ?? "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: event.payload.createdAt,
+        },
+        createdAt: event.payload.createdAt,
+      });
+      return;
+    }
     if (!session || session.status === "stopped") {
       return yield* appendProviderFailureActivity({
         threadId: event.payload.threadId,

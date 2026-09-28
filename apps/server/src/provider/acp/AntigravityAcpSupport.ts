@@ -66,7 +66,7 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
       ...input,
       authMethodId: input.authMethod ?? "oauth-personal",
       resumeMethod: "resume",
-      cancelBehavior: "wait-for-prompt",
+      cancelBehavior: "interrupt",
       cancelTimeout: Duration.seconds(15),
       clientCapabilities: {
         fs: {
