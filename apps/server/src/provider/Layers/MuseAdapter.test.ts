@@ -1864,4 +1864,37 @@ describe("MuseAdapter path and symlink utilities", () => {
     expect(() => MuseAdapter.killMuseProcessTree({})).not.toThrow();
     expect(() => MuseAdapter.killMuseProcessTree({ child: { pid: -1 } })).not.toThrow();
   });
+
+  it.effect("safely receives session/branchChanged without failing session", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-branch-changed");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+      expect(mockNotificationCallback).toBeDefined();
+
+      mockNotificationCallback!({
+        method: "session/branchChanged",
+        params: {
+          sessionId,
+          viewCursor: "v:branch:1",
+          branch: "main",
+          workspaceRoot: "Z:\\test-workspace",
+          vcs: "git",
+        },
+      });
+
+      const sessions = yield* adapter.listSessions();
+      const current = sessions.find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("ready");
+    }).pipe(Effect.provide(testLayer)),
+  );
 });

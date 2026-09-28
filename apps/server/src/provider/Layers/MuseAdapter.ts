@@ -1,6 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off globalTimers:off
 import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import {
   createUuidV7Mint,
@@ -199,6 +201,8 @@ interface SessionContext {
   lastViewCursor?: string;
   isPagingView?: boolean;
   drainTimer?: ReturnType<typeof setInterval> | undefined;
+  lastActivityAt: number;
+  sessionLogPath?: string;
 }
 
 function isAutoApproveSession(ctx: SessionContext): boolean {
@@ -278,6 +282,97 @@ export function arePathsEquivalent(pathA: string, pathB: string): boolean {
     return normA.toLowerCase() === normB.toLowerCase();
   }
   return false;
+}
+
+interface MuseTerminalOutcome {
+  terminal: "completed" | "failed" | "interrupted";
+  reason?: string | null;
+}
+
+function findMuseSessionLog(museHome: string, sessionId: string): string | undefined {
+  const now = new Date();
+  for (let daysAgo = 0; daysAgo <= 7; daysAgo++) {
+    const d = new Date(now.getTime() - daysAgo * 86_400_000);
+    const yyyy = String(d.getUTCFullYear());
+    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    const candidate = NodePath.join(museHome, "sessions", yyyy, mm, dd, sessionId, "session.jsonl");
+    if (NodeFS.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  const sessionsRoot = NodePath.join(museHome, "sessions");
+  try {
+    if (!NodeFS.existsSync(sessionsRoot)) return undefined;
+    const years = NodeFS.readdirSync(sessionsRoot);
+    for (const y of years) {
+      const yPath = NodePath.join(sessionsRoot, y);
+      if (!NodeFS.statSync(yPath).isDirectory()) continue;
+      const months = NodeFS.readdirSync(yPath);
+      for (const m of months) {
+        const mPath = NodePath.join(yPath, m);
+        if (!NodeFS.statSync(mPath).isDirectory()) continue;
+        const days = NodeFS.readdirSync(mPath);
+        for (const d of days) {
+          const cand = NodePath.join(mPath, d, sessionId, "session.jsonl");
+          if (NodeFS.existsSync(cand)) {
+            return cand;
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore directory traversal errors
+  }
+  return undefined;
+}
+
+function checkOnDiskTerminal(
+  sessionLogPath: string,
+  activeTurnId: string,
+): MuseTerminalOutcome | undefined {
+  try {
+    const stat = NodeFS.statSync(sessionLogPath);
+    if (stat.size === 0) return undefined;
+    const readSize = Math.min(stat.size, 128 * 1024);
+    const buffer = Buffer.alloc(readSize);
+    const fd = NodeFS.openSync(sessionLogPath, "r");
+    try {
+      NodeFS.readSync(fd, buffer, 0, readSize, stat.size - readSize);
+    } finally {
+      NodeFS.closeSync(fd);
+    }
+    const text = buffer.toString("utf8");
+    const lines = text.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      if (line.includes('"terminal"') && line.includes(activeTurnId)) {
+        try {
+          const parsed = JSON.parse(line);
+          const payload = parsed.payload ?? parsed;
+          if (
+            payload?.kind === "run" &&
+            payload?.run_id === activeTurnId &&
+            payload?.event?.kind === "terminal"
+          ) {
+            const terminal = payload.event.terminal;
+            if (terminal === "completed" || terminal === "failed" || terminal === "interrupted") {
+              return {
+                terminal,
+                reason: payload.event.reason,
+              };
+            }
+          }
+        } catch {
+          // Incomplete line if read buffer split mid-record
+        }
+      }
+    }
+  } catch {
+    // Session log not accessible or read error
+  }
+  return undefined;
 }
 
 export function make(
@@ -444,6 +539,69 @@ export function make(
 
     let drainViewPages: (ctx: SessionContext) => Promise<void>;
 
+    const settleTurnFromOutcome = (
+      ctx: SessionContext,
+      turnId: string,
+      outcome: MuseTerminalOutcome,
+    ) => {
+      if (ctx.settledTurns.has(turnId)) return;
+      ctx.settledTurns.add(turnId);
+      stopDrainTimer(ctx);
+
+      for (const [id, item] of ctx.items.entries()) {
+        if (item.status === "inProgress") {
+          ctx.items.set(id, { ...item, status: "completed" });
+          emit({
+            ...base(ctx),
+            type: "item.completed",
+            turnId: TurnId.make(turnId),
+            itemId: RuntimeItemId.make(id),
+            payload: {
+              itemType: itemType(item),
+              status: "completed",
+            },
+          });
+          if (item.kind === "workflow" || item.kind === "subagent") {
+            emit({
+              ...base(ctx),
+              type: "task.completed",
+              turnId: TurnId.make(turnId),
+              itemId: RuntimeItemId.make(id),
+              payload: {
+                taskId: RuntimeTaskId.make(id),
+                taskType: item.kind === "workflow" ? "local_workflow" : "subagent",
+                status: "completed",
+                summary: "Completed",
+              },
+            });
+          }
+        }
+      }
+
+      emit({
+        ...base(ctx),
+        type: "turn.completed",
+        turnId: TurnId.make(turnId),
+        payload: {
+          state:
+            outcome.terminal === "interrupted"
+              ? "interrupted"
+              : outcome.terminal === "failed"
+                ? "failed"
+                : "completed",
+          ...(outcome.reason ? { errorMessage: outcome.reason } : {}),
+        },
+      });
+
+      const { activeTurnId: _, ...rest } = ctx.session;
+      ctx.session = { ...rest, status: "ready", updatedAt: nowIso() };
+      emit({
+        ...base(ctx),
+        type: "session.state.changed",
+        payload: { state: "ready" },
+      });
+    };
+
     const startDrainTimer = (ctx: SessionContext) => {
       if (ctx.drainTimer) return;
       ctx.drainTimer = setInterval(() => {
@@ -452,6 +610,49 @@ export function make(
           return;
         }
         void drainViewPages(ctx);
+
+        const activeTurnId = ctx.session.activeTurnId;
+        if (!activeTurnId) return;
+
+        const quietMs = Date.now() - ctx.lastActivityAt;
+
+        // Layer 1: If quiet for >= 10s, inspect the on-disk session.jsonl
+        if (quietMs >= 10_000) {
+          if (!ctx.sessionLogPath && ctx.sessionId) {
+            const museHome =
+              ((ctx.host.initializeResult as Record<string, unknown> | undefined)?.museHome as
+                | string
+                | undefined) ||
+              process.env.MUSE_HOME ||
+              (process.platform === "win32"
+                ? process.env.LOCALAPPDATA
+                  ? NodePath.join(process.env.LOCALAPPDATA, "muse")
+                  : NodePath.join(NodeOS.homedir(), ".local", "share", "muse")
+                : process.env.XDG_DATA_HOME
+                  ? NodePath.join(process.env.XDG_DATA_HOME, "muse")
+                  : NodePath.join(NodeOS.homedir(), ".local", "share", "muse"));
+            ctx.sessionLogPath = findMuseSessionLog(museHome, ctx.sessionId);
+          }
+
+          if (ctx.sessionLogPath) {
+            const onDiskTerminal = checkOnDiskTerminal(ctx.sessionLogPath, activeTurnId);
+            if (onDiskTerminal) {
+              settleTurnFromOutcome(ctx, activeTurnId, onDiskTerminal);
+              return;
+            }
+          }
+        }
+
+        // Layer 2: Quiet turn auto-finalization if quiet for >= 45s with no active subagents or pending requests
+        if (
+          quietMs >= 45_000 &&
+          !hasActiveWorkflowOrSubagent(ctx) &&
+          ctx.approvals.size === 0 &&
+          ctx.questions.size === 0
+        ) {
+          settleTurnFromOutcome(ctx, activeTurnId, { terminal: "completed" });
+          return;
+        }
       }, 5_000);
     };
 
@@ -496,7 +697,11 @@ export function make(
           }
 
           for (const item of result.events) {
-            receive(ctx, item);
+            try {
+              receive(ctx, item);
+            } catch {
+              // Ignore single item failure so remaining page events are processed
+            }
           }
 
           if (!result.nextCursor || result.nextCursor === currentCursor) {
@@ -513,12 +718,25 @@ export function make(
 
     const receive = (ctx: SessionContext, input: { method: string; params?: unknown }) => {
       if (ctx.stopped) return;
+      if (typeof input !== "object" || input === null || !("method" in input)) return;
+
+      const rawParams = input.params as Record<string, unknown> | undefined;
+      if (rawParams && typeof rawParams === "object" && typeof rawParams.viewCursor === "string") {
+        ctx.lastViewCursor = rawParams.viewCursor;
+      }
+      ctx.lastActivityAt = Date.now();
+
       if (input.method === "view/gap") {
         void drainViewPages(ctx);
         return;
       }
       if (!isMuseNotificationMethod(input.method)) return;
-      const event = decodeMuseNotification(input);
+      let event: MuseNotification;
+      try {
+        event = decodeMuseNotification(input);
+      } catch {
+        return;
+      }
       if (event.method !== "usage/changed" && event.params.sessionId !== ctx.sessionId) return;
       if (
         "viewCursor" in (event.params as Record<string, unknown>) &&
@@ -901,6 +1119,8 @@ export function make(
               transientRetryPending: undefined,
               startInput: input,
               needsRestart: false,
+              lastActivityAt: Date.now(),
+              sessionLogPath: undefined,
             };
             yield* Effect.addFinalizer(() =>
               Effect.sync(() => {
@@ -1477,6 +1697,7 @@ export function make(
             });
           }
           if (result.disposition !== "queued" && !ctx.settledTurns.has(result.turnId)) {
+            ctx.lastActivityAt = Date.now();
             ctx.session = {
               ...ctx.session,
               status: "running",

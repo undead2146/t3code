@@ -1,6 +1,7 @@
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -170,13 +171,43 @@ const bootstrap = Effect.gen(function* () {
   // The renderer is served from the bundled client (or Vite in development)
   // rather than through the local backend, so the window can open without one.
   const electronProtocol = yield* ElectronProtocol.ElectronProtocol;
+  const assetDirectories = [environment.clientAssetsDir, ...environment.clientAssetsFallbackDirs];
   yield* electronProtocol.registerDesktopProtocol({
     scheme: ElectronProtocol.getDesktopScheme(environment.isDevelopment),
     ...(environment.isDevelopment
       ? { targetOrigin: Option.getOrThrow(environment.devServerUrl) }
-      : { assetDirectory: environment.clientAssetsDir }),
+      : { assetDirectory: assetDirectories }),
     clerkFrontendApiHostname: DesktopClerk.desktopClerkFrontendApiHostname,
   });
+
+  // Self-heal: If unpackaged and server client bundle is missing but web dist exists, sync it
+  if (!environment.isPackaged && !environment.isDevelopment) {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const serverClientIndex = environment.path.join(environment.clientAssetsDir, "index.html");
+    const webDistIndex = environment.path.join(environment.rootDir, "apps/web/dist/index.html");
+    const hasServerClient = yield* fileSystem
+      .exists(serverClientIndex)
+      .pipe(Effect.orElseSucceed(() => false));
+    if (!hasServerClient) {
+      const hasWebDist = yield* fileSystem
+        .exists(webDistIndex)
+        .pipe(Effect.orElseSucceed(() => false));
+      if (hasWebDist) {
+        yield* fileSystem
+          .copy(
+            environment.path.join(environment.rootDir, "apps/web/dist"),
+            environment.clientAssetsDir,
+          )
+          .pipe(
+            Effect.tap(() =>
+              logBootstrapInfo("self-healed server client bundle from apps/web/dist"),
+            ),
+            Effect.ignore,
+          );
+      }
+    }
+  }
+
   yield* installDesktopIpcHandlers();
   yield* logBootstrapInfo("bootstrap ipc handlers registered");
 

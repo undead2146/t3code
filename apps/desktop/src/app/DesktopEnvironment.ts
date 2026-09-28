@@ -64,6 +64,7 @@ export class DesktopEnvironment extends Context.Service<
     readonly backendEntryPath: string;
     // Built web client the packaged renderer is served from over t3code://app.
     readonly clientAssetsDir: string;
+    readonly clientAssetsFallbackDirs: readonly string[];
     readonly backendCwd: string;
     readonly preloadPath: string;
     // Preload that turns on the V8 compile cache for the local backend.
@@ -221,6 +222,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
     serverRoot,
     backendEntryPath: path.join(serverRoot, "apps/server/dist/bin.mjs"),
     clientAssetsDir: path.join(serverRoot, "apps/server/dist/client"),
+    clientAssetsFallbackDirs: input.isPackaged ? [] : [path.join(rootDir, "apps/web/dist")],
     backendCwd: input.isPackaged ? homeDirectory : appRoot,
     preloadPath: path.join(input.dirname, "preload.cjs"),
     compileCachePath: path.join(input.dirname, "compileCache.cjs"),

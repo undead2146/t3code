@@ -222,6 +222,15 @@ export const MuseNotification = Schema.Union([
       windowTokens: Schema.optional(NonNegativeInt),
     }),
   }),
+  Schema.Struct({
+    method: Schema.Literal("session/branchChanged"),
+    params: Schema.Struct({
+      ...identity,
+      branch: Schema.optional(Schema.NullOr(Schema.String)),
+      workspaceRoot: Schema.optional(Schema.NullOr(Schema.String)),
+      vcs: Schema.optional(Schema.NullOr(Schema.String)),
+    }),
+  }),
 ]);
 export type MuseNotification = typeof MuseNotification.Type;
 export const decodeMuseNotification = Schema.decodeUnknownSync(MuseNotification);
@@ -243,6 +252,7 @@ const notificationMethods: ReadonlySet<string> = new Set([
   "session/todoListChanged",
   "session/tokenUsage",
   "session/contextUsage",
+  "session/branchChanged",
   "usage/changed",
 ]);
 export const isMuseNotificationMethod = (method: string): boolean =>
@@ -985,5 +995,7 @@ export function mapMuseNotification(
           },
         },
       ];
+    case "session/branchChanged":
+      return [];
   }
 }

@@ -599,7 +599,14 @@ export const make = (
     );
     yield* Scope.addFinalizer(
       runtimeScope,
-      Ref.set(stoppingRef, true).pipe(Effect.andThen(Deferred.succeed(runtimeClosed, undefined))),
+      Effect.all(
+        [
+          Ref.set(stoppingRef, true),
+          Deferred.succeed(runtimeClosed, undefined),
+          child.kill({ forceKillAfter: "1 second" }).pipe(Effect.ignore),
+        ],
+        { discard: true },
+      ),
     );
     const initializeClientCapabilities = {
       fs: {

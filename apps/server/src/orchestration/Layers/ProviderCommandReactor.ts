@@ -850,20 +850,6 @@ const make = Effect.gen(function* () {
         shouldRestartForModelSelectionChange,
         hasResumeCursor: resumeCursor !== undefined,
       });
-      yield* setThreadSession({
-        threadId,
-        session: {
-          threadId,
-          status: "starting",
-          providerName: activeSession?.provider ?? preferredProvider ?? "antigravity",
-          providerInstanceId: desiredInstanceId,
-          runtimeMode: desiredRuntimeMode,
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: createdAt,
-        },
-        createdAt,
-      });
       const restartedSession = yield* startProviderSession(
         resumeCursor !== undefined ? { resumeCursor } : undefined,
       );
@@ -1631,15 +1617,25 @@ const make = Effect.gen(function* () {
         return;
       }
 
-      const send = providerService
-        .sendTurn(sendTurnRequest.value)
-        .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure));
+      let sendFiber: Fiber.Fiber<void, unknown> | undefined;
+      const send = providerService.sendTurn(sendTurnRequest.value).pipe(
+        Effect.asVoid,
+        Effect.catchCause(recoverTurnStartFailure),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (sendFiber && startingTurnFibers.get(event.payload.threadId) === sendFiber) {
+              startingTurnFibers.delete(event.payload.threadId);
+            }
+          }),
+        ),
+      );
       // The forked send settles `sent` from here on, so drop the entry the post-processing hook uses.
       if (resumed && event.commandId !== null) resumedTurnStarts.delete(event.commandId);
-      yield* send.pipe(
+      sendFiber = yield* send.pipe(
         Effect.ensuring(resumed ? Deferred.succeed(resumed.sent, undefined) : Effect.void),
         Effect.forkScoped,
       );
+      startingTurnFibers.set(event.payload.threadId, sendFiber);
     }).pipe(
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
@@ -1679,7 +1675,7 @@ const make = Effect.gen(function* () {
       return;
     }
     const session = thread.session;
-    if (inFlight || session?.status === "starting") {
+    if (inFlight && (!session || session.status === "stopped")) {
       yield* providerService
         .interruptTurn({ threadId: event.payload.threadId })
         .pipe(Effect.ignore);
@@ -1813,22 +1809,19 @@ const make = Effect.gen(function* () {
         decision: event.payload.decision,
       })
       .pipe(
-        Effect.catchCause((cause) => {
-          if (isUnknownPendingApprovalRequestError(cause)) {
-            return Effect.logWarning(
-              `Stale or already resolved approval request '${event.payload.requestId}'; ignoring duplicate response.`,
-            );
-          }
-          return appendProviderFailureActivity({
+        Effect.catchCause((cause) =>
+          appendProviderFailureActivity({
             threadId: event.payload.threadId,
             kind: "provider.approval.respond.failed",
             summary: "Provider approval response failed",
-            detail: Cause.pretty(cause),
+            detail: isUnknownPendingApprovalRequestError(cause)
+              ? stalePendingRequestDetail("approval", event.payload.requestId)
+              : Cause.pretty(cause),
             turnId: null,
             createdAt: event.payload.createdAt,
             requestId: event.payload.requestId,
-          });
-        }),
+          }),
+        ),
       );
   });
 
@@ -1863,22 +1856,19 @@ const make = Effect.gen(function* () {
             : {}),
         })
         .pipe(
-          Effect.catchCause((cause) => {
-            if (isUnknownPendingUserInputRequestError(cause)) {
-              return Effect.logWarning(
-                `Stale or already resolved user input request '${event.payload.requestId}'; ignoring duplicate response.`,
-              );
-            }
-            return appendProviderFailureActivity({
+          Effect.catchCause((cause) =>
+            appendProviderFailureActivity({
               threadId: event.payload.threadId,
               kind: "provider.user-input.respond.failed",
               summary: "Provider user input response failed",
-              detail: Cause.pretty(cause),
+              detail: isUnknownPendingUserInputRequestError(cause)
+                ? stalePendingRequestDetail("user-input", event.payload.requestId)
+                : Cause.pretty(cause),
               turnId: null,
               createdAt: event.payload.createdAt,
               requestId: event.payload.requestId,
-            });
-          }),
+            }),
+          ),
         );
     },
   );
