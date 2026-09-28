@@ -115,7 +115,7 @@ type Approval = Extract<
   { method: "approval/requested" | "approval/updated" }
 >["params"];
 export function killMuseProcessTree(childOrHandshake: unknown): void {
-  if (process.platform !== "win32" || !childOrHandshake) return;
+  if (!childOrHandshake) return;
   try {
     const candidate = (childOrHandshake as { child?: unknown })?.child ?? childOrHandshake;
     let pid: number | undefined;
@@ -143,9 +143,22 @@ export function killMuseProcessTree(childOrHandshake: unknown): void {
     }
 
     if (typeof pid === "number" && pid > 0) {
-      NodeChildProcess.spawnSync("taskkill.exe", ["/pid", String(pid), "/t", "/f"], {
-        stdio: "ignore",
-      });
+      if (process.platform === "win32") {
+        NodeChildProcess.spawnSync("taskkill.exe", ["/pid", String(pid), "/t", "/f"], {
+          stdio: "ignore",
+        });
+      } else {
+        try {
+          NodeChildProcess.spawnSync("pkill", ["-KILL", "-P", String(pid)], { stdio: "ignore" });
+        } catch {}
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch {}
+        }
+      }
     }
   } catch {
     // Best-effort process tree termination
@@ -171,6 +184,7 @@ interface SessionContext {
   selectedModel: string;
   contextUsedTokens?: number;
   contextWindowTokens?: number;
+  stderrBuffer: string[];
   pendingTokenUsage: Map<string, Extract<MuseNotification, { method: "session/tokenUsage" }>>;
   stopped: boolean;
   transportRetryStreak: { turnId: string; signature: string; count: number } | undefined;
@@ -714,7 +728,11 @@ export function make(
         (!ctx.session.activeTurnId || ctx.session.activeTurnId === event.params.turnId)
       ) {
         for (const [id, item] of ctx.items.entries()) {
-          if (item.kind === "reminderChild" && item.status === "inProgress") {
+          if (
+            item.status === "inProgress" &&
+            item.kind !== "workflow" &&
+            item.kind !== "subagent"
+          ) {
             ctx.items.set(id, { ...item, status: "completed" });
           }
         }
@@ -780,6 +798,7 @@ export function make(
                   APPROVAL_JUDGE: "off",
                 }
               : baseEnv;
+            const stderrBuffer: string[] = [];
             const handshake = yield* Effect.acquireRelease(
               Effect.try({
                 try: () =>
@@ -789,6 +808,19 @@ export function make(
                     cwd,
                     env: McpProviderSession.withAgentDeviceEnvironment(sessionEnv, mcp),
                     shutdownTimeoutMs: 2_000,
+                    onStderr: (chunk: string | Buffer) => {
+                      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+                      for (const line of text.split("\n")) {
+                        const trimmed = line.trim();
+                        if (trimmed) {
+                          stderrBuffer.push(trimmed);
+                          if (stderrBuffer.length > 100) stderrBuffer.shift();
+                        }
+                      }
+                    },
+                    connection: {
+                      frameLimitBytes: 512 * 1024 * 1024,
+                    },
                   }),
                 catch: (cause) => requestError("spawn", cause),
               }),
@@ -842,6 +874,7 @@ export function make(
               questions: new Map(),
               settledTurns: new Set(),
               pendingTokenUsage: new Map(),
+              stderrBuffer,
               selectedModel,
               stopped: false,
               transportRetryStreak: undefined,
@@ -910,7 +943,7 @@ export function make(
                   host.connection.command("session/resume", {
                     sessionId,
                     ...(sessionConfig ? { config: sessionConfig } : {}),
-                    history: "inline",
+                    excludeItems: true,
                   }),
                 ).pipe(
                   Effect.catch(() => {
@@ -961,7 +994,10 @@ export function make(
             const snapshotCursor = result.history?.snapshot as
               | { cursor?: string; viewCursor?: string }
               | undefined;
-            const foundCursor = snapshotCursor?.viewCursor ?? snapshotCursor?.cursor;
+            const foundCursor =
+              (result as { viewCursor?: string }).viewCursor ??
+              snapshotCursor?.viewCursor ??
+              snapshotCursor?.cursor;
             if (foundCursor) {
               ctx.lastViewCursor = foundCursor;
             }
@@ -1028,9 +1064,10 @@ export function make(
           failSession(ctx, "Muse Code sent an invalid notification.");
         }
       });
-      host.connection.onProtocolError(() =>
-        failSession(ctx, "Muse Code sent an invalid protocol frame."),
-      );
+      host.connection.onProtocolError((error) => {
+        failSession(ctx, `Muse Code protocol error: ${error.message}`);
+        void host.close().catch(() => {});
+      });
       host.connection.onServerRequest(async (request) => {
         if (request.method === "approval/request" && isAutoApproveSession(ctx)) {
           const params = request.params as Approval;
@@ -1071,13 +1108,24 @@ export function make(
         }
         return {};
       });
+      let exitHandled = false;
+      const handleExit = (exitKind?: string) => {
+        if (exitHandled || ctx.stopped || ctx.needsRestart) return;
+        exitHandled = true;
+        const stderrTail = ctx.stderrBuffer.slice(-10).join("\n").trim();
+        const baseReason = exitKind
+          ? `Muse Code exited (${exitKind}).`
+          : "Muse Code closed its connection.";
+        const message = stderrTail
+          ? `${baseReason} Stderr: ${stderrTail}. Resume the thread to reconnect.`
+          : `${baseReason} Resume the thread to reconnect.`;
+        failSession(ctx, message);
+      };
       void host.connection.closed.then(() => {
-        if (!ctx.stopped && !ctx.needsRestart)
-          failSession(ctx, "Muse Code closed its connection. Resume the thread to reconnect.");
+        setTimeout(() => handleExit(), 300);
       });
       void host.child.exit.then((exit) => {
-        if (!ctx.stopped && !ctx.needsRestart)
-          failSession(ctx, `Muse Code exited (${exit.kind}). Resume the thread to reconnect.`);
+        handleExit(exit.kind);
       });
     };
 
@@ -1114,6 +1162,7 @@ export function make(
             APPROVAL_JUDGE: "off",
           }
         : baseEnv;
+      const stderrBuffer: string[] = [];
       const handshake = yield* Effect.acquireRelease(
         Effect.try({
           try: () =>
@@ -1123,6 +1172,19 @@ export function make(
               cwd,
               env: McpProviderSession.withAgentDeviceEnvironment(sessionEnv, mcp),
               shutdownTimeoutMs: 2_000,
+              onStderr: (chunk: string | Buffer) => {
+                const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+                for (const line of text.split("\n")) {
+                  const trimmed = line.trim();
+                  if (trimmed) {
+                    stderrBuffer.push(trimmed);
+                    if (stderrBuffer.length > 100) stderrBuffer.shift();
+                  }
+                }
+              },
+              connection: {
+                frameLimitBytes: 512 * 1024 * 1024,
+              },
             }),
           catch: (cause) => requestError("spawn", cause),
         }),
@@ -1216,6 +1278,7 @@ export function make(
       ctx.autoApprovedApprovals.clear();
       ctx.questions.clear();
       ctx.pendingTokenUsage.clear();
+      ctx.stderrBuffer = stderrBuffer;
       ctx.needsRestart = false;
     });
 
@@ -1371,10 +1434,15 @@ export function make(
             Effect.mapError((cause) => requestError("turn/start", cause)),
             Effect.tapError((cause) =>
               Effect.sync(() => {
-                failSession(
-                  ctx,
-                  `Muse Code failed to start turn: ${cause.detail ?? cause.message}`,
-                );
+                const message = cause.detail ?? cause.message;
+                if (
+                  message.includes("conflicts with an existing event") ||
+                  message.includes("event log failed")
+                ) {
+                  ctx.session = { ...ctx.session, resumeCursor: undefined };
+                  ctx.needsRestart = true;
+                }
+                failSession(ctx, `Muse Code failed to start turn: ${message}`);
               }),
             ),
           );
