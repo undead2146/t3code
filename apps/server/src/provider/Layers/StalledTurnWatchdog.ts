@@ -31,7 +31,7 @@ export interface StalledTurnWatchdogLiveOptions {
 
 export interface StalledTurn {
   readonly threadId: ThreadId;
-  readonly turnId: TurnId;
+  readonly turnId: TurnId | null;
   readonly idleMs: number;
 }
 
@@ -39,8 +39,10 @@ export interface StalledTurn {
  * A running turn whose thread projection has seen no provider progress
  * (messages, activities, usage, session transitions all bump updatedAt)
  * for longer than the threshold is wedged, not busy: every provider emits
- * something observable within minutes while a turn is alive. Turns blocked
- * on the user (pending approvals / input) or active in background tasks/subagents
+ * something observable within minutes while a turn is alive. The same holds
+ * for a session stuck in starting: a turn that never started and never
+ * produced any progress is wedged, not queued. Turns blocked on the user
+ * (pending approvals / input) or active in background tasks/subagents
  * (backgroundLiveness is "working" or "monitoring") are never stalled.
  */
 export function selectStalledTurns(
@@ -50,8 +52,11 @@ export function selectStalledTurns(
 ): Array<StalledTurn> {
   const stalled: Array<StalledTurn> = [];
   for (const thread of threads) {
+    const status = thread.session?.status;
     const activeTurnId = thread.session?.activeTurnId ?? null;
-    if (thread.session?.status !== "running" || activeTurnId === null) {
+    const runningStalled = status === "running" && activeTurnId !== null;
+    const startingStalled = status === "starting";
+    if (!runningStalled && !startingStalled) {
       continue;
     }
     if (thread.archivedAt !== null) {
@@ -71,7 +76,11 @@ export function selectStalledTurns(
     if (idleMs < stallThresholdMs) {
       continue;
     }
-    stalled.push({ threadId: thread.id, turnId: activeTurnId, idleMs });
+    stalled.push({
+      threadId: thread.id,
+      turnId: runningStalled ? activeTurnId : null,
+      idleMs,
+    });
   }
   return stalled;
 }
@@ -89,8 +98,16 @@ const makeStalledTurnWatchdog = (options?: StalledTurnWatchdogLiveOptions) =>
         // Deterministic ids: a wedged provider that never settles still only
         // ever records one interrupt + one explanation, since the engine
         // dedupes on command id across sweeps and restarts.
-        const idBase = `stalled-turn-watchdog:${stalled.threadId}:${stalled.turnId}`;
+        const idBase = `stalled-turn-watchdog:${stalled.threadId}:${stalled.turnId ?? "pending"}`;
         const minutes = Math.max(1, Math.round(stalled.idleMs / 60_000));
+        const detail =
+          stalled.turnId === null
+            ? `No provider progress for ${minutes} minute${minutes === 1 ? "" : "s"}. ` +
+              "The turn never started, so it was stopped automatically. " +
+              "Send a new message to retry."
+            : `No provider progress for ${minutes} minute${minutes === 1 ? "" : "s"}. ` +
+              "The provider may have stalled, so the turn was stopped automatically. " +
+              "Send a new message to retry.";
         yield* orchestrationEngine.dispatch({
           type: "thread.activity.append",
           commandId: CommandId.make(`${idBase}:activity`),
@@ -100,12 +117,7 @@ const makeStalledTurnWatchdog = (options?: StalledTurnWatchdogLiveOptions) =>
             tone: "info",
             kind: "provider.turn.interrupted",
             summary: "Turn stopped automatically",
-            payload: {
-              detail:
-                `No provider progress for ${minutes} minute${minutes === 1 ? "" : "s"}. ` +
-                "The provider may have stalled, so the turn was stopped automatically. " +
-                "Send a new message to retry.",
-            },
+            payload: { detail },
             turnId: stalled.turnId,
             createdAt,
           },
@@ -118,7 +130,7 @@ const makeStalledTurnWatchdog = (options?: StalledTurnWatchdogLiveOptions) =>
           type: "thread.turn.interrupt",
           commandId: CommandId.make(`${idBase}:interrupt`),
           threadId: stalled.threadId,
-          turnId: stalled.turnId,
+          ...(stalled.turnId !== null ? { turnId: stalled.turnId } : {}),
           createdAt,
         });
         yield* Effect.logInfo("stalled-turn-watchdog.interrupted", {

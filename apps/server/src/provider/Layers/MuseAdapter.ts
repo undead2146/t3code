@@ -203,6 +203,7 @@ interface SessionContext {
   drainTimer?: ReturnType<typeof setInterval> | undefined;
   lastActivityAt: number;
   sessionLogPath?: string;
+  lastTurnId?: string;
 }
 
 function isAutoApproveSession(ctx: SessionContext): boolean {
@@ -243,6 +244,13 @@ function hasActiveWorkflowOrSubagent(ctx: SessionContext): boolean {
     if ((item.kind === "workflow" || item.kind === "subagent") && item.status === "inProgress") {
       return true;
     }
+  }
+  return false;
+}
+
+function hasInProgressItem(ctx: SessionContext): boolean {
+  for (const item of ctx.items.values()) {
+    if (item.status === "inProgress") return true;
   }
   return false;
 }
@@ -381,6 +389,8 @@ export function make(
     environment?: NodeJS.ProcessEnv;
     instanceId?: ProviderInstanceId;
     transientRetryDelaysMs?: ReadonlyArray<number>;
+    drainIntervalMs?: number;
+    quietSettleThresholdMs?: number;
   },
 ) {
   return Effect.gen(function* () {
@@ -396,6 +406,8 @@ export function make(
     const mintEventId = createUuidV7Mint();
     const nextEventId = () => EventId.make(mintEventId());
     const transientRetryDelays = options?.transientRetryDelaysMs ?? MUSE_TRANSIENT_RETRY_DELAYS_MS;
+    const drainIntervalMs = Math.max(1, options?.drainIntervalMs ?? 5_000);
+    const quietSettleThresholdMs = Math.max(1, options?.quietSettleThresholdMs ?? 45_000);
     const requestError = (method: string, cause: unknown) => {
       let detail = "Muse Code rejected the request or its response was invalid.";
       if (typeof cause === "string" && cause.trim().length > 0) {
@@ -643,9 +655,14 @@ export function make(
           }
         }
 
-        // Layer 2: Quiet turn auto-finalization if quiet for >= 45s with no active subagents or pending requests
+        // Layer 2: Quiet turn auto-finalization if quiet for >= 45s with no live
+        // items, active subagents, or pending requests. A tool call that emits
+        // no output for a while (long builds, tests) is alive, not dead:
+        // settling it orphans the still-running host turn, and the next turn
+        // then queues behind that zombie instead of starting.
         if (
-          quietMs >= 45_000 &&
+          quietMs >= quietSettleThresholdMs &&
+          !hasInProgressItem(ctx) &&
           !hasActiveWorkflowOrSubagent(ctx) &&
           ctx.approvals.size === 0 &&
           ctx.questions.size === 0
@@ -653,7 +670,7 @@ export function make(
           settleTurnFromOutcome(ctx, activeTurnId, { terminal: "completed" });
           return;
         }
-      }, 5_000);
+      }, drainIntervalMs);
     };
 
     const stopDrainTimer = (ctx: SessionContext) => {
@@ -810,6 +827,7 @@ export function make(
       if (event.method === "userInput/settled") ctx.questions.delete(event.params.userInputId);
       if (event.method === "turn/started") {
         if (ctx.settledTurns.has(event.params.turnId)) return;
+        ctx.lastTurnId = event.params.turnId;
         ctx.session = {
           ...ctx.session,
           status: "running",
@@ -1251,6 +1269,7 @@ export function make(
                   : {}),
               };
               if (ctx.session.status === "running" && ctx.session.activeTurnId) {
+                ctx.lastTurnId = ctx.session.activeTurnId;
                 startDrainTimer(ctx);
               }
             }
@@ -1518,6 +1537,53 @@ export function make(
       ctx.needsRestart = false;
     });
 
+    // A turn that queues while the adapter tracks no live turn means the host
+    // is still busy with a turn this adapter already settled (e.g. an
+    // idle-settled turn whose tool calls kept running). The queued turn would
+    // wait behind that zombie indefinitely, so stop the stale host turn and
+    // let the queue drain instead of leaving the session stuck in starting.
+    // The explicit turn id keeps this race-safe: if the stale turn already
+    // finished, the interrupt is rejected and the queued turn proceeds.
+    const interruptStaleHostTurn = (ctx: SessionContext, queuedTurnId: string) =>
+      Effect.gen(function* () {
+        const activeTurnId = ctx.session.activeTurnId ?? undefined;
+        if (
+          ctx.session.status === "running" &&
+          activeTurnId !== undefined &&
+          !ctx.settledTurns.has(activeTurnId)
+        ) {
+          return;
+        }
+        const staleTurnId = ctx.lastTurnId;
+        if (!staleTurnId) return;
+        const interrupted = yield* attempt(
+          "turn/interrupt",
+          () =>
+            ctx.host.connection.command("turn/interrupt", {
+              sessionId: ctx.sessionId,
+              turnId: staleTurnId,
+            }),
+          "10 seconds",
+        ).pipe(Effect.option);
+        if (Option.isNone(interrupted)) {
+          yield* Effect.logWarning("Muse stale host turn interrupt failed", {
+            threadId: ctx.session.threadId,
+            staleTurnId,
+            queuedTurnId,
+          });
+          return;
+        }
+        emit({
+          ...base(ctx),
+          type: "runtime.warning",
+          turnId: TurnId.make(queuedTurnId),
+          payload: {
+            message:
+              "The previous turn was still running in the provider, so it was stopped to let the queued turn start.",
+          },
+        });
+      });
+
     const sendTurn: Adapter["sendTurn"] = Effect.fn("MuseAdapter.sendTurn")(function* (input) {
       let ctx = yield* requireSession(input.threadId);
       return yield* ctx.lock.withPermit(
@@ -1688,6 +1754,7 @@ export function make(
               ctx.session.lastError ?? "Muse Code disconnected.",
             );
           if (result.disposition !== "queued") {
+            ctx.lastTurnId = result.turnId;
             ctx.settledTurns.delete(result.turnId);
             emit({
               ...base(ctx),
@@ -1695,6 +1762,9 @@ export function make(
               turnId: TurnId.make(result.turnId),
               payload: {},
             });
+          }
+          if (result.disposition === "queued") {
+            yield* interruptStaleHostTurn(ctx, result.turnId);
           }
           if (result.disposition !== "queued" && !ctx.settledTurns.has(result.turnId)) {
             ctx.lastActivityAt = Date.now();
@@ -2052,6 +2122,7 @@ export function make(
             }
             const result = started.right;
             if (result.disposition !== "queued") {
+              ctx.lastTurnId = result.turnId;
               ctx.settledTurns.delete(result.turnId);
               emit({
                 ...base(ctx),

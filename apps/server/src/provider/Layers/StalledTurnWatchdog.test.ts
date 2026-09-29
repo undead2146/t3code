@@ -101,6 +101,39 @@ describe("selectStalledTurns", () => {
     expect(selectStalledTurns(threads, nowMs, STALL_THRESHOLD_MS)).toHaveLength(0);
   });
 
+  it("selects a starting session silent past the threshold", () => {
+    const silentAt = minutesBefore(now, 40);
+    const threads = [
+      makeShell({
+        id: threadId,
+        updatedAt: silentAt,
+        session: {
+          ...runningSession(threadId, null, silentAt),
+          status: "starting",
+        } as unknown as NonNullable<OrchestrationThreadShell["session"]>,
+      }),
+    ];
+    const stalled = selectStalledTurns(threads, nowMs, STALL_THRESHOLD_MS);
+    expect(stalled).toHaveLength(1);
+    expect(stalled[0]?.threadId).toBe(threadId);
+    expect(stalled[0]?.turnId).toBeNull();
+  });
+
+  it("ignores starting sessions with recent progress", () => {
+    const freshAt = minutesBefore(now, 2);
+    const threads = [
+      makeShell({
+        id: threadId,
+        updatedAt: freshAt,
+        session: {
+          ...runningSession(threadId, null, freshAt),
+          status: "starting",
+        } as unknown as NonNullable<OrchestrationThreadShell["session"]>,
+      }),
+    ];
+    expect(selectStalledTurns(threads, nowMs, STALL_THRESHOLD_MS)).toHaveLength(0);
+  });
+
   it("ignores running turns with active background work (backgroundLiveness is not null)", () => {
     const silentAt = minutesBefore(now, 60);
     const threads = [
@@ -270,6 +303,48 @@ describe("StalledTurnWatchdog sweep", () => {
       }
       expect(interrupt.threadId).toBe(threadId);
       expect(interrupt.turnId).toBe(turnId);
+    }),
+  );
+
+  it.effect("interrupts a starting session that never produced a turn", () =>
+    Effect.gen(function* () {
+      const dispatched: Array<OrchestrationCommand> = [];
+      const threadId = ThreadId.make("thread-sweep-starting");
+      const layer = sweepLayer({
+        dispatched,
+        buildThreads: (now) => {
+          const silentAt = DateTime.formatIso(DateTime.subtract(now, { minutes: 40 }));
+          return [
+            makeShell({
+              id: threadId,
+              updatedAt: silentAt,
+              session: {
+                ...runningSession(threadId, null, silentAt),
+                status: "starting",
+              } as unknown as NonNullable<OrchestrationThreadShell["session"]>,
+            }),
+          ];
+        },
+      });
+      const watchdog = yield* StalledTurnWatchdog.pipe(Effect.provide(layer));
+      yield* watchdog.runSweep();
+
+      expect(dispatched.map((command) => command.type)).toEqual([
+        "thread.activity.append",
+        "thread.turn.interrupt",
+      ]);
+      const activity = dispatched[0];
+      if (activity?.type !== "thread.activity.append") {
+        throw new Error("Expected activity.append first");
+      }
+      expect(activity.threadId).toBe(threadId);
+      expect(activity.activity.turnId).toBeNull();
+      const interrupt = dispatched[1];
+      if (interrupt?.type !== "thread.turn.interrupt") {
+        throw new Error("Expected turn.interrupt second");
+      }
+      expect(interrupt.threadId).toBe(threadId);
+      expect(interrupt.turnId).toBeUndefined();
     }),
   );
 

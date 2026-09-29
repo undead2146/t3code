@@ -1564,6 +1564,179 @@ describe("MuseAdapter transport truncation mitigation", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.live("interrupts the stale host turn when a turn queues with no live turn", () =>
+    Effect.gen(function* () {
+      mockCommands = [];
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-queued-zombie");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+
+      // Turn 1 runs, then settles in the adapter while the host keeps working it.
+      const first = yield* adapter.sendTurn({ threadId, input: "first" });
+      const staleTurnId = String(first.turnId);
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: "cursor-zombie-done",
+          turnId: staleTurnId,
+          terminal: "completed",
+        },
+      });
+      let current = (yield* adapter.listSessions()).find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("ready");
+
+      // The follow-up queues behind the still-busy host.
+      mockCommands = [];
+      mockTurnStartResponse = {
+        status: "accepted",
+        turnId: "turn-queued-zombie",
+        disposition: "queued",
+        startedNewTurn: false,
+      };
+      const warnings = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "runtime.warning" }> =>
+            event.type === "runtime.warning",
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      const second = yield* adapter.sendTurn({ threadId, input: "second" });
+      expect(String(second.turnId)).toBe("turn-queued-zombie");
+
+      // The stale host turn is interrupted so the queued turn can launch.
+      const interrupt = mockCommands.find((c) => c.method === "turn/interrupt");
+      expect(interrupt?.params).toMatchObject({ sessionId, turnId: staleTurnId });
+
+      const warned = yield* Fiber.join(warnings).pipe(Effect.timeoutOption("5 seconds"));
+      expect(Option.isSome(warned)).toBe(true);
+
+      current = (yield* adapter.listSessions()).find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("ready");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("leaves a queued turn alone while its predecessor is still live", () =>
+    Effect.gen(function* () {
+      mockCommands = [];
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+
+      const threadId = ThreadId.make("thread-test-queued-live");
+      yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({ threadId, input: "first" });
+      mockCommands = [];
+      mockTurnStartResponse = {
+        status: "accepted",
+        turnId: "turn-queued-live",
+        disposition: "queued",
+        startedNewTurn: false,
+      };
+      yield* adapter.sendTurn({ threadId, input: "second" });
+
+      expect(mockCommands.find((c) => c.method === "turn/interrupt")).toBeUndefined();
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.live("does not idle-settle a quiet turn while a tool call is still running", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+        drainIntervalMs: 20,
+        quietSettleThresholdMs: 100,
+      });
+
+      const threadId = ThreadId.make("thread-test-idle-live-tool");
+      const session = yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+
+      const turn = yield* adapter.sendTurn({ threadId, input: "run the slow build" });
+      mockNotificationCallback!({
+        method: "item/started",
+        params: {
+          sessionId,
+          viewCursor: "cursor-idle-tool",
+          item: {
+            itemId: "tool-idle-1",
+            kind: "toolCall",
+            revision: 1,
+            status: "inProgress",
+            turnId: String(turn.turnId),
+            tool: "bash",
+          },
+        },
+      });
+
+      const completions: Array<ProviderRuntimeEvent> = [];
+      const tap = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "turn.completed"),
+        Stream.tap((event) => Effect.sync(() => void completions.push(event))),
+        Stream.runDrain,
+        Effect.forkChild,
+      );
+      yield* Effect.sleep("500 millis");
+      yield* Fiber.interrupt(tap);
+
+      expect(completions).toHaveLength(0);
+      const current = (yield* adapter.listSessions()).find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("running");
+      expect(current?.activeTurnId).toBe(String(turn.turnId));
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.live("idle-settles a quiet turn once nothing is still running", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+        drainIntervalMs: 20,
+        quietSettleThresholdMs: 100,
+      });
+
+      const threadId = ThreadId.make("thread-test-idle-done");
+      yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+      });
+
+      const turn = yield* adapter.sendTurn({ threadId, input: "quick question" });
+      const completed = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "turn.completed"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      const events = yield* Fiber.join(completed).pipe(Effect.timeoutOption("10 seconds"));
+
+      expect(Option.isSome(events)).toBe(true);
+      expect(events.pipe(Option.map((chunk) => String(chunk[0]?.turnId)))).toEqual(
+        Option.some(String(turn.turnId)),
+      );
+      const current = (yield* adapter.listSessions()).find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("ready");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.effect(
     "auto-approves tool approvals and suppresses approval prompts in full-access mode via notification",
     () =>
