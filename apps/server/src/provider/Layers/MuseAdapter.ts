@@ -90,6 +90,9 @@ const SessionResult = Schema.Struct({
     status: Schema.String,
     activeTurnId: Schema.NullOr(Schema.String),
   }),
+  // The view head the connection is subscribed after; "" when Muse could not
+  // project the session and did not subscribe it.
+  viewCursor: Schema.optional(Schema.String),
   history: Schema.optional(
     Schema.Struct({
       mode: Schema.String,
@@ -217,6 +220,13 @@ interface SessionContext {
   needsRestart?: boolean;
   lastViewCursor?: string;
   isPagingView?: boolean;
+  // The in-flight view/page drain, so a caller can wait for it instead of skipping.
+  pagingPromise?: Promise<void> | undefined;
+  // Set when session/resume answered without a view cursor (Muse reports
+  // history "projectionUnavailable"): the connection is not subscribed, so no
+  // notifications are pushed and view/page polling is the only event source.
+  pushUnavailable?: boolean;
+  settlingFromDisk?: boolean;
   drainTimer?: ReturnType<typeof setInterval> | undefined;
   lastActivityAt: number;
   sessionLogPath?: string;
@@ -410,6 +420,7 @@ export function make(
     silentNudgeDelayMs?: number;
     drainIntervalMs?: number;
     quietSettleThresholdMs?: number;
+    sessionRecordCheckQuietMs?: number;
   },
 ) {
   return Effect.gen(function* () {
@@ -442,6 +453,7 @@ export function make(
     const silentNudgeDelayMs = Math.max(0, options?.silentNudgeDelayMs ?? 5_000);
     const drainIntervalMs = Math.max(1, options?.drainIntervalMs ?? 5_000);
     const quietSettleThresholdMs = Math.max(1, options?.quietSettleThresholdMs ?? 45_000);
+    const sessionRecordCheckQuietMs = Math.max(1, options?.sessionRecordCheckQuietMs ?? 10_000);
     const requestError = (method: string, cause: unknown) => {
       let detail = "Muse Code rejected the request or its response was invalid.";
       if (typeof cause === "string" && cause.trim().length > 0) {
@@ -674,7 +686,7 @@ export function make(
         const quietMs = Date.now() - ctx.lastActivityAt;
 
         // Layer 1: If quiet for >= 10s, inspect the on-disk session.jsonl
-        if (quietMs >= 10_000) {
+        if (quietMs >= sessionRecordCheckQuietMs) {
           if (!ctx.sessionLogPath && ctx.sessionId) {
             const museHome =
               ((ctx.host.initializeResult as Record<string, unknown> | undefined)?.museHome as
@@ -693,13 +705,31 @@ export function make(
 
           if (ctx.sessionLogPath) {
             const onDiskTerminal = checkOnDiskTerminal(ctx.sessionLogPath, activeTurnId);
-            if (onDiskTerminal) {
-              settleTurnFromOutcome(
-                ctx,
-                activeTurnId,
-                onDiskTerminal,
-                "Muse reported this turn complete, but the completion notice was lost in transit — settled from the session record.",
-              );
+            if (onDiskTerminal && !ctx.settlingFromDisk) {
+              // The record shows the turn ended but its events have not reached
+              // us yet (always the case without push). Drain the view first so
+              // the final items (the assistant reply) and the real turn/completed
+              // go through receive(), which also drives retries and nudges.
+              // Settle from the record only if the view still never delivers it.
+              ctx.settlingFromDisk = true;
+              void drainViewFully(ctx)
+                .then(() => {
+                  if (
+                    ctx.stopped ||
+                    ctx.settledTurns.has(activeTurnId) ||
+                    ctx.session.activeTurnId !== activeTurnId
+                  )
+                    return;
+                  settleTurnFromOutcome(
+                    ctx,
+                    activeTurnId,
+                    onDiskTerminal,
+                    "Muse's session record shows this turn ended, but its final events never arrived — settled from the session record.",
+                  );
+                })
+                .finally(() => {
+                  ctx.settlingFromDisk = false;
+                });
               return;
             }
           }
@@ -712,6 +742,7 @@ export function make(
         // then queues behind that zombie instead of starting.
         if (
           quietMs >= quietSettleThresholdMs &&
+          !ctx.settlingFromDisk &&
           !hasInProgressItem(ctx) &&
           !hasActiveWorkflowOrSubagent(ctx) &&
           ctx.approvals.size === 0 &&
@@ -725,7 +756,19 @@ export function make(
           );
           return;
         }
-      }, drainIntervalMs);
+      }, pollIntervalMs(ctx));
+    };
+
+    // Without push, polling is the only event source, so poll fast enough that
+    // the thread still reads as live.
+    const pollIntervalMs = (ctx: SessionContext) =>
+      ctx.pushUnavailable ? Math.min(drainIntervalMs, 1_000) : drainIntervalMs;
+
+    // Waits for any in-flight drain, then drains once more so events written
+    // after that drain started are also delivered.
+    const drainViewFully = async (ctx: SessionContext): Promise<void> => {
+      await ctx.pagingPromise;
+      await drainViewPages(ctx);
     };
 
     const stopDrainTimer = (ctx: SessionContext) => {
@@ -735,9 +778,19 @@ export function make(
       }
     };
 
-    drainViewPages = async (ctx: SessionContext): Promise<void> => {
-      if (ctx.stopped || ctx.isPagingView || !ctx.host || !ctx.sessionId) return;
+    drainViewPages = (ctx: SessionContext): Promise<void> => {
+      if (ctx.stopped || !ctx.host || !ctx.sessionId) return Promise.resolve();
+      if (ctx.isPagingView) return ctx.pagingPromise ?? Promise.resolve();
       ctx.isPagingView = true;
+      const run = pageView(ctx).finally(() => {
+        ctx.isPagingView = false;
+        ctx.pagingPromise = undefined;
+      });
+      ctx.pagingPromise = run;
+      return run;
+    };
+
+    const pageView = async (ctx: SessionContext): Promise<void> => {
       try {
         let currentCursor = ctx.lastViewCursor;
         let pageCount = 0;
@@ -783,8 +836,29 @@ export function make(
         }
       } catch {
         // Best-effort drain: connection close or transient protocol error should not fail session
-      } finally {
-        ctx.isPagingView = false;
+      }
+    };
+
+    // Resume answers with an empty view cursor when Muse cannot project the
+    // session's view; the connection is then not subscribed to pushes. Mark the
+    // session for polling and anchor the cursor at the view head so the first
+    // poll does not replay the whole history as if it were live.
+    const adoptResumeViewState = async (
+      ctx: SessionContext,
+      viewCursor: string | undefined,
+    ): Promise<void> => {
+      ctx.pushUnavailable = viewCursor === "";
+      if (!ctx.pushUnavailable || ctx.lastViewCursor) return;
+      try {
+        const head = (await ctx.host.connection.request("view/page", {
+          sessionId: ctx.sessionId,
+          direction: "backward",
+          limit: 1,
+        })) as { events?: Array<{ params?: { viewCursor?: unknown } }> } | undefined;
+        const cursor = head?.events?.at(-1)?.params?.viewCursor;
+        if (typeof cursor === "string" && cursor) ctx.lastViewCursor = cursor;
+      } catch {
+        // Without an anchor the first poll pages from the start; replayed turns are ignored.
       }
     };
 
@@ -1377,12 +1451,12 @@ export function make(
               | { cursor?: string; viewCursor?: string }
               | undefined;
             const foundCursor =
-              (result as { viewCursor?: string }).viewCursor ??
-              snapshotCursor?.viewCursor ??
-              snapshotCursor?.cursor;
+              result.viewCursor ?? snapshotCursor?.viewCursor ?? snapshotCursor?.cursor;
             if (foundCursor) {
               ctx.lastViewCursor = foundCursor;
             }
+            if (cursor && ctx.sessionId === sessionId)
+              yield* Effect.promise(() => adoptResumeViewState(ctx, result.viewCursor));
             if (ctx.session.status === "connecting") {
               const activeTurnId = result.session.activeTurnId;
               const hasActiveWorkflow = hasActiveWorkflowOrSubagent(ctx);
@@ -1662,6 +1736,8 @@ export function make(
       ctx.questions.clear();
       ctx.pendingTokenUsage.clear();
       ctx.stderrBuffer = stderrBuffer;
+      // A fresh session/start always subscribes the connection.
+      ctx.pushUnavailable = false;
       ctx.needsRestart = false;
     });
 
@@ -2481,6 +2557,7 @@ export function make(
         updatedAt: nowIso(),
       };
       ctx.stopped = false;
+      yield* Effect.promise(() => adoptResumeViewState(ctx, result.viewCursor));
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           ctx.stopped = true;

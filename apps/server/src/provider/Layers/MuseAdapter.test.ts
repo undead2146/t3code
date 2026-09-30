@@ -4,6 +4,7 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { afterEach, describe, expect, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -29,6 +30,7 @@ let mockSessionResultHistory: any = undefined;
 let mockResumeShouldFail = false;
 let mockStartShouldFail: string | false = false;
 let mockStartHangWorkspace: string | undefined;
+let mockResumeViewCursor: string | undefined;
 let mintCommandIdCounter = 0;
 let mockCommands: Array<{ method: string; params: any }> = [];
 let mockTurnStartResponse: any = undefined;
@@ -77,6 +79,9 @@ vi.mock("@muse-code/sdk", async (importOriginal) => {
                     activeTurnId: null,
                   },
                   history: mockSessionResultHistory,
+                  ...(method === "session/resume" && mockResumeViewCursor !== undefined
+                    ? { viewCursor: mockResumeViewCursor }
+                    : {}),
                 };
               }
               if (method === "turn/start") {
@@ -115,6 +120,7 @@ afterEach(() => {
   mockTurnInterruptShouldHang = false;
   mockStartShouldFail = false;
   mockStartHangWorkspace = undefined;
+  mockResumeViewCursor = undefined;
   mockResumeShouldFail = false;
   McpProviderSession.clearAllMcpProviderSessions();
   mockTurnStartResponse = undefined;
@@ -2256,6 +2262,116 @@ describe("MuseAdapter transport truncation mitigation", () => {
       );
       const current = (yield* adapter.listSessions()).find((s) => s.threadId === threadId);
       expect(current?.status).toBe("ready");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.live("delivers a push-less resumed session's final events before settling", () =>
+    Effect.gen(function* () {
+      // Muse answers session/resume without a view cursor when it cannot
+      // project the session: nothing is pushed and polling is the only source.
+      mockResumeViewCursor = "";
+      const sessionId = "sess-poll";
+      const turnId = "poll-turn-1";
+      const museHome = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(process.cwd(), ".muse-home-test-")),
+      );
+      const now = DateTime.toDateUtc(yield* DateTime.now);
+      const dayDir = NodePath.join(
+        museHome,
+        "sessions",
+        String(now.getUTCFullYear()),
+        String(now.getUTCMonth() + 1).padStart(2, "0"),
+        String(now.getUTCDate()).padStart(2, "0"),
+        sessionId,
+      );
+      yield* Effect.promise(() => NodeFSP.mkdir(dayDir, { recursive: true }));
+      // The session record already shows the turn ended.
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(
+          NodePath.join(dayDir, "session.jsonl"),
+          `{"payload":{"kind":"run","run_id":"${turnId}","event":{"kind":"terminal","terminal":"completed"}}}\n`,
+        ),
+      );
+      const priorMuseHome = process.env.MUSE_HOME;
+      process.env.MUSE_HOME = museHome;
+      mockRequestHandler = async (method, params) => {
+        if (method !== "view/page") return {};
+        if (params.direction === "backward")
+          return {
+            events: [
+              {
+                method: "session/statusChanged",
+                params: { sessionId, viewCursor: "v:sess-poll:5" },
+              },
+            ],
+          };
+        if (params.cursor !== "v:sess-poll:5") return { events: [], nextCursor: null };
+        // Slow page: the session-record check fires while this is in flight.
+        await Effect.runPromise(Effect.sleep("150 millis"));
+        return {
+          events: [
+            {
+              method: "item/completed",
+              params: {
+                sessionId,
+                viewCursor: "v:sess-poll:6",
+                item: {
+                  itemId: "final-reply",
+                  kind: "agentMessage",
+                  revision: 1,
+                  status: "completed",
+                  turnId,
+                  text: "Here is the answer.",
+                },
+              },
+            },
+            {
+              method: "turn/completed",
+              params: { sessionId, viewCursor: "v:sess-poll:7", turnId, terminal: "completed" },
+            },
+          ],
+          nextCursor: "v:sess-poll:7",
+        };
+      };
+      try {
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+          drainIntervalMs: 20,
+          sessionRecordCheckQuietMs: 50,
+        });
+        const threadId = ThreadId.make("thread-test-push-less");
+        yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+          resumeCursor: { schemaVersion: 1, sessionId, selectedModel: "default" },
+        });
+        const collected = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "turn.completed" ||
+              event.type === "runtime.warning" ||
+              (event.type === "item.completed" && String(event.itemId) === "final-reply"),
+          ),
+          Stream.takeUntil((event) => event.type === "turn.completed"),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        mockTurnStartResponse = { status: "accepted", turnId };
+        yield* adapter.sendTurn({ threadId, input: "question" });
+
+        const events = yield* Fiber.join(collected).pipe(Effect.timeoutOption("5 seconds"));
+        expect(Option.isSome(events)).toBe(true);
+        const types = Option.getOrThrow(events).map((event) =>
+          event.type === "runtime.warning" ? `warning: ${event.payload.message}` : event.type,
+        );
+        // The reply arrives before the turn settles, and nothing falls back to the record.
+        expect(types).toEqual(["item.completed", "turn.completed"]);
+      } finally {
+        if (priorMuseHome === undefined) delete process.env.MUSE_HOME;
+        else process.env.MUSE_HOME = priorMuseHome;
+        yield* Effect.promise(() => NodeFSP.rm(museHome, { recursive: true, force: true }));
+      }
     }).pipe(Effect.provide(testLayer)),
   );
 
