@@ -10,9 +10,16 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
-import { MuseSettings, ThreadId, type ProviderRuntimeEvent } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  MuseSettings,
+  ProviderInstanceId,
+  ThreadId,
+  type ProviderRuntimeEvent,
+} from "@t3tools/contracts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as MuseAdapter from "./MuseAdapter.ts";
 
 const decodeMuseSettings = Schema.decodeSync(MuseSettings);
@@ -21,6 +28,7 @@ let mockNotificationCallback: ((notification: any) => void) | undefined;
 let mockSessionResultHistory: any = undefined;
 let mockResumeShouldFail = false;
 let mockStartShouldFail: string | false = false;
+let mockStartHangWorkspace: string | undefined;
 let mintCommandIdCounter = 0;
 let mockCommands: Array<{ method: string; params: any }> = [];
 let mockTurnStartResponse: any = undefined;
@@ -55,6 +63,8 @@ vi.mock("@muse-code/sdk", async (importOriginal) => {
               if (method === "session/compact") return { status: "accepted" };
               if (method === "session/start" && mockStartShouldFail)
                 throw new Error(mockStartShouldFail);
+              if (method === "session/start" && mockStartHangWorkspace === params.workspaceRoot)
+                return new Promise(() => {});
               if (method === "session/resume" && mockResumeShouldFail)
                 throw new Error("Session not found");
               if (method === "session/start" || method === "session/resume") {
@@ -104,13 +114,50 @@ const testLayer = ServerConfig.layerTest(process.cwd(), { prefix: "t3-muse-adapt
 afterEach(() => {
   mockTurnInterruptShouldHang = false;
   mockStartShouldFail = false;
+  mockStartHangWorkspace = undefined;
   mockResumeShouldFail = false;
+  McpProviderSession.clearAllMcpProviderSessions();
   mockTurnStartResponse = undefined;
   mockSessionResultHistory = undefined;
   mockCommands = [];
   mockRequestHandler = undefined;
   mockServerRequestHandler = undefined;
   lastSpawnOptions = undefined;
+});
+
+describe("MuseAdapter per-thread session lifecycle", () => {
+  it.live("starts and stops other threads while one session start hangs", () =>
+    Effect.gen(function* () {
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+      });
+      mockStartHangWorkspace = "Z:\\hung-workspace";
+      const hung = yield* adapter
+        .startSession({
+          threadId: ThreadId.make("thread-hung"),
+          cwd: "Z:\\hung-workspace",
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      // Let the hung start take its thread's lifecycle permit first.
+      yield* Effect.sleep("20 millis");
+
+      const other = yield* adapter
+        .startSession({
+          threadId: ThreadId.make("thread-other"),
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.timeoutOption("2 seconds"));
+      expect(Option.isSome(other)).toBe(true);
+      const stopped = yield* adapter
+        .stopSession(ThreadId.make("thread-other"))
+        .pipe(Effect.timeoutOption("2 seconds"));
+      expect(Option.isSome(stopped)).toBe(true);
+
+      yield* Fiber.interrupt(hung);
+    }).pipe(Effect.provide(testLayer)),
+  );
 });
 
 describe("MuseAdapter session lifecycle with workflow items", () => {
@@ -1303,6 +1350,481 @@ describe("MuseAdapter transport truncation mitigation", () => {
         const starts = turnStartCommands();
         expect(starts).toHaveLength(2);
         expect(JSON.stringify(starts[1]?.params.input)).toContain("Follow-up prompt");
+      }).pipe(Effect.provide(testLayer)),
+    );
+  });
+
+  describe("MuseAdapter MCP audit auto-retry", () => {
+    const AUDIT_FAILURE =
+      "invalid run configuration: MCP startup audit failed; MCP is disabled for this runtime";
+
+    const makeAdapter = () =>
+      MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+        mcpAuditRetryDelayMs: 0,
+      });
+
+    const startThread = (
+      adapter: Effect.Success<ReturnType<typeof MuseAdapter.make>>,
+      threadId: string,
+    ) =>
+      Effect.gen(function* () {
+        McpProviderSession.setMcpProviderSession({
+          environmentId: EnvironmentId.make("env-test"),
+          threadId: ThreadId.make(threadId),
+          providerSessionId: "provider-session-1",
+          providerInstanceId: ProviderInstanceId.make("muse"),
+          endpoint: "http://127.0.0.1:13773/mcp",
+          authorizationHeader: "Bearer test-token",
+          capabilities: new Set(["pull-requests"]),
+        });
+        const session = yield* adapter.startSession({
+          threadId: ThreadId.make(threadId),
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+        return (session.resumeCursor as { sessionId: string }).sessionId;
+      });
+
+    const failTurn = (turnId: string, sessionId: string, cursor: string, message: string) =>
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: cursor,
+          turnId,
+          terminal: "failed",
+          error: { kind: "configError", message, retryable: false },
+        },
+      });
+
+    const collectWarning = (
+      adapter: Effect.Success<ReturnType<typeof MuseAdapter.make>>,
+      pattern: RegExp,
+    ) =>
+      adapter.streamEvents.pipe(
+        Stream.filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "runtime.warning" }> =>
+            event.type === "runtime.warning" && pattern.test(event.payload.message),
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+    const collectTurnStarted = (
+      adapter: Effect.Success<ReturnType<typeof MuseAdapter.make>>,
+      turnId: string,
+    ) =>
+      adapter.streamEvents.pipe(
+        Stream.filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "turn.started" }> =>
+            event.type === "turn.started" && event.turnId === turnId,
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+    it.live("re-resumes the same session on a fresh process and redrives once", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeAdapter();
+        const threadId = ThreadId.make("thread-test-audit-retry");
+        const sessionId = yield* startThread(adapter, "thread-test-audit-retry");
+        const firstCallback = mockNotificationCallback;
+
+        const turn = yield* adapter.sendTurn({ threadId, input: "Audit me" });
+        const warningFiber = yield* collectWarning(adapter, /retrying once/);
+        mockTurnStartResponse = { status: "accepted", turnId: "audit-retry-turn-1" };
+        failTurn(turn.turnId, sessionId, "cursor-audit-fail", AUDIT_FAILURE);
+
+        const warning = yield* Fiber.join(warningFiber).pipe(Effect.timeoutOption("5 seconds"));
+        expect(Option.isSome(warning)).toBe(true);
+
+        const startedFiber = yield* collectTurnStarted(adapter, "audit-retry-turn-1");
+        const started = yield* Fiber.join(startedFiber).pipe(Effect.timeoutOption("5 seconds"));
+        expect(Option.isSome(started)).toBe(true);
+
+        // Fresh process (new notification callback), same session resumed without
+        // the t3-code MCP server, which is what Muse keeps rejecting.
+        expect(mockNotificationCallback).toBeDefined();
+        expect(mockNotificationCallback).not.toBe(firstCallback);
+        const resumes = mockCommands.filter((command) => command.method === "session/resume");
+        expect(resumes).toHaveLength(1);
+        expect(resumes[0]?.params.sessionId).toBe(sessionId);
+        expect(resumes[0]?.params.config).toBeUndefined();
+
+        // Identical input redriven.
+        const starts = mockCommands.filter((command) => command.method === "turn/start");
+        expect(starts).toHaveLength(2);
+        expect(starts[1]?.params.input).toEqual(starts[0]?.params.input);
+        expect(starts[1]?.params.sessionId).toBe(sessionId);
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("surfaces the second consecutive audit failure instead of looping", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeAdapter();
+        const threadId = ThreadId.make("thread-test-audit-exhausted");
+        const sessionId = yield* startThread(adapter, "thread-test-audit-exhausted");
+
+        const turn = yield* adapter.sendTurn({ threadId, input: "Doomed prompt" });
+        mockTurnStartResponse = { status: "accepted", turnId: "audit-retry-turn-1" };
+        const startedFiber = yield* collectTurnStarted(adapter, "audit-retry-turn-1");
+        failTurn(turn.turnId, sessionId, "cursor-audit-fail-1", AUDIT_FAILURE);
+        expect(
+          Option.isSome(yield* Fiber.join(startedFiber).pipe(Effect.timeoutOption("5 seconds"))),
+        ).toBe(true);
+
+        const exhaustedFiber = yield* collectWarning(adapter, /rejected the resumed session twice/);
+        failTurn("audit-retry-turn-1", sessionId, "cursor-audit-fail-2", AUDIT_FAILURE);
+        expect(
+          Option.isSome(yield* Fiber.join(exhaustedFiber).pipe(Effect.timeoutOption("5 seconds"))),
+        ).toBe(true);
+
+        yield* Effect.sleep("50 millis");
+        expect(mockCommands.filter((command) => command.method === "session/resume")).toHaveLength(
+          1,
+        );
+        expect(mockCommands.filter((command) => command.method === "turn/start")).toHaveLength(2);
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("refuses the audit retry when the failed turn already executed tools", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeAdapter();
+        const threadId = ThreadId.make("thread-test-audit-tools");
+        const sessionId = yield* startThread(adapter, "thread-test-audit-tools");
+
+        const turn = yield* adapter.sendTurn({ threadId, input: "Acting prompt" });
+        mockNotificationCallback!({
+          method: "item/completed",
+          params: {
+            sessionId,
+            viewCursor: "cursor-item-1",
+            item: {
+              itemId: "tool-item-1",
+              kind: "toolCall",
+              revision: 2,
+              status: "completed",
+              turnId: turn.turnId,
+              tool: "bash",
+              args: "{}",
+            },
+          },
+        });
+
+        const warningFiber = yield* collectWarning(adapter, /already executed tools/);
+        failTurn(turn.turnId, sessionId, "cursor-audit-fail", AUDIT_FAILURE);
+        expect(
+          Option.isSome(yield* Fiber.join(warningFiber).pipe(Effect.timeoutOption("5 seconds"))),
+        ).toBe(true);
+
+        yield* Effect.sleep("50 millis");
+        expect(mockCommands.filter((command) => command.method === "session/resume")).toHaveLength(
+          0,
+        );
+        expect(mockCommands.filter((command) => command.method === "turn/start")).toHaveLength(1);
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("ignores audit failures for turns it did not start", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeAdapter();
+        const threadId = ThreadId.make("thread-test-audit-phantom");
+        const sessionId = yield* startThread(adapter, "thread-test-audit-phantom");
+
+        yield* adapter.sendTurn({ threadId, input: "Real prompt" });
+        failTurn("phantom-turn-9", sessionId, "cursor-audit-phantom", AUDIT_FAILURE);
+
+        yield* Effect.sleep("50 millis");
+        expect(mockCommands.filter((command) => command.method === "session/resume")).toHaveLength(
+          0,
+        );
+        expect(mockCommands.filter((command) => command.method === "turn/start")).toHaveLength(1);
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("routes the next resend to a fresh session when the re-resume is rejected", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeAdapter();
+        const threadId = ThreadId.make("thread-test-audit-gone");
+        const sessionId = yield* startThread(adapter, "thread-test-audit-gone");
+
+        const turn = yield* adapter.sendTurn({ threadId, input: "Gone prompt" });
+        mockResumeShouldFail = true;
+        const warningFiber = yield* collectWarning(adapter, /could not re-attach/);
+        failTurn(turn.turnId, sessionId, "cursor-audit-fail", AUDIT_FAILURE);
+        expect(
+          Option.isSome(yield* Fiber.join(warningFiber).pipe(Effect.timeoutOption("5 seconds"))),
+        ).toBe(true);
+
+        yield* Effect.sleep("50 millis");
+        expect(mockCommands.filter((command) => command.method === "turn/start")).toHaveLength(1);
+
+        // The session is gone from the CLI: the next resend starts fresh.
+        mockResumeShouldFail = false;
+        yield* adapter.sendTurn({ threadId, input: "Fresh start" });
+        const starts = mockCommands.filter((command) => command.method === "session/start");
+        expect(starts).toHaveLength(2);
+        expect(starts[1]?.params.sessionId).not.toBe(sessionId);
+      }).pipe(Effect.provide(testLayer)),
+    );
+  });
+
+  describe("MuseAdapter silent-completion summary nudge", () => {
+    const makeNudgeAdapter = (silentNudgeDelayMs = 0) =>
+      MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+        silentNudgeDelayMs,
+      });
+
+    const startThread = (
+      adapter: Effect.Success<ReturnType<typeof MuseAdapter.make>>,
+      threadId: string,
+    ) =>
+      Effect.gen(function* () {
+        const session = yield* adapter.startSession({
+          threadId: ThreadId.make(threadId),
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+        return (session.resumeCursor as { sessionId: string }).sessionId;
+      });
+
+    const collectNudgeWarning = (
+      adapter: Effect.Success<ReturnType<typeof MuseAdapter.make>>,
+      pattern: RegExp,
+    ) =>
+      adapter.streamEvents.pipe(
+        Stream.filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "runtime.warning" }> =>
+            event.type === "runtime.warning" && pattern.test(event.payload.message),
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+    const collectNudgeStarted = (
+      adapter: Effect.Success<ReturnType<typeof MuseAdapter.make>>,
+      turnId: string,
+    ) =>
+      adapter.streamEvents.pipe(
+        Stream.filter(
+          (event): event is Extract<ProviderRuntimeEvent, { type: "turn.started" }> =>
+            event.type === "turn.started" && event.turnId === turnId,
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+    const completeTurn = (turnId: string, sessionId: string, cursor: string) =>
+      mockNotificationCallback!({
+        method: "turn/completed",
+        params: {
+          sessionId,
+          viewCursor: cursor,
+          turnId,
+          terminal: "completed",
+        },
+      });
+
+    const completeWithTools = (
+      turnId: string,
+      sessionId: string,
+      itemCursor: string,
+      turnCursor: string,
+    ) => {
+      mockNotificationCallback!({
+        method: "item/completed",
+        params: {
+          sessionId,
+          viewCursor: itemCursor,
+          item: {
+            itemId: `tool-${String(turnId)}`,
+            kind: "toolCall",
+            revision: 2,
+            status: "completed",
+            turnId: String(turnId),
+            tool: "bash",
+            args: "{}",
+          },
+        },
+      });
+      completeTurn(turnId, sessionId, turnCursor);
+    };
+
+    const sendTextDelta = (sessionId: string, text: string) =>
+      mockNotificationCallback!({
+        method: "item/delta",
+        params: {
+          sessionId,
+          viewCursor: "cursor-nudge-delta",
+          itemId: "assistant-text-item",
+          delta: text,
+        },
+      });
+
+    it.live("asks for a summary when a turn completes with tools but no text", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeNudgeAdapter();
+        const threadId = ThreadId.make("thread-test-silent-nudge");
+        const sessionId = yield* startThread(adapter, "thread-test-silent-nudge");
+
+        const turn = yield* adapter.sendTurn({ threadId, input: "Build the thing" });
+        mockTurnStartResponse = { status: "accepted", turnId: "silent-nudge-turn-1" };
+        const warningFiber = yield* collectNudgeWarning(adapter, /asking for a summary/);
+        const startedFiber = yield* collectNudgeStarted(adapter, "silent-nudge-turn-1");
+        completeWithTools(turn.turnId, sessionId, "cursor-tool-1", "cursor-silent-1");
+
+        expect(
+          Option.isSome(yield* Fiber.join(warningFiber).pipe(Effect.timeoutOption("5 seconds"))),
+        ).toBe(true);
+        expect(
+          Option.isSome(yield* Fiber.join(startedFiber).pipe(Effect.timeoutOption("5 seconds"))),
+        ).toBe(true);
+
+        const starts = mockCommands.filter((command) => command.method === "turn/start");
+        expect(starts).toHaveLength(2);
+        expect(starts[1]?.params.input).toEqual([
+          { type: "text", text: expect.stringContaining("without any visible response") },
+        ]);
+
+        // The nudge turn responds with text: healthy again, no further starts.
+        sendTextDelta(sessionId, "Done: all tests pass.");
+        completeTurn("silent-nudge-turn-1", sessionId, "cursor-nudge-done");
+        yield* Effect.sleep("50 millis");
+        expect(mockCommands.filter((command) => command.method === "turn/start")).toHaveLength(2);
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("stays quiet when the turn responded with text", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeNudgeAdapter();
+        const threadId = ThreadId.make("thread-test-silent-text");
+        const sessionId = yield* startThread(adapter, "thread-test-silent-text");
+
+        const turn = yield* adapter.sendTurn({ threadId, input: "Build the other thing" });
+        const warningFiber = yield* collectNudgeWarning(adapter, /asking for a summary/);
+        mockNotificationCallback!({
+          method: "item/completed",
+          params: {
+            sessionId,
+            viewCursor: "cursor-tool-1",
+            item: {
+              itemId: `tool-${String(turn.turnId)}`,
+              kind: "toolCall",
+              revision: 2,
+              status: "completed",
+              turnId: String(turn.turnId),
+              tool: "bash",
+              args: "{}",
+            },
+          },
+        });
+        sendTextDelta(sessionId, "Built it.");
+        completeTurn(turn.turnId, sessionId, "cursor-done-1");
+
+        expect(
+          Option.isNone(yield* Fiber.join(warningFiber).pipe(Effect.timeoutOption("500 millis"))),
+        ).toBe(true);
+        yield* Effect.sleep("50 millis");
+        expect(mockCommands.filter((command) => command.method === "turn/start")).toHaveLength(1);
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("stays quiet when the turn ran nothing", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeNudgeAdapter();
+        const threadId = ThreadId.make("thread-test-silent-empty");
+        const sessionId = yield* startThread(adapter, "thread-test-silent-empty");
+
+        const turn = yield* adapter.sendTurn({ threadId, input: "Just thinking" });
+        completeTurn(turn.turnId, sessionId, "cursor-empty-1");
+
+        yield* Effect.sleep("50 millis");
+        expect(mockCommands.filter((command) => command.method === "turn/start")).toHaveLength(1);
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("surfaces the second consecutive silent end instead of looping", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeNudgeAdapter();
+        const threadId = ThreadId.make("thread-test-silent-loop");
+        const sessionId = yield* startThread(adapter, "thread-test-silent-loop");
+
+        const turn = yield* adapter.sendTurn({ threadId, input: "Doomed build" });
+        mockTurnStartResponse = { status: "accepted", turnId: "silent-nudge-turn-1" };
+        const startedFiber = yield* collectNudgeStarted(adapter, "silent-nudge-turn-1");
+        completeWithTools(turn.turnId, sessionId, "cursor-tool-1", "cursor-doomed-1");
+        expect(
+          Option.isSome(yield* Fiber.join(startedFiber).pipe(Effect.timeoutOption("5 seconds"))),
+        ).toBe(true);
+
+        const exhaustedFiber = yield* collectNudgeWarning(adapter, /also ended without a response/);
+        completeTurn("silent-nudge-turn-1", sessionId, "cursor-doomed-2");
+        expect(
+          Option.isSome(yield* Fiber.join(exhaustedFiber).pipe(Effect.timeoutOption("5 seconds"))),
+        ).toBe(true);
+
+        yield* Effect.sleep("50 millis");
+        expect(mockCommands.filter((command) => command.method === "turn/start")).toHaveLength(2);
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("lets a user send supersede a pending nudge", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* makeNudgeAdapter(50);
+        const threadId = ThreadId.make("thread-test-silent-superseded");
+        const sessionId = yield* startThread(adapter, "thread-test-silent-superseded");
+
+        const turn = yield* adapter.sendTurn({ threadId, input: "Original prompt" });
+        completeWithTools(turn.turnId, sessionId, "cursor-tool-1", "cursor-silent-1");
+        yield* adapter.sendTurn({ threadId, input: "Follow-up prompt" });
+
+        yield* Effect.sleep("150 millis");
+        const starts = mockCommands.filter((command) => command.method === "turn/start");
+        expect(starts).toHaveLength(2);
+        const resendText = starts[1]?.params.input?.[0]?.text as string;
+        expect(resendText).toContain("Follow-up prompt");
+        expect(resendText).not.toContain("without any visible response");
+      }).pipe(Effect.provide(testLayer)),
+    );
+
+    it.live("announces quiet settles instead of dropping turns silently", () =>
+      Effect.gen(function* () {
+        mockCommands = [];
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+          drainIntervalMs: 20,
+          quietSettleThresholdMs: 100,
+          silentNudgeDelayMs: 0,
+        });
+
+        const threadId = ThreadId.make("thread-test-quiet-notice");
+        yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+
+        yield* adapter.sendTurn({ threadId, input: "quick question" });
+        const warningFiber = yield* collectNudgeWarning(adapter, /No provider activity/);
+        expect(
+          Option.isSome(yield* Fiber.join(warningFiber).pipe(Effect.timeoutOption("10 seconds"))),
+        ).toBe(true);
       }).pipe(Effect.provide(testLayer)),
     );
   });

@@ -60,6 +60,7 @@ import {
 } from "../muse/MuseModels.ts";
 import {
   decodeMuseNotification,
+  isMcpStartupAuditFailure,
   isMuseNotificationMethod,
   isRetryableMuseError,
   itemType,
@@ -196,6 +197,22 @@ interface SessionContext {
   lastTurnStart: { parts: Array<Record<string, unknown>>; reasoningEffort?: string } | undefined;
   transientFailureStreak: { count: number } | undefined;
   transientRetryPending: { failedTurnId: string; attempt: number; cancelled: boolean } | undefined;
+  // Latches the turn ids an MCP-audit re-resume already covered: the audit
+  // verdict is per-process, so when the redriven turn fails the same way the
+  // resume itself is rejected, not racing, and must surface instead of loop.
+  // Extended to the redrive's turn id when it starts; cleared on completion.
+  mcpAuditRetryTurnId: string | undefined;
+  // Latches the turn ids a silent-completion summary nudge already covered:
+  // a turn that did work but produced no response text gets one automatic
+  // follow-up asking for a summary. Extended to the nudge turn's id when it
+  // starts so a second silent end surfaces instead of looping; cleared on
+  // completion.
+  silentNudgeTurnId: string | undefined;
+  // The turn id that last produced assistant text, if any. Compared at turn
+  // completion to detect turns that did work but never responded. Reset after
+  // every completed turn is evaluated, so a stale value can only ever match
+  // its own turn.
+  lastTurnTextTurnId: string | undefined;
   startInput: StartSessionInput;
   needsRestart?: boolean;
   lastViewCursor?: string;
@@ -389,6 +406,8 @@ export function make(
     environment?: NodeJS.ProcessEnv;
     instanceId?: ProviderInstanceId;
     transientRetryDelaysMs?: ReadonlyArray<number>;
+    mcpAuditRetryDelayMs?: number;
+    silentNudgeDelayMs?: number;
     drainIntervalMs?: number;
     quietSettleThresholdMs?: number;
   },
@@ -402,10 +421,25 @@ export function make(
     const environment = options?.environment ?? (yield* HostProcess.HostProcessEnvironment);
     const sessions = new Map<ThreadId, SessionContext>();
     const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
-    const lifecycle = yield* Semaphore.make(1);
+    // Session start/stop/teardown serialize per thread only: a Muse process that
+    // hangs while starting must not block starts and stops on every other thread.
+    const lifecycles = new Map<ThreadId, Semaphore.Semaphore>();
+    const withThreadLifecycle = <A, E, R>(
+      threadId: ThreadId,
+      effect: Effect.Effect<A, E, R>,
+    ): Effect.Effect<A, E, R> => {
+      let lock = lifecycles.get(threadId);
+      if (!lock) {
+        lock = Semaphore.makeUnsafe(1);
+        lifecycles.set(threadId, lock);
+      }
+      return lock.withPermit(effect);
+    };
     const mintEventId = createUuidV7Mint();
     const nextEventId = () => EventId.make(mintEventId());
     const transientRetryDelays = options?.transientRetryDelaysMs ?? MUSE_TRANSIENT_RETRY_DELAYS_MS;
+    const mcpAuditRetryDelayMs = Math.max(0, options?.mcpAuditRetryDelayMs ?? 10_000);
+    const silentNudgeDelayMs = Math.max(0, options?.silentNudgeDelayMs ?? 5_000);
     const drainIntervalMs = Math.max(1, options?.drainIntervalMs ?? 5_000);
     const quietSettleThresholdMs = Math.max(1, options?.quietSettleThresholdMs ?? 45_000);
     const requestError = (method: string, cause: unknown) => {
@@ -540,7 +574,8 @@ export function make(
       });
       // MSP invokes this at its native callback boundary, outside an Effect fiber.
       void Effect.runPromise(
-        lifecycle.withPermit(
+        withThreadLifecycle(
+          ctx.session.threadId,
           Effect.gen(function* () {
             yield* Scope.close(ctx.scope, Exit.void);
             if (sessions.get(ctx.session.threadId) === ctx) sessions.delete(ctx.session.threadId);
@@ -555,10 +590,20 @@ export function make(
       ctx: SessionContext,
       turnId: string,
       outcome: MuseTerminalOutcome,
+      notice: string,
     ) => {
       if (ctx.settledTurns.has(turnId)) return;
       ctx.settledTurns.add(turnId);
       stopDrainTimer(ctx);
+      // Adapter-side settles are invisible by construction: no provider event
+      // announced them. Say so out loud, so a quiet thread never reads as a
+      // silently dropped turn.
+      emit({
+        ...base(ctx),
+        type: "runtime.warning",
+        turnId: TurnId.make(turnId),
+        payload: { message: notice },
+      });
 
       for (const [id, item] of ctx.items.entries()) {
         if (item.status === "inProgress") {
@@ -649,7 +694,12 @@ export function make(
           if (ctx.sessionLogPath) {
             const onDiskTerminal = checkOnDiskTerminal(ctx.sessionLogPath, activeTurnId);
             if (onDiskTerminal) {
-              settleTurnFromOutcome(ctx, activeTurnId, onDiskTerminal);
+              settleTurnFromOutcome(
+                ctx,
+                activeTurnId,
+                onDiskTerminal,
+                "Muse reported this turn complete, but the completion notice was lost in transit — settled from the session record.",
+              );
               return;
             }
           }
@@ -667,7 +717,12 @@ export function make(
           ctx.approvals.size === 0 &&
           ctx.questions.size === 0
         ) {
-          settleTurnFromOutcome(ctx, activeTurnId, { terminal: "completed" });
+          settleTurnFromOutcome(
+            ctx,
+            activeTurnId,
+            { terminal: "completed" },
+            `No provider activity for ${Math.round(quietMs / 1_000)}s with nothing still running; marking the turn complete. If the model was still working, resend to continue.`,
+          );
           return;
         }
       }, drainIntervalMs);
@@ -873,6 +928,13 @@ export function make(
                 : "text";
           const key = `${mapped.itemId}:${field}`;
           ctx.streamed.set(key, (ctx.streamed.get(key) ?? "") + mapped.payload.delta);
+          // Track assistant prose per turn so a completed turn that did work
+          // but never responded can be nudged for a summary. Reasoning
+          // summaries and tool output are not user-visible responses.
+          if (field === "text" && mapped.payload.delta) {
+            const owner = ctx.items.get(mapped.itemId)?.turnId ?? ctx.session.activeTurnId;
+            if (owner) ctx.lastTurnTextTurnId = String(owner);
+          }
         }
         emit(mapped);
       }
@@ -905,10 +967,72 @@ export function make(
           ctx.transportStreakCompacted = false;
           ctx.transientFailureStreak = undefined;
           ctx.transientRetryPending = undefined;
+          ctx.mcpAuditRetryTurnId = undefined;
           ctx.lastTurnStart = undefined;
+          // A turn that did work but produced no response text leaves the
+          // thread silently dead (observed after hour-long model stalls that
+          // end without any assistant message). Ask for a summary once so the
+          // thread always gets a response. Failed turns already surface their
+          // error; textless turns that ran nothing need no summary. The
+          // lastTurnId match keeps resume replays of older completions from
+          // scheduling extra nudges.
+          if (event.params.turnId === ctx.lastTurnId) {
+            if (
+              ctx.silentNudgeTurnId === event.params.turnId &&
+              ctx.lastTurnTextTurnId !== event.params.turnId
+            ) {
+              emit({
+                ...base(ctx),
+                type: "runtime.warning",
+                turnId: TurnId.make(event.params.turnId),
+                payload: {
+                  message:
+                    "The follow-up summary also ended without a response. Resend your message to continue manually.",
+                },
+              });
+            } else if (
+              ctx.lastTurnTextTurnId !== event.params.turnId &&
+              turnDidWork(ctx, event.params.turnId)
+            ) {
+              if (scheduleSilentNudge(ctx, event.params.turnId))
+                ctx.silentNudgeTurnId = event.params.turnId;
+            } else {
+              ctx.silentNudgeTurnId = undefined;
+            }
+            ctx.lastTurnTextTurnId = undefined;
+          }
         } else if (museTransportTruncationSignature(event.params.error?.message)) {
           ctx.transientFailureStreak = undefined;
           mitigateTransportTruncation(ctx, event.params.turnId, false);
+        } else if (
+          isMcpStartupAuditFailure(event.params.error?.message) &&
+          ctx.lastTurnStart &&
+          event.params.turnId === ctx.lastTurnId
+        ) {
+          // The audit verdict belongs to the serve process that just failed
+          // the run, so a re-resume on a fresh process gets a new verdict
+          // with identical input and the same session history. One attempt:
+          // a second failure means the resume itself is rejected, not racing.
+          // The lastTurnId match also ignores replayed failures from older
+          // turns, which resume bursts re-emit as notifications.
+          if (ctx.mcpAuditRetryTurnId === event.params.turnId) {
+            emit({
+              ...base(ctx),
+              type: "runtime.warning",
+              turnId: TurnId.make(event.params.turnId),
+              payload: {
+                message:
+                  "Muse rejected the resumed session twice (MCP startup audit failed) — the turn failed without running anything. Resend your message to retry, or stop the session and resend to start fresh (previous context will be dropped).",
+              },
+            });
+          } else {
+            const scheduled = scheduleMcpAuditRetry(
+              ctx,
+              event.params.turnId,
+              event.params.error?.message ?? "unknown error",
+            );
+            if (scheduled) ctx.mcpAuditRetryTurnId = event.params.turnId;
+          }
         } else if (
           transientRetryDelays.length > 0 &&
           event.params.error?.retryable !== false &&
@@ -1015,7 +1139,8 @@ export function make(
       });
     });
     const startSession: Adapter["startSession"] = (input) =>
-      lifecycle.withPermit(
+      withThreadLifecycle(
+        input.threadId,
         Effect.gen(function* () {
           const existing = sessions.get(input.threadId);
           if (existing) yield* stopContext(existing);
@@ -1135,6 +1260,9 @@ export function make(
               lastTurnStart: undefined,
               transientFailureStreak: undefined,
               transientRetryPending: undefined,
+              mcpAuditRetryTurnId: undefined,
+              silentNudgeTurnId: undefined,
+              lastTurnTextTurnId: undefined,
               startInput: input,
               needsRestart: false,
               lastActivityAt: Date.now(),
@@ -1988,7 +2116,8 @@ export function make(
       },
     );
     const stopSession: Adapter["stopSession"] = (threadId) =>
-      lifecycle.withPermit(
+      withThreadLifecycle(
+        threadId,
         Effect.gen(function* () {
           const ctx = sessions.get(threadId);
           if (ctx) yield* stopContext(ctx);
@@ -2123,6 +2252,441 @@ export function make(
             const result = started.right;
             if (result.disposition !== "queued") {
               ctx.lastTurnId = result.turnId;
+              ctx.settledTurns.delete(result.turnId);
+              emit({
+                ...base(ctx),
+                type: "turn.started",
+                turnId: TurnId.make(result.turnId),
+                payload: {},
+              });
+            }
+            if (result.disposition !== "queued" && !ctx.settledTurns.has(result.turnId)) {
+              ctx.session = {
+                ...ctx.session,
+                status: "running",
+                activeTurnId: TurnId.make(result.turnId),
+                updatedAt: nowIso(),
+              };
+              startDrainTimer(ctx);
+            }
+          }),
+        );
+      });
+      // MSP invokes this at its native callback boundary, outside an Effect fiber.
+      void Effect.runPromise(task).catch(() => undefined);
+      return true;
+    };
+    // Respawns the serve process and re-resumes the SAME session after Muse
+    // failed a run with an MCP startup audit error. Muse can keep rejecting the
+    // session's MCP startup on every fresh process (observed after a process
+    // loss), but a resume without the t3-code MCP server audits cleanly and
+    // keeps the conversation. So the replacement resumes without MCP: T3 tools
+    // are unavailable until the next session start, the thread keeps working.
+    // Returns false when the session is gone: the caller aborts the redrive and
+    // the next manual resend falls back to a fresh session through startSession.
+    const reauditSession = Effect.fn("MuseAdapter.reauditSession")(function* (ctx: SessionContext) {
+      const input = ctx.startInput;
+      const cwd = input.cwd ?? config.cwd;
+      yield* Effect.promise(() => healWindowsSkillSymlinks(cwd));
+      const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
+      // Spawn the replacement before tearing down the stale process: if the
+      // spawn or handshake fails, the existing session is left untouched and
+      // the turn simply stays failed. Closing the old scope trips the stopped
+      // finalizer, which also guards the old host's exit handler below.
+      const scope = yield* Scope.make();
+      const args = ["serve", "--trust-workspace"];
+      const isFullAccess =
+        input.sandboxMode === "danger-full-access" ||
+        (input.sandboxMode === undefined && input.runtimeMode === "full-access") ||
+        input.approvalPolicy === "never";
+      if (
+        input.sandboxMode === "danger-full-access" ||
+        (input.sandboxMode === undefined && input.runtimeMode === "full-access")
+      )
+        args.push("--disable-sandbox");
+      if (input.sandboxMode === "read-only") args.push("--disable-write", "--disable-shell");
+      const baseEnv = {
+        ...environment,
+        MUSE_NO_AUTO_UPDATE: "1",
+        TBH_STREAM_IDLE_TIMEOUT_SECS: "600",
+        TBH_STREAM_FIRST_EVENT_TIMEOUT_SECS: "600",
+      };
+      const sessionEnv = isFullAccess
+        ? {
+            ...baseEnv,
+            MUSE_APPROVAL_MODE: "never",
+            APPROVAL_MODE: "never",
+            MUSE_DISABLE_APPROVAL_JUDGE: "1",
+            APPROVAL_JUDGE: "off",
+          }
+        : baseEnv;
+      const stderrBuffer: string[] = [];
+      const handshake = yield* Effect.acquireRelease(
+        Effect.try({
+          try: () =>
+            spawnMspConnection({
+              command: settings.binaryPath || "muse",
+              args,
+              cwd,
+              env: McpProviderSession.withAgentDeviceEnvironment(sessionEnv, mcp),
+              shutdownTimeoutMs: 2_000,
+              onStderr: (chunk: string | Buffer) => {
+                const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+                for (const line of text.split("\n")) {
+                  const trimmed = line.trim();
+                  if (trimmed) {
+                    stderrBuffer.push(trimmed);
+                    if (stderrBuffer.length > 100) stderrBuffer.shift();
+                  }
+                }
+              },
+              connection: {
+                frameLimitBytes: 512 * 1024 * 1024,
+              },
+            }),
+          catch: (cause) => requestError("spawn", cause),
+        }),
+        (child) =>
+          Effect.tryPromise(async () => {
+            try {
+              await child.close();
+            } finally {
+              killMuseProcessTree(child);
+            }
+          }).pipe(Effect.ignore),
+      ).pipe(Effect.provideService(Scope.Scope, scope));
+      const initialized = yield* attempt("initialize", () =>
+        handshake.initialize({
+          clientInfo: { name: "t3_code", version: "0.0.0" },
+          capabilities: { requestedCapabilities: [] },
+        }),
+      ).pipe(
+        Effect.match({
+          onFailure: (left) => ({ _tag: "Left", left }) as const,
+          onSuccess: (right) => ({ _tag: "Right", right }) as const,
+        }),
+      );
+      if (initialized._tag === "Left") {
+        yield* Scope.close(scope, Exit.void);
+        emit({
+          ...base(ctx),
+          type: "runtime.warning",
+          payload: {
+            message: `MCP audit retry failed to start a replacement process (${initialized.left.detail}). Resend your message to try again.`,
+          },
+        });
+        return false;
+      }
+      const host = initialized.right;
+      yield* Scope.close(ctx.scope, Exit.void);
+      killMuseProcessTree(ctx.handshake);
+      wireHostListeners(ctx, host);
+      const resumed = yield* attempt("session/resume", () =>
+        host.connection.command("session/resume", {
+          sessionId: ctx.sessionId,
+          excludeItems: true,
+        }),
+      ).pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(SessionResult)),
+        Effect.mapError((cause) => requestError("session/resume", cause)),
+        Effect.match({
+          onFailure: (left) => ({ _tag: "Left", left }) as const,
+          onSuccess: (right) => ({ _tag: "Right", right }) as const,
+        }),
+      );
+      if (resumed._tag === "Left") {
+        yield* Scope.close(scope, Exit.void);
+        killMuseProcessTree(handshake);
+        // The session is gone from the CLI, so no re-resume can ever work.
+        // Route the next manual resend to a fresh session instead.
+        ctx.session = { ...ctx.session, resumeCursor: undefined };
+        ctx.needsRestart = true;
+        ctx.stopped = false;
+        emit({
+          ...base(ctx),
+          type: "runtime.warning",
+          payload: {
+            message: `MCP audit retry could not re-attach to the session (${resumed.left.detail}). Resend your message to start fresh.`,
+          },
+        });
+        return false;
+      }
+      const result = resumed.right;
+      if (!arePathsEquivalent(result.session.workspaceRoot, cwd)) {
+        yield* Scope.close(scope, Exit.void);
+        killMuseProcessTree(handshake);
+        ctx.stopped = false;
+        emit({
+          ...base(ctx),
+          type: "runtime.warning",
+          payload: {
+            message:
+              "MCP audit retry aborted: the resumed session belongs to a different workspace. Resend your message to start fresh.",
+          },
+        });
+        return false;
+      }
+      for (const item of result.history?.items ?? result.history?.snapshot?.state.items ?? []) {
+        if ((ctx.items.get(item.itemId)?.revision ?? -1) < (item.revision ?? 0))
+          ctx.items.set(item.itemId, item);
+        if (item.text) ctx.streamed.set(`${item.itemId}:text`, item.text);
+        item.summary?.forEach((text, index) =>
+          ctx.streamed.set(`${item.itemId}:summary.${index}`, text),
+        );
+      }
+      const mode =
+        input.approvalPolicy === "never" ||
+        (input.approvalPolicy === undefined && input.runtimeMode === "full-access")
+          ? "allowAll"
+          : input.approvalPolicy === "untrusted" || input.runtimeMode === "approval-required"
+            ? "promptUnmatched"
+            : "onRequest";
+      const approval = yield* attempt("session/setApprovalMode", () =>
+        host.connection.command("session/setApprovalMode", {
+          sessionId: ctx.sessionId,
+          mode,
+        }),
+      ).pipe(
+        Effect.match({
+          onFailure: (left) => ({ _tag: "Left", left }) as const,
+          onSuccess: (right) => ({ _tag: "Right", right }) as const,
+        }),
+      );
+      if (approval._tag === "Left") {
+        yield* Scope.close(scope, Exit.void);
+        killMuseProcessTree(handshake);
+        ctx.session = { ...ctx.session, resumeCursor: undefined };
+        ctx.needsRestart = true;
+        ctx.stopped = false;
+        emit({
+          ...base(ctx),
+          type: "runtime.warning",
+          payload: {
+            message: `MCP audit retry failed to configure the resumed session (${approval.left.detail}). Resend your message to start fresh.`,
+          },
+        });
+        return false;
+      }
+      ctx.scope = scope;
+      ctx.host = host;
+      ctx.handshake = handshake;
+      ctx.stderrBuffer = stderrBuffer;
+      ctx.session = {
+        ...ctx.session,
+        resumeCursor: {
+          schemaVersion: 1,
+          sessionId: ctx.sessionId,
+          selectedModel: ctx.selectedModel,
+        },
+        updatedAt: nowIso(),
+      };
+      ctx.stopped = false;
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          ctx.stopped = true;
+          stopDrainTimer(ctx);
+        }),
+      ).pipe(Effect.provideService(Scope.Scope, scope));
+      return true;
+    });
+    // Redrives a turn the CLI failed with an MCP startup audit error by
+    // re-resuming the same session on a fresh serve process, then starting an
+    // identical turn. The audit runs before the model, so a failed turn never
+    // acts — but the side-effect guard stays: if the turn somehow executed
+    // tools, redriving could apply them twice.
+    const scheduleMcpAuditRetry = (
+      ctx: SessionContext,
+      failedTurnId: string,
+      message: string,
+    ): boolean => {
+      for (const item of ctx.items.values()) {
+        if (item.turnId === failedTurnId && TRANSIENT_RETRY_SIDE_EFFECT_KINDS.has(item.kind)) {
+          emit({
+            ...base(ctx),
+            type: "runtime.warning",
+            turnId: TurnId.make(failedTurnId),
+            payload: {
+              message:
+                "Muse reported an MCP startup audit failure, but the failed turn already executed tools, so it was not retried automatically — re-running them could apply side effects twice. Resend your message to retry manually.",
+            },
+          });
+          return false;
+        }
+      }
+      const record = { failedTurnId, attempt: 1, cancelled: false };
+      ctx.transientRetryPending = record;
+      emit({
+        ...base(ctx),
+        type: "session.state.changed",
+        payload: { state: "running", reason: "mcp_audit_retry:1/1" },
+      });
+      emit({
+        ...base(ctx),
+        type: "runtime.warning",
+        turnId: TurnId.make(failedTurnId),
+        payload: {
+          message: `Muse rejected the resumed session before the model ran (MCP startup audit failed) — restarting its process without T3 Code tools and retrying once in ${mcpAuditRetryDelayMs / 1_000}s. Nothing was executed, so this is safe: ${message}`,
+        },
+      });
+      const task = Effect.gen(function* () {
+        yield* Effect.yieldNow;
+        if (mcpAuditRetryDelayMs > 0) yield* Effect.sleep(Duration.millis(mcpAuditRetryDelayMs));
+        if (sessions.get(ctx.session.threadId) !== ctx || ctx.stopped) return;
+        if (ctx.transientRetryPending !== record || record.cancelled) return;
+        const redrive = ctx.lastTurnStart;
+        if (!redrive || ctx.needsRestart) return;
+        if (ctx.session.status !== "ready" || ctx.session.activeTurnId) return;
+        yield* ctx.lock.withPermit(
+          Effect.gen(function* () {
+            if (sessions.get(ctx.session.threadId) !== ctx || ctx.stopped) return;
+            if (ctx.transientRetryPending !== record || record.cancelled) return;
+            const live = ctx.lastTurnStart;
+            if (!live || ctx.needsRestart) return;
+            if (ctx.session.status !== "ready" || ctx.session.activeTurnId) return;
+            ctx.transientRetryPending = undefined;
+            const reattached = yield* reauditSession(ctx);
+            if (!reattached) return;
+            const started = yield* attempt("turn/start", () =>
+              ctx.host.connection.command("turn/start", {
+                sessionId: ctx.sessionId,
+                input: live.parts,
+                ifBusy: "queue",
+                ...(live.reasoningEffort ? { reasoningEffort: live.reasoningEffort } : {}),
+              }),
+            ).pipe(
+              Effect.flatMap(Schema.decodeUnknownEffect(TurnResult)),
+              Effect.mapError((cause) => requestError("turn/start", cause)),
+              Effect.match({
+                onFailure: (left) => ({ _tag: "Left", left }) as const,
+                onSuccess: (right) => ({ _tag: "Right", right }) as const,
+              }),
+            );
+            if (started._tag === "Left") {
+              emit({
+                ...base(ctx),
+                type: "runtime.warning",
+                turnId: TurnId.make(failedTurnId),
+                payload: {
+                  message: `MCP audit retry failed to start a new turn: ${started.left.detail}. Resend your message to try again.`,
+                },
+              });
+              return;
+            }
+            const result = started.right;
+            if (result.disposition !== "queued") {
+              ctx.lastTurnId = result.turnId;
+              // The redrive consumed the audit retry: if it fails the same
+              // way, that is a rejected resume, not a race — surface it.
+              ctx.mcpAuditRetryTurnId = result.turnId;
+              ctx.settledTurns.delete(result.turnId);
+              emit({
+                ...base(ctx),
+                type: "turn.started",
+                turnId: TurnId.make(result.turnId),
+                payload: {},
+              });
+            }
+            if (result.disposition !== "queued" && !ctx.settledTurns.has(result.turnId)) {
+              ctx.session = {
+                ...ctx.session,
+                status: "running",
+                activeTurnId: TurnId.make(result.turnId),
+                updatedAt: nowIso(),
+              };
+              startDrainTimer(ctx);
+            }
+          }),
+        );
+      });
+      // MSP invokes this at its native callback boundary, outside an Effect fiber.
+      void Effect.runPromise(task).catch(() => undefined);
+      return true;
+    };
+    // Item kinds that count as real work for the silent-completion nudge.
+    // Reminder children are system-driven noise, not model work.
+    const SILENT_NUDGE_WORK_KINDS: ReadonlySet<string> = new Set([
+      "toolCall",
+      "userShell",
+      "subagent",
+      "workflow",
+    ]);
+    const turnDidWork = (ctx: SessionContext, turnId: string): boolean => {
+      for (const item of ctx.items.values()) {
+        if (item.turnId === turnId && SILENT_NUDGE_WORK_KINDS.has(item.kind)) return true;
+      }
+      return false;
+    };
+    // Starts one follow-up turn asking for a summary after a turn completed
+    // with no response text. Unlike a redrive this never repeats tool calls:
+    // it only asks the model to report on history, so there is nothing to
+    // apply twice. Bounded to one attempt per turn via silentNudgeTurnId; a
+    // user send supersedes it through the shared pending slot.
+    const SILENT_SUMMARY_NUDGE =
+      "Your previous turn ended without any visible response. Briefly summarize what you accomplished in that turn, what remains unfinished, and any blockers. Do not start new work.";
+    const scheduleSilentNudge = (ctx: SessionContext, completedTurnId: string): boolean => {
+      const record = { failedTurnId: completedTurnId, attempt: 1, cancelled: false };
+      ctx.transientRetryPending = record;
+      emit({
+        ...base(ctx),
+        type: "session.state.changed",
+        payload: { state: "running", reason: "silent_nudge:1/1" },
+      });
+      emit({
+        ...base(ctx),
+        type: "runtime.warning",
+        turnId: TurnId.make(completedTurnId),
+        payload: {
+          message: `The turn completed without any response text — asking for a summary in ${silentNudgeDelayMs / 1_000}s so the thread doesn't go quiet.`,
+        },
+      });
+      const task = Effect.gen(function* () {
+        yield* Effect.yieldNow;
+        if (silentNudgeDelayMs > 0) yield* Effect.sleep(Duration.millis(silentNudgeDelayMs));
+        if (sessions.get(ctx.session.threadId) !== ctx || ctx.stopped) return;
+        if (ctx.transientRetryPending !== record || record.cancelled) return;
+        if (ctx.session.status !== "ready" || ctx.session.activeTurnId) return;
+        if (ctx.needsRestart) return;
+        yield* ctx.lock.withPermit(
+          Effect.gen(function* () {
+            if (sessions.get(ctx.session.threadId) !== ctx || ctx.stopped) return;
+            if (ctx.transientRetryPending !== record || record.cancelled) return;
+            if (ctx.session.status !== "ready" || ctx.session.activeTurnId) return;
+            if (ctx.needsRestart) return;
+            ctx.transientRetryPending = undefined;
+            const runtimeInstructions = buildRuntimeInstructions({ harness: "Muse Code" });
+            const started = yield* attempt("turn/start", () =>
+              ctx.host.connection.command("turn/start", {
+                sessionId: ctx.sessionId,
+                input: [
+                  { type: "text", text: `${runtimeInstructions}\n\n${SILENT_SUMMARY_NUDGE}` },
+                ],
+                ifBusy: "queue",
+              }),
+            ).pipe(
+              Effect.flatMap(Schema.decodeUnknownEffect(TurnResult)),
+              Effect.mapError((cause) => requestError("turn/start", cause)),
+              Effect.match({
+                onFailure: (left) => ({ _tag: "Left", left }) as const,
+                onSuccess: (right) => ({ _tag: "Right", right }) as const,
+              }),
+            );
+            if (started._tag === "Left") {
+              emit({
+                ...base(ctx),
+                type: "runtime.warning",
+                turnId: TurnId.make(completedTurnId),
+                payload: {
+                  message: `Silent-completion follow-up failed to start: ${started.left.detail}. Resend your message to try again.`,
+                },
+              });
+              return;
+            }
+            const result = started.right;
+            if (result.disposition !== "queued") {
+              ctx.lastTurnId = result.turnId;
+              // The nudge consumed the silent-completion retry: if it ends
+              // silently too, that is a rejected pattern, not a race.
+              ctx.silentNudgeTurnId = result.turnId;
               ctx.settledTurns.delete(result.turnId);
               emit({
                 ...base(ctx),

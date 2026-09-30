@@ -332,6 +332,18 @@ export function isRetryableMuseError(message: string | undefined): boolean {
   return MUSE_TRANSIENT_FAILURE_MARKERS.some((marker) => lowered.includes(marker));
 }
 
+// Matches the run-config failure Muse reports when its startup audit of the
+// session's MCP servers fails (observed on a resumed session as "invalid run
+// configuration: MCP startup audit failed; MCP is disabled for this runtime").
+// The audit runs before the model, so the failed turn never acts. Some
+// sessions keep failing it on every fresh process, while a resume without the
+// MCP server audits cleanly, so this is worth exactly one re-resume without
+// MCP on a fresh serve process, never a blind redrive.
+export function isMcpStartupAuditFailure(message: string | undefined): boolean {
+  if (!message) return false;
+  return message.toLowerCase().includes("mcp startup audit failed");
+}
+
 export function museApprovalDecision(
   decision: string,
   scope?: string,

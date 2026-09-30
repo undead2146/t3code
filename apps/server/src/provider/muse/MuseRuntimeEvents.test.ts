@@ -8,6 +8,7 @@ import {
 import { describe, expect, it } from "@effect/vitest";
 import {
   decodeMuseNotification,
+  isMcpStartupAuditFailure,
   isRetryableMuseError,
   mapMuseNotification,
   museTransportTruncationSignature,
@@ -570,6 +571,19 @@ describe("MuseRuntimeEvents", () => {
       expect(isRetryableMuseError("something else went wrong")).toBe(false);
       expect(isRetryableMuseError("")).toBe(false);
       expect(isRetryableMuseError(undefined)).toBe(false);
+    });
+
+    it("detects MCP startup audit failures for the re-resume path", () => {
+      expect(
+        isMcpStartupAuditFailure(
+          "invalid run configuration: MCP startup audit failed; MCP is disabled for this runtime",
+        ),
+      ).toBe(true);
+      expect(isMcpStartupAuditFailure("MCP STARTUP AUDIT FAILED")).toBe(true);
+      expect(isMcpStartupAuditFailure(OVERLOADED_503)).toBe(false);
+      expect(isMcpStartupAuditFailure("something else went wrong")).toBe(false);
+      expect(isMcpStartupAuditFailure("")).toBe(false);
+      expect(isMcpStartupAuditFailure(undefined)).toBe(false);
     });
   });
 
