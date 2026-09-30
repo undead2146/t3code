@@ -219,6 +219,11 @@ interface SessionContext {
   startInput: StartSessionInput;
   needsRestart?: boolean;
   lastViewCursor?: string;
+  // Where view/page catch-up resumes. Only view/page results (and the view
+  // head a session start or resume reports) advance it: live pushes can carry
+  // transient events whose cursors collide with different durable events, so
+  // a pushed cursor never proves the view up to it was delivered.
+  durableViewCursor?: string | undefined;
   isPagingView?: boolean;
   // The in-flight view/page drain, so a caller can wait for it instead of skipping.
   pagingPromise?: Promise<void> | undefined;
@@ -461,6 +466,7 @@ export function make(
     drainIntervalMs?: number;
     quietSettleThresholdMs?: number;
     sessionRecordCheckQuietMs?: number;
+    viewCatchUpMs?: number;
   },
 ) {
   return Effect.gen(function* () {
@@ -494,6 +500,7 @@ export function make(
     const drainIntervalMs = Math.max(1, options?.drainIntervalMs ?? 5_000);
     const quietSettleThresholdMs = Math.max(1, options?.quietSettleThresholdMs ?? 45_000);
     const sessionRecordCheckQuietMs = Math.max(1, options?.sessionRecordCheckQuietMs ?? 10_000);
+    const viewCatchUpMs = Math.max(0, options?.viewCatchUpMs ?? 30_000);
     const requestError = (method: string, cause: unknown) => {
       let detail = "Muse Code rejected the request or its response was invalid.";
       if (typeof cause === "string" && cause.trim().length > 0) {
@@ -750,9 +757,11 @@ export function make(
               // us yet (always the case without push). Drain the view first so
               // the final items (the assistant reply) and the real turn/completed
               // go through receive(), which also drives retries and nudges.
-              // Settle from the record only if the view still never delivers it.
+              // Settle from the record only if the view still never delivers it:
+              // Muse writes the record before it projects the view, and on a
+              // loaded host the view can trail by seconds, so keep paging.
               ctx.settlingFromDisk = true;
-              void drainViewFully(ctx)
+              void drainUntilTurnSettles(ctx, activeTurnId)
                 .then(() => {
                   if (
                     ctx.stopped ||
@@ -813,6 +822,19 @@ export function make(
       await drainViewPages(ctx);
     };
 
+    // Pages the view until the turn's own turn/completed arrives, for at most
+    // viewCatchUpMs. Returns early once the turn settled through receive().
+    const drainUntilTurnSettles = async (ctx: SessionContext, turnId: string): Promise<void> => {
+      const deadline = Date.now() + viewCatchUpMs;
+      while (true) {
+        await drainViewFully(ctx);
+        if (ctx.stopped || ctx.settledTurns.has(turnId) || ctx.session.activeTurnId !== turnId)
+          return;
+        if (Date.now() >= deadline) return;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(1_000, drainIntervalMs)));
+      }
+    };
+
     const stopDrainTimer = (ctx: SessionContext) => {
       if (ctx.drainTimer) {
         clearInterval(ctx.drainTimer);
@@ -834,7 +856,7 @@ export function make(
 
     const pageView = async (ctx: SessionContext): Promise<void> => {
       try {
-        let currentCursor = ctx.lastViewCursor;
+        let currentCursor = ctx.durableViewCursor;
         let pageCount = 0;
         const MAX_PAGES = 50;
 
@@ -870,6 +892,9 @@ export function make(
               // Ignore single item failure so remaining page events are processed
             }
           }
+          const lastCursor = (result.events.at(-1)?.params as { viewCursor?: unknown } | undefined)
+            ?.viewCursor;
+          if (typeof lastCursor === "string" && lastCursor) ctx.durableViewCursor = lastCursor;
 
           if (!result.nextCursor || result.nextCursor === currentCursor) {
             break;
@@ -890,7 +915,8 @@ export function make(
       viewCursor: string | undefined,
     ): Promise<void> => {
       ctx.pushUnavailable = viewCursor === "";
-      if (!ctx.pushUnavailable || ctx.lastViewCursor) return;
+      if (viewCursor) ctx.durableViewCursor = viewCursor;
+      if (!ctx.pushUnavailable || ctx.durableViewCursor) return;
       try {
         const head = (await ctx.host.connection.request("view/page", {
           sessionId: ctx.sessionId,
@@ -898,7 +924,10 @@ export function make(
           limit: 1,
         })) as { events?: Array<{ params?: { viewCursor?: unknown } }> } | undefined;
         const cursor = head?.events?.at(-1)?.params?.viewCursor;
-        if (typeof cursor === "string" && cursor) ctx.lastViewCursor = cursor;
+        if (typeof cursor === "string" && cursor) {
+          ctx.lastViewCursor = cursor;
+          ctx.durableViewCursor = cursor;
+        }
       } catch {
         // Without an anchor the first poll pages from the start; replayed turns are ignored.
       }
@@ -962,6 +991,8 @@ export function make(
       if (event.method === "approval/requested" || event.method === "approval/updated") {
         const prior = ctx.approvals.get(event.params.approvalId);
         if (prior?.viewCursor === event.params.viewCursor) return;
+        // View catch-up replays requests push already delivered, under a different cursor.
+        if (prior && event.method === "approval/requested") return;
         ctx.approvals.set(event.params.approvalId, event.params);
 
         if (isAutoApproveSession(ctx)) {
@@ -991,8 +1022,7 @@ export function make(
         if (ctx.autoApprovedApprovals.delete(event.params.approvalId)) return;
       }
       if (event.method === "userInput/requested") {
-        if (ctx.questions.get(event.params.userInputId)?.viewCursor === event.params.viewCursor)
-          return;
+        if (ctx.questions.has(event.params.userInputId)) return;
         ctx.questions.set(event.params.userInputId, event.params);
       }
       if (event.method === "userInput/settled") ctx.questions.delete(event.params.userInputId);
@@ -1496,6 +1526,7 @@ export function make(
               result.viewCursor ?? snapshotCursor?.viewCursor ?? snapshotCursor?.cursor;
             if (foundCursor) {
               ctx.lastViewCursor = foundCursor;
+              ctx.durableViewCursor = foundCursor;
             }
             if (cursor && ctx.sessionId === sessionId)
               yield* Effect.promise(() => adoptResumeViewState(ctx, result.viewCursor));
@@ -1780,6 +1811,8 @@ export function make(
       ctx.stderrBuffer = stderrBuffer;
       // A fresh session/start always subscribes the connection.
       ctx.pushUnavailable = false;
+      // The new session's view starts empty; catch-up pages it from the start.
+      ctx.durableViewCursor = undefined;
       ctx.needsRestart = false;
     });
 

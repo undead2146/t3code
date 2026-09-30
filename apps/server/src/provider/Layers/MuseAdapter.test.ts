@@ -2334,6 +2334,136 @@ describe("MuseAdapter transport truncation mitigation", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.live(
+    "recovers a reply whose view cursor a live push reused, and waits for a lagging view",
+    () =>
+      Effect.gen(function* () {
+        const museHome = yield* Effect.promise(() =>
+          NodeFSP.mkdtemp(NodePath.join(process.cwd(), ".muse-home-test-")),
+        );
+        const priorMuseHome = process.env.MUSE_HOME;
+        process.env.MUSE_HOME = museHome;
+        try {
+          const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+            environment: process.env,
+            drainIntervalMs: 20,
+            quietSettleThresholdMs: 60_000,
+            sessionRecordCheckQuietMs: 50,
+          });
+          const threadId = ThreadId.make("thread-test-cursor-collision");
+          const session = yield* adapter.startSession({
+            threadId,
+            cwd: "Z:\\test-workspace",
+            runtimeMode: "full-access",
+          });
+          const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+          const turnId = "collision-turn";
+          const cursor = (n: number) => `v:${sessionId}:${n}`;
+          // The durable view, as Muse pages it. The turn/completed only shows up
+          // once `viewCaughtUp` flips, like a view trailing the session record.
+          const view = [
+            { method: "turn/started", params: { sessionId, viewCursor: cursor(1), turnId } },
+            {
+              method: "item/completed",
+              params: {
+                sessionId,
+                viewCursor: cursor(2),
+                item: {
+                  itemId: "the-reply",
+                  kind: "agentMessage",
+                  revision: 1,
+                  status: "completed",
+                  turnId,
+                  text: "Here is the reply.",
+                },
+              },
+            },
+          ];
+          let viewCaughtUp = false;
+          mockRequestHandler = async (method, params) => {
+            if (method !== "view/page") return {};
+            const after = params.cursor ? Number(String(params.cursor).split(":").at(-1)) : 0;
+            const events = [
+              ...view,
+              ...(viewCaughtUp
+                ? [
+                    {
+                      method: "turn/completed",
+                      params: { sessionId, viewCursor: cursor(3), turnId, terminal: "completed" },
+                    },
+                  ]
+                : []),
+            ].filter((event) => Number(event.params.viewCursor.split(":").at(-1)) > after);
+            return { events, nextCursor: null };
+          };
+          const now = DateTime.toDateUtc(yield* DateTime.now);
+          const dayDir = NodePath.join(
+            museHome,
+            "sessions",
+            String(now.getUTCFullYear()),
+            String(now.getUTCMonth() + 1).padStart(2, "0"),
+            String(now.getUTCDate()).padStart(2, "0"),
+            sessionId,
+          );
+          yield* Effect.promise(() => NodeFSP.mkdir(dayDir, { recursive: true }));
+          yield* Effect.promise(() =>
+            NodeFSP.writeFile(
+              NodePath.join(dayDir, "session.jsonl"),
+              `{"payload":{"kind":"run","run_id":"${turnId}","event":{"kind":"terminal","terminal":"completed"}}}\n`,
+            ),
+          );
+
+          const collected = yield* adapter.streamEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "turn.completed" ||
+                event.type === "runtime.warning" ||
+                (event.type === "item.completed" && String(event.itemId) === "the-reply"),
+            ),
+            Stream.takeUntil((event) => event.type === "turn.completed"),
+            Stream.runCollect,
+            Effect.forkChild,
+          );
+          mockTurnStartResponse = { status: "accepted", turnId };
+          yield* adapter.sendTurn({ threadId, input: "question" });
+          // Live push: the turn starts, then a transient event arrives carrying
+          // the reply's cursor (and a later one), so push never shows the reply.
+          mockNotificationCallback!({
+            method: "turn/started",
+            params: { sessionId, viewCursor: cursor(1), turnId },
+          });
+          mockNotificationCallback!({
+            method: "item/completed",
+            params: {
+              sessionId,
+              viewCursor: cursor(2),
+              item: {
+                itemId: "reminder",
+                kind: "reminderChild",
+                revision: 2,
+                status: "failed",
+                turnId,
+              },
+            },
+          });
+          // Past the old single drain, the view catches up with the record.
+          yield* Effect.sleep("400 millis");
+          viewCaughtUp = true;
+
+          const events = yield* Fiber.join(collected).pipe(Effect.timeoutOption("5 seconds"));
+          expect(Option.isSome(events)).toBe(true);
+          const types = Option.getOrThrow(events).map((event) =>
+            event.type === "runtime.warning" ? `warning: ${event.payload.message}` : event.type,
+          );
+          expect(types).toEqual(["item.completed", "turn.completed"]);
+        } finally {
+          if (priorMuseHome === undefined) delete process.env.MUSE_HOME;
+          else process.env.MUSE_HOME = priorMuseHome;
+          yield* Effect.promise(() => NodeFSP.rm(museHome, { recursive: true, force: true }));
+        }
+      }).pipe(Effect.provide(testLayer)),
+  );
+
   it.live("delivers a push-less resumed session's final events before settling", () =>
     Effect.gen(function* () {
       // Muse answers session/resume without a view cursor when it cannot
