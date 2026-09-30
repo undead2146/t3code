@@ -1245,6 +1245,60 @@ describe("MuseAdapter transport truncation mitigation", () => {
     const turnStartCommands = () =>
       mockCommands.filter((command) => command.method === "turn/start");
 
+    it.live(
+      "continues, instead of redriving, a transiently failed turn that already ran tools",
+      () =>
+        Effect.gen(function* () {
+          mockCommands = [];
+          const adapter = yield* makeAdapter();
+          const threadId = ThreadId.make("thread-test-transient-continue");
+          const sessionId = yield* startThread(adapter, "thread-test-transient-continue");
+
+          const turn = yield* adapter.sendTurn({ threadId, input: "Port the whole module" });
+          // The turn ran a tool before the model backend went down.
+          mockNotificationCallback!({
+            method: "item/completed",
+            params: {
+              sessionId,
+              viewCursor: "cursor-tool",
+              item: {
+                itemId: "tool-1",
+                kind: "toolCall",
+                revision: 2,
+                status: "completed",
+                turnId: turn.turnId,
+                tool: "bash",
+              },
+            },
+          });
+          const warningFiber = yield* adapter.streamEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "runtime.warning" &&
+                /continue where it stopped/.test(event.payload.message),
+            ),
+            Stream.take(1),
+            Stream.runCollect,
+            Effect.forkChild,
+          );
+          mockTurnStartResponse = { status: "accepted", turnId: "continue-turn-1" };
+          failTurn(turn.turnId, sessionId, "cursor-fail-1", OVERLOADED_503, true);
+
+          const warning = yield* Fiber.join(warningFiber).pipe(Effect.timeoutOption("5 seconds"));
+          expect(Option.isSome(warning)).toBe(true);
+          const startedFiber = yield* collectTurnStarted(adapter, "continue-turn-1");
+          const started = yield* Fiber.join(startedFiber).pipe(Effect.timeoutOption("5 seconds"));
+          expect(Option.isSome(started)).toBe(true);
+
+          // A continuation prompt, never the original request again.
+          const starts = turnStartCommands();
+          expect(starts).toHaveLength(2);
+          const redriven = JSON.stringify(starts[1]?.params.input);
+          expect(redriven).toContain("Continue the user's latest request");
+          expect(redriven).not.toContain("Port the whole module");
+        }).pipe(Effect.provide(testLayer)),
+    );
+
     it.live("redrives a transiently failed turn with identical input", () =>
       Effect.gen(function* () {
         mockCommands = [];

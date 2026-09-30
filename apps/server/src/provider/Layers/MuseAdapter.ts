@@ -2307,6 +2307,8 @@ export function make(
     // Redrives a turn the CLI failed with a transient backend error as a new
     // turn/start with identical input, so checkpoints and the work log record
     // each attempt honestly and only the terminal outcome settles the thread.
+    const TRANSIENT_CONTINUE_PROMPT =
+      "Your previous turn was cut off by a temporary model backend outage (the model API returned 5xx errors), not by the user. Everything you did before it is in this conversation, including tool results. Continue the user's latest request from exactly where you stopped: do not redo completed steps, and do not stop to summarize until the task is done or you are genuinely blocked.";
     const scheduleTransientRetry = (
       ctx: SessionContext,
       failedTurnId: string,
@@ -2314,18 +2316,14 @@ export function make(
       attemptNumber: number,
     ): boolean => {
       const delayMs = transientRetryDelays[attemptNumber - 1] ?? 30_000;
+      // A turn that already ran tools must not be redriven with its original
+      // prompt: that would redo the work. Its tool results are in the session,
+      // so ask the model to continue instead; continuing never re-runs a tool.
+      let continueWork = false;
       for (const item of ctx.items.values()) {
         if (item.turnId === failedTurnId && TRANSIENT_RETRY_SIDE_EFFECT_KINDS.has(item.kind)) {
-          emit({
-            ...base(ctx),
-            type: "runtime.warning",
-            turnId: TurnId.make(failedTurnId),
-            payload: {
-              message:
-                "Muse backend error is transient, but the failed turn already executed tools, so it was not retried automatically — re-running them could apply side effects twice. Resend your message to retry manually.",
-            },
-          });
-          return false;
+          continueWork = true;
+          break;
         }
       }
       const record = { failedTurnId, attempt: attemptNumber, cancelled: false };
@@ -2343,7 +2341,7 @@ export function make(
         type: "runtime.warning",
         turnId: TurnId.make(failedTurnId),
         payload: {
-          message: `Muse backend error — retrying automatically in ${delayMs / 1_000}s (attempt ${attemptNumber} of ${transientRetryDelays.length}): ${message}`,
+          message: `Muse backend error — ${continueWork ? "asking the model to continue where it stopped" : "retrying automatically"} in ${delayMs / 1_000}s (attempt ${attemptNumber} of ${transientRetryDelays.length}): ${message}`,
         },
       });
       const task = Effect.gen(function* () {
@@ -2365,10 +2363,18 @@ export function make(
             if (!live || ctx.needsRestart) return;
             if (ctx.session.status !== "ready" || ctx.session.activeTurnId) return;
             ctx.transientRetryPending = undefined;
+            const input = continueWork
+              ? [
+                  {
+                    type: "text",
+                    text: `${buildRuntimeInstructions({ harness: "Muse Code" })}\n\n${TRANSIENT_CONTINUE_PROMPT}`,
+                  },
+                ]
+              : live.parts;
             const started = yield* attempt("turn/start", () =>
               ctx.host.connection.command("turn/start", {
                 sessionId: ctx.sessionId,
-                input: live.parts,
+                input,
                 ifBusy: "queue",
                 ...(live.reasoningEffort ? { reasoningEffort: live.reasoningEffort } : {}),
               }),
