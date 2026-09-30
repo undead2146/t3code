@@ -2265,7 +2265,7 @@ describe("MuseAdapter transport truncation mitigation", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
-  it.live("does not idle-settle while the session record shows a task still running", () =>
+  it.live("never idle-settles a turn while Muse's session record is available", () =>
     Effect.gen(function* () {
       const museHome = yield* Effect.promise(() =>
         NodeFSP.mkdtemp(NodePath.join(process.cwd(), ".muse-home-test-")),
@@ -2278,6 +2278,7 @@ describe("MuseAdapter transport truncation mitigation", () => {
           drainIntervalMs: 20,
           quietSettleThresholdMs: 100,
           sessionRecordCheckQuietMs: 50,
+          viewCatchUpMs: 0,
         });
         const threadId = ThreadId.make("thread-test-open-task");
         const session = yield* adapter.startSession({
@@ -2298,11 +2299,13 @@ describe("MuseAdapter transport truncation mitigation", () => {
         );
         yield* Effect.promise(() => NodeFSP.mkdir(dayDir, { recursive: true }));
         const logPath = NodePath.join(dayDir, "session.jsonl");
-        // A long build started on the host; its item/started never reached us.
+        // Between two steps the record briefly shows no open task (a model step
+        // just ended, the next tools have not started), exactly as observed.
         yield* Effect.promise(() =>
           NodeFSP.writeFile(
             logPath,
-            `{"payload":{"kind":"task","run_id":"${turnId}","task_id":"build-task","event":{"kind":"started","task_id":"build-task"}}}\n`,
+            `{"payload":{"kind":"task","run_id":"${turnId}","task_id":"model-step","event":{"kind":"started","task_id":"model-step"}}}\n` +
+              `{"payload":{"kind":"task","run_id":"${turnId}","task_id":"model-step","event":{"kind":"completed","task_id":"model-step"}}}\n`,
           ),
         );
         const completed = yield* adapter.streamEvents.pipe(
@@ -2314,14 +2317,15 @@ describe("MuseAdapter transport truncation mitigation", () => {
         mockTurnStartResponse = { status: "accepted", turnId };
         yield* adapter.sendTurn({ threadId, input: "build it" });
 
+        // Quiet far past the threshold, nothing open: still not settled.
         const early = yield* Fiber.join(completed).pipe(Effect.timeoutOption("600 millis"));
         expect(Option.isNone(early)).toBe(true);
 
-        // Once the record shows the task ended, the quiet turn settles as before.
+        // Only the record's own terminal entry ends the turn.
         yield* Effect.promise(() =>
           NodeFSP.appendFile(
             logPath,
-            `{"payload":{"kind":"task","run_id":"${turnId}","task_id":"build-task","event":{"kind":"completed","task_id":"build-task"}}}\n`,
+            `{"payload":{"kind":"run","run_id":"${turnId}","event":{"kind":"terminal","terminal":"completed"}}}\n`,
           ),
         );
         const settled = yield* Fiber.join(completed).pipe(Effect.timeoutOption("5 seconds"));

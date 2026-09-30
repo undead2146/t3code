@@ -420,46 +420,6 @@ function checkOnDiskTerminal(
   return undefined;
 }
 
-// True when Muse's session record shows a task of `runId` (a tool call, a model
-// stream, a child session) that started and has not ended. Live notifications
-// can miss such a task entirely, so the record is the authority on whether a
-// quiet turn is still working.
-export function hasOpenTaskOnDisk(sessionLogPath: string, runId: string): boolean {
-  try {
-    const stat = NodeFS.statSync(sessionLogPath);
-    if (stat.size === 0) return false;
-    const readSize = Math.min(stat.size, 1024 * 1024);
-    const buffer = Buffer.alloc(readSize);
-    const fd = NodeFS.openSync(sessionLogPath, "r");
-    try {
-      NodeFS.readSync(fd, buffer, 0, readSize, stat.size - readSize);
-    } finally {
-      NodeFS.closeSync(fd);
-    }
-    const open = new Set<string>();
-    for (const line of buffer.toString("utf8").split("\n")) {
-      if (!line.includes(runId) || !line.includes('"task_id"')) continue;
-      let parsed: {
-        payload?: { kind?: string; run_id?: string; task_id?: string; event?: { kind?: string } };
-      };
-      try {
-        parsed = JSON.parse(line);
-      } catch {
-        continue; // The first line of the window is usually cut mid-record.
-      }
-      const payload = parsed.payload;
-      if (payload?.kind !== "task" || payload.run_id !== runId || !payload.task_id) continue;
-      const kind = payload.event?.kind;
-      if (kind === "started") open.add(payload.task_id);
-      else if (kind === "completed" || kind === "failed" || kind === "cancelled")
-        open.delete(payload.task_id);
-    }
-    return open.size > 0;
-  } catch {
-    return false;
-  }
-}
-
 export function make(
   settings: MuseSettings,
   options?: {
@@ -789,20 +749,20 @@ export function make(
           }
         }
 
-        // Layer 2: Quiet turn auto-finalization if quiet for >= 45s with no live
-        // items, active subagents, or pending requests. A tool call that emits
-        // no output for a while (long builds, tests) is alive, not dead:
-        // settling it orphans the still-running host turn, and the next turn
-        // then queues behind that zombie instead of starting. Notifications can
-        // miss a tool's start entirely, so the session record gets the last word.
+        // Layer 2: Quiet turn auto-finalization, only when Muse's session record
+        // cannot be found. With the record, only its terminal entry (Layer 1)
+        // ends a turn: a quiet stretch proves nothing, since a model step can
+        // think for minutes without an event and Muse briefly has no open task
+        // between every two steps. Muse's own stream timeouts write a terminal
+        // entry for a truly hung turn, and the stalled-turn watchdog covers the rest.
         if (
+          !ctx.sessionLogPath &&
           quietMs >= quietSettleThresholdMs &&
           !ctx.settlingFromDisk &&
           !hasInProgressItem(ctx) &&
           !hasActiveWorkflowOrSubagent(ctx) &&
           ctx.approvals.size === 0 &&
-          ctx.questions.size === 0 &&
-          !(ctx.sessionLogPath && hasOpenTaskOnDisk(ctx.sessionLogPath, activeTurnId))
+          ctx.questions.size === 0
         ) {
           settleTurnFromOutcome(
             ctx,
