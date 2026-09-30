@@ -2265,6 +2265,75 @@ describe("MuseAdapter transport truncation mitigation", () => {
     }).pipe(Effect.provide(testLayer)),
   );
 
+  it.live("does not idle-settle while the session record shows a task still running", () =>
+    Effect.gen(function* () {
+      const museHome = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(process.cwd(), ".muse-home-test-")),
+      );
+      const priorMuseHome = process.env.MUSE_HOME;
+      process.env.MUSE_HOME = museHome;
+      try {
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+          drainIntervalMs: 20,
+          quietSettleThresholdMs: 100,
+          sessionRecordCheckQuietMs: 50,
+        });
+        const threadId = ThreadId.make("thread-test-open-task");
+        const session = yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+        });
+        const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+        const turnId = "open-task-turn";
+        const now = DateTime.toDateUtc(yield* DateTime.now);
+        const dayDir = NodePath.join(
+          museHome,
+          "sessions",
+          String(now.getUTCFullYear()),
+          String(now.getUTCMonth() + 1).padStart(2, "0"),
+          String(now.getUTCDate()).padStart(2, "0"),
+          sessionId,
+        );
+        yield* Effect.promise(() => NodeFSP.mkdir(dayDir, { recursive: true }));
+        const logPath = NodePath.join(dayDir, "session.jsonl");
+        // A long build started on the host; its item/started never reached us.
+        yield* Effect.promise(() =>
+          NodeFSP.writeFile(
+            logPath,
+            `{"payload":{"kind":"task","run_id":"${turnId}","task_id":"build-task","event":{"kind":"started","task_id":"build-task"}}}\n`,
+          ),
+        );
+        const completed = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.type === "turn.completed"),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        mockTurnStartResponse = { status: "accepted", turnId };
+        yield* adapter.sendTurn({ threadId, input: "build it" });
+
+        const early = yield* Fiber.join(completed).pipe(Effect.timeoutOption("600 millis"));
+        expect(Option.isNone(early)).toBe(true);
+
+        // Once the record shows the task ended, the quiet turn settles as before.
+        yield* Effect.promise(() =>
+          NodeFSP.appendFile(
+            logPath,
+            `{"payload":{"kind":"task","run_id":"${turnId}","task_id":"build-task","event":{"kind":"completed","task_id":"build-task"}}}\n`,
+          ),
+        );
+        const settled = yield* Fiber.join(completed).pipe(Effect.timeoutOption("5 seconds"));
+        expect(Option.isSome(settled)).toBe(true);
+      } finally {
+        if (priorMuseHome === undefined) delete process.env.MUSE_HOME;
+        else process.env.MUSE_HOME = priorMuseHome;
+        yield* Effect.promise(() => NodeFSP.rm(museHome, { recursive: true, force: true }));
+      }
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.live("delivers a push-less resumed session's final events before settling", () =>
     Effect.gen(function* () {
       // Muse answers session/resume without a view cursor when it cannot
