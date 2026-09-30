@@ -224,6 +224,11 @@ interface SessionContext {
   // transient events whose cursors collide with different durable events, so
   // a pushed cursor never proves the view up to it was delivered.
   durableViewCursor?: string | undefined;
+  // Push-less sessions only: the view cursor just before the active turn
+  // began, and which turn it belongs to.
+  turnViewAnchor?: string | undefined;
+  turnViewAnchorTurnId?: string | undefined;
+  turnViewSeen?: Set<string> | undefined;
   isPagingView?: boolean;
   // The in-flight view/page drain, so a caller can wait for it instead of skipping.
   pagingPromise?: Promise<void> | undefined;
@@ -857,6 +862,21 @@ export function make(
     const pageView = async (ctx: SessionContext): Promise<void> => {
       try {
         let currentCursor = ctx.durableViewCursor;
+        // Without push, Muse only has a provisional view of the running turn
+        // and renumbers it when the turn ends, so a cursor inside the turn can
+        // land past events that were not there yet. Re-read the turn from where
+        // it began on every poll; receive() drops what was already delivered.
+        const activeTurnId = ctx.session.activeTurnId;
+        let seen: Set<string> | undefined;
+        if (ctx.pushUnavailable && activeTurnId) {
+          if (ctx.turnViewAnchorTurnId !== activeTurnId) {
+            ctx.turnViewAnchorTurnId = activeTurnId;
+            ctx.turnViewAnchor = ctx.durableViewCursor;
+            ctx.turnViewSeen = new Set();
+          }
+          currentCursor = ctx.turnViewAnchor;
+          seen = ctx.turnViewSeen;
+        }
         let pageCount = 0;
         const MAX_PAGES = 50;
 
@@ -886,6 +906,17 @@ export function make(
           }
 
           for (const item of result.events) {
+            if (seen) {
+              // Re-reads return the same events, possibly renumbered; deliver each once.
+              const {
+                viewCursor: _cursor,
+                sourceRange: _range,
+                ...content
+              } = (item.params ?? {}) as Record<string, unknown>;
+              const signature = `${item.method}|${JSON.stringify(content)}`;
+              if (seen.has(signature)) continue;
+              seen.add(signature);
+            }
             try {
               receive(ctx, item);
             } catch {

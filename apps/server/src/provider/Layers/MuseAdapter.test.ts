@@ -2464,6 +2464,96 @@ describe("MuseAdapter transport truncation mitigation", () => {
       }).pipe(Effect.provide(testLayer)),
   );
 
+  it.live("re-reads a push-less turn whose provisional view gets renumbered", () =>
+    Effect.gen(function* () {
+      mockResumeViewCursor = "";
+      const sessionId = "sess-renumber";
+      const turnId = "renumber-turn";
+      const c = (n: number) => `v:${sessionId}:${n}`;
+      let polls = 0;
+      mockRequestHandler = async (method, params) => {
+        if (method !== "view/page") return {};
+        if (params.direction === "backward")
+          return {
+            events: [{ method: "session/statusChanged", params: { sessionId, viewCursor: c(5) } }],
+          };
+        if (params.cursor !== c(5)) return { events: [], nextCursor: null };
+        polls++;
+        // Muse's provisional view of a running turn ends in an interim marker;
+        // once the turn ends the same positions hold the real events.
+        const events =
+          polls < 3
+            ? [
+                { method: "turn/started", params: { sessionId, viewCursor: c(6), turnId } },
+                {
+                  method: "turn/completed",
+                  params: {
+                    sessionId,
+                    viewCursor: c(7),
+                    turnId,
+                    terminal: "failed",
+                    reason: "incomplete",
+                  },
+                },
+              ]
+            : [
+                { method: "turn/started", params: { sessionId, viewCursor: c(6), turnId } },
+                {
+                  method: "item/completed",
+                  params: {
+                    sessionId,
+                    viewCursor: c(7),
+                    item: {
+                      itemId: "renumbered-reply",
+                      kind: "agentMessage",
+                      revision: 1,
+                      status: "completed",
+                      turnId,
+                      text: "The answer.",
+                    },
+                  },
+                },
+                {
+                  method: "turn/completed",
+                  params: { sessionId, viewCursor: c(8), turnId, terminal: "completed" },
+                },
+              ];
+        return { events, nextCursor: null };
+      };
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+        drainIntervalMs: 20,
+      });
+      const threadId = ThreadId.make("thread-test-renumber");
+      yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId, selectedModel: "default" },
+      });
+      const collected = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "turn.completed" ||
+            event.type === "runtime.warning" ||
+            (event.type === "item.completed" && String(event.itemId) === "renumbered-reply"),
+        ),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      mockTurnStartResponse = { status: "accepted", turnId };
+      yield* adapter.sendTurn({ threadId, input: "question" });
+
+      const events = yield* Fiber.join(collected).pipe(Effect.timeoutOption("5 seconds"));
+      expect(Option.isSome(events)).toBe(true);
+      expect(Option.getOrThrow(events).map((event) => event.type)).toEqual([
+        "item.completed",
+        "turn.completed",
+      ]);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.live("delivers a push-less resumed session's final events before settling", () =>
     Effect.gen(function* () {
       // Muse answers session/resume without a view cursor when it cannot
