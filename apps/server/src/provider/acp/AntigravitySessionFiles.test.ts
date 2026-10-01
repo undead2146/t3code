@@ -6,150 +6,183 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as NodeSqlite from "node:sqlite";
 
-import {
-  removeAntigravitySessionFiles,
-  sanitizeAntigravitySessionDatabase,
-} from "./AntigravitySessionFiles.ts";
+import { sanitizeAntigravitySessionDatabase } from "./AntigravitySessionFiles.ts";
+
+const STEPS_TABLE = `CREATE TABLE steps (
+  idx INTEGER PRIMARY KEY,
+  step_type INTEGER NOT NULL DEFAULT 0,
+  status INTEGER NOT NULL DEFAULT 0,
+  step_payload BLOB
+)`;
+const METADATA_TABLE = "CREATE TABLE executor_metadata (idx INTEGER PRIMARY KEY, data BLOB)";
+
+/** Shaped like a real row: field 1 = 2, then the error string the harness records. */
+const doneChFailureRow = () =>
+  Buffer.concat([
+    Buffer.from([0x08, 0x02, 0x10, 0x01]),
+    Buffer.from("could not find doneCh for checkpoint"),
+  ]);
+const healthyRow = () => Buffer.from([0x08, 0x04, 0x10, 0x1f]);
+
+const makeConversation = Effect.fn("makeConversation")(function* (
+  sessionId: string,
+  seed: (db: NodeSqlite.DatabaseSync) => void,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const profileDirectory = yield* fs.makeTempDirectoryScoped();
+  const conversations = path.join(profileDirectory, "antigravity-acp", "conversations");
+  yield* fs.makeDirectory(conversations, { recursive: true });
+  const dbPath = path.join(conversations, `${sessionId}.db`);
+  const db = new NodeSqlite.DatabaseSync(dbPath);
+  db.exec(`${STEPS_TABLE}; ${METADATA_TABLE};`);
+  seed(db);
+  db.close();
+  return { profileDirectory, dbPath };
+});
+
+const insertStep = (db: NodeSqlite.DatabaseSync, idx: number, stepType: number, status: number) =>
+  db
+    .prepare("INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)")
+    .run(idx, stepType, status, Buffer.from(`step ${idx}`));
+
+const insertMetadata = (db: NodeSqlite.DatabaseSync, idx: number, data: Buffer) =>
+  db.prepare("INSERT INTO executor_metadata (idx, data) VALUES (?, ?)").run(idx, data);
 
 describe("AntigravitySessionFiles", () => {
   it.effect("safely ignores non-existent or invalid session ids", () =>
     Effect.gen(function* () {
-      const result = yield* sanitizeAntigravitySessionDatabase({
-        profileDirectory: "C:/non/existent",
-        sessionId: "invalid-uuid",
-      });
-      expect(result).toEqual({ repairedCheckpoints: 0, removedErrorSteps: 0 });
-
-      const nonExistent = yield* sanitizeAntigravitySessionDatabase({
-        profileDirectory: "C:/non/existent",
-        sessionId: "00000000-0000-4000-8000-000000000000",
-      });
-      expect(nonExistent).toEqual({ repairedCheckpoints: 0, removedErrorSteps: 0 });
+      const nothing = { repairedCheckpoints: 0, removedErrorSteps: 0, resumable: true };
+      expect(
+        yield* sanitizeAntigravitySessionDatabase({
+          profileDirectory: "C:/non/existent",
+          sessionId: "invalid-uuid",
+        }),
+      ).toEqual(nothing);
+      expect(
+        yield* sanitizeAntigravitySessionDatabase({
+          profileDirectory: "C:/non/existent",
+          sessionId: "00000000-0000-4000-8000-000000000000",
+        }),
+      ).toEqual(nothing);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("repairs poisoned in-progress checkpoints and removes panic steps", () =>
+  it.effect("cancels an interrupted checkpoint so the conversation can resume", () =>
     Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-
-      const tempDir = yield* fs.makeTempDirectoryScoped();
-      const acpDir = path.join(tempDir, "antigravity-acp", "conversations");
-      yield* fs.makeDirectory(acpDir, { recursive: true });
-
-      const sessionId = "461ec98b-c308-443b-bce6-fabbae5b5569";
-      const dbPath = path.join(acpDir, `${sessionId}.db`);
-
-      // Initialize synthetic database mimicking the exact checkpoint crash state
-      const db = new NodeSqlite.DatabaseSync(dbPath);
-      db.exec(`
-        CREATE TABLE executor_metadata (idx INTEGER PRIMARY KEY, data BLOB);
-        CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB);
-      `);
-
-      // Row 13: status 4 (COMMITTED)
-      const committedBuf = Buffer.from([0x08, 0x04, 0x10, 0x1f]);
-      // Row 14: status 1 (IN_PROGRESS) -> the poison that causes "could not find doneCh for checkpoint"
-      const inProgressBuf = Buffer.from([0x08, 0x01, 0x10, 0x20]);
-      db.prepare("INSERT INTO executor_metadata (idx, data) VALUES (?, ?)").run(13, committedBuf);
-      db.prepare("INSERT INTO executor_metadata (idx, data) VALUES (?, ?)").run(14, inProgressBuf);
-
-      // Normal tool call step
-      db.prepare("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)").run(
-        2864,
-        21,
-        Buffer.from("run_command git status"),
-      );
-      // Panic crash step
-      db.prepare("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)").run(
-        2865,
-        17,
-        Buffer.from("agent executor error: could not find doneCh for checkpoint"),
-      );
-      db.close();
-
-      // First run: repairs the database
-      const firstRun = yield* sanitizeAntigravitySessionDatabase({
-        profileDirectory: tempDir,
-        sessionId,
+      const sessionId = "415a1999-e5a2-41e2-a0c2-f4eb9e999dfd";
+      const { profileDirectory, dbPath } = yield* makeConversation(sessionId, (db) => {
+        insertStep(db, 52, 15, 3);
+        insertStep(db, 53, 23, 2); // checkpoint left running by a killed process
+        insertStep(db, 54, 23, 3);
+        insertStep(db, 120, 14, 3);
+        insertStep(db, 121, 14, 3);
+        insertMetadata(db, 0, doneChFailureRow());
+        insertMetadata(db, 1, doneChFailureRow());
       });
-      expect(firstRun).toEqual({ repairedCheckpoints: 1, removedErrorSteps: 1 });
 
-      // Verify the state of the database after sanitization
-      const verifyDb = new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
+      const first = yield* sanitizeAntigravitySessionDatabase({ profileDirectory, sessionId });
+      expect(first).toEqual({ repairedCheckpoints: 1, removedErrorSteps: 0, resumable: true });
 
-      const meta13 = verifyDb
-        .prepare("SELECT data FROM executor_metadata WHERE idx = 13")
-        .get() as { data: Uint8Array };
-      expect(Buffer.from(meta13.data)[1]).toBe(0x04); // Untouched
-
-      const meta14 = verifyDb
-        .prepare("SELECT data FROM executor_metadata WHERE idx = 14")
-        .get() as { data: Uint8Array };
-      expect(Buffer.from(meta14.data)[1]).toBe(0x02); // Successfully transitioned to SKIPPED (2)
-
-      const remainingSteps = verifyDb.prepare("SELECT idx FROM steps").all() as Array<{
-        idx: number;
+      const db = new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
+      const checkpoints = db
+        .prepare("SELECT idx, status FROM steps WHERE step_type = 23 ORDER BY idx")
+        .all();
+      const metadata = db
+        .prepare("SELECT data FROM executor_metadata ORDER BY idx")
+        .all() as Array<{
+        data: Uint8Array;
       }>;
-      expect(remainingSteps).toEqual([{ idx: 2864 }]); // Crash step 2865 was removed
+      db.close();
+      expect(checkpoints).toEqual([
+        { idx: 53, status: 5 },
+        { idx: 54, status: 3 },
+      ]);
+      // Harness-owned metadata is left alone.
+      expect(metadata.map((row) => Buffer.from(row.data).equals(doneChFailureRow()))).toEqual([
+        true,
+        true,
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 
-      verifyDb.close();
-
-      // Second run: idempotent, nothing left to repair
-      const secondRun = yield* sanitizeAntigravitySessionDatabase({
-        profileDirectory: tempDir,
-        sessionId,
+  it.effect("gives up on resuming once a repair did not stop the checkpoint failure", () =>
+    Effect.gen(function* () {
+      const sessionId = "4ba207e8-0000-4000-8000-000000000001";
+      const { profileDirectory } = yield* makeConversation(sessionId, (db) => {
+        insertStep(db, 1263, 23, 5); // repaired on the previous start
+        insertStep(db, 1337, 14, 3);
+        insertMetadata(db, 0, healthyRow());
+        insertMetadata(db, 1, doneChFailureRow()); // the resume after the repair failed again
       });
-      expect(secondRun).toEqual({ repairedCheckpoints: 0, removedErrorSteps: 0 });
+
+      expect(yield* sanitizeAntigravitySessionDatabase({ profileDirectory, sessionId })).toEqual({
+        repairedCheckpoints: 0,
+        removedErrorSteps: 0,
+        resumable: false,
+      });
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("stops trusting the repair after repeated failures", () =>
+    Effect.gen(function* () {
+      const sessionId = "5f1f81a6-0000-4000-8000-000000000002";
+      const { profileDirectory } = yield* makeConversation(sessionId, (db) => {
+        insertStep(db, 332, 23, 2);
+        for (let idx = 0; idx < 6; idx++) insertMetadata(db, idx, doneChFailureRow());
+      });
+
+      const result = yield* sanitizeAntigravitySessionDatabase({ profileDirectory, sessionId });
+      expect(result.repairedCheckpoints).toBe(1);
+      expect(result.resumable).toBe(false);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("leaves a healthy conversation untouched", () =>
+    Effect.gen(function* () {
+      const sessionId = "01a40f1e-0000-4000-8000-000000000003";
+      const { profileDirectory } = yield* makeConversation(sessionId, (db) => {
+        insertStep(db, 17, 23, 5);
+        insertStep(db, 18, 23, 3);
+        insertMetadata(db, 0, doneChFailureRow()); // an old failure, recovered since
+        insertMetadata(db, 1, healthyRow());
+      });
+
+      expect(yield* sanitizeAntigravitySessionDatabase({ profileDirectory, sessionId })).toEqual({
+        repairedCheckpoints: 0,
+        removedErrorSteps: 0,
+        resumable: true,
+      });
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect("removes fatal executor construction and MCP failure crash steps", () =>
     Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-
-      const tempDir = yield* fs.makeTempDirectoryScoped();
-      const acpDir = path.join(tempDir, "antigravity-acp", "conversations");
-      yield* fs.makeDirectory(acpDir, { recursive: true });
-
       const sessionId = "58b9fc5a-8f4b-4d24-a4dc-6e7a12260a32";
-      const dbPath = path.join(acpDir, `${sessionId}.db`);
-
-      const db = new NodeSqlite.DatabaseSync(dbPath);
-      db.exec(`
-        CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB);
-      `);
-
-      // Normal user message step
-      db.prepare("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)").run(
-        2770,
-        14,
-        Buffer.from("what is the status of this so far?"),
-      );
-      // Terminal failure step recorded by Antigravity Go harness on aborted MCP initialization
-      db.prepare("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)").run(
-        2771,
-        17,
-        Buffer.from(
-          '(Agent execution terminated due to error. failed to construct executor: MCP load failed for t3-code: context canceled client is closing: sending "notifications/cancelled": Bad Request',
-        ),
-      );
-      db.close();
-
-      const run = yield* sanitizeAntigravitySessionDatabase({
-        profileDirectory: tempDir,
-        sessionId,
+      const { profileDirectory, dbPath } = yield* makeConversation(sessionId, (db) => {
+        insertStep(db, 2770, 14, 3);
+        db.prepare(
+          "INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)",
+        ).run(
+          2771,
+          17,
+          3,
+          Buffer.from(
+            '(Agent execution terminated due to error. failed to construct executor: MCP load failed for t3-code: context canceled client is closing: sending "notifications/cancelled": Bad Request',
+          ),
+        );
       });
-      expect(run).toEqual({ repairedCheckpoints: 0, removedErrorSteps: 1 });
 
-      const verifyDb = new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
-      const remainingSteps = verifyDb.prepare("SELECT idx, step_type FROM steps").all() as Array<{
-        idx: number;
-        step_type: number;
-      }>;
-      expect(remainingSteps).toEqual([{ idx: 2770, step_type: 14 }]);
-      verifyDb.close();
+      expect(yield* sanitizeAntigravitySessionDatabase({ profileDirectory, sessionId })).toEqual({
+        repairedCheckpoints: 0,
+        removedErrorSteps: 1,
+        resumable: true,
+      });
+
+      const db = new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
+      const remaining = db.prepare("SELECT idx, step_type FROM steps").all();
+      db.close();
+      expect(remaining).toEqual([{ idx: 2770, step_type: 14 }]);
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 });

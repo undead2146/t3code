@@ -23,6 +23,7 @@ import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as AcpErrors from "effect-acp/errors";
 import type * as AcpSchema from "effect-acp/schema";
+import * as NodeSqlite from "node:sqlite";
 
 import { ServerConfig } from "../../config.ts";
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../antigravityAuthSupport.ts";
@@ -489,6 +490,37 @@ it.layer(layer)("AntigravityAdapter", (it) => {
       });
       expect(session.status).toBe("ready");
       expect(session.resumeCursor).toEqual({ schemaVersion: 1, sessionId: nativeSessionId });
+      expect(h.launches[0]?.resumeSessionId).toBeUndefined();
+    }),
+  );
+
+  it.effect("starts a fresh conversation when a checkpoint failure survived its repair", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const profileDirectory = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-agy-poisoned-",
+      });
+      const conversations = path.join(profileDirectory, "antigravity-acp", "conversations");
+      yield* fileSystem.makeDirectory(conversations, { recursive: true });
+      const db = new NodeSqlite.DatabaseSync(path.join(conversations, `${nativeSessionId}.db`));
+      db.exec(`
+        CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB);
+        CREATE TABLE executor_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+      `);
+      db.prepare("INSERT INTO steps (idx, step_type, status) VALUES (53, 23, 5)").run();
+      db.prepare("INSERT INTO executor_metadata (idx, data) VALUES (0, ?)").run(
+        Buffer.from("\b\u0002could not find doneCh for checkpoint"),
+      );
+      db.close();
+
+      const h = yield* makeHarness({ profileDirectory });
+      yield* h.adapter.startSession({
+        threadId,
+        cwd: "/tmp",
+        runtimeMode: "auto-accept-edits",
+        resumeCursor: { schemaVersion: 1, sessionId: nativeSessionId },
+      });
       expect(h.launches[0]?.resumeSessionId).toBeUndefined();
     }),
   );

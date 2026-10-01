@@ -10,37 +10,56 @@ const decodeSessionMetadata = Schema.decodeEffect(
   Schema.fromJsonString(Schema.Struct({ cwd: Schema.String })),
 );
 
+/** Context checkpoint step. Status 2 is running, 3 done, 5 cancelled. */
+const CHECKPOINT_STEP_TYPE = 23;
+const STEP_STATUS_RUNNING = 2;
+const STEP_STATUS_CANCELLED = 5;
+const DONE_CH_ERROR = "could not find doneCh for checkpoint";
+/** Past this many failures in a row, a repair is not trusted to help. */
+const MAX_CONSECUTIVE_DONE_CH_FAILURES = 5;
+
+export interface AntigravitySessionRepair {
+  readonly repairedCheckpoints: number;
+  readonly removedErrorSteps: number;
+  /** False when resuming would hit the same harness error again. Start fresh instead. */
+  readonly resumable: boolean;
+}
+
+const nothingToRepair: AntigravitySessionRepair = {
+  repairedCheckpoints: 0,
+  removedErrorSteps: 0,
+  resumable: true,
+};
+
 /**
- * Repairs Antigravity SQLite conversation databases that were corrupted by an
- * interrupted context checkpoint or fatal executor error.
+ * Repairs an Antigravity conversation database before T3 resumes it, and
+ * after the process that owned it exits.
  *
- * Root Cause & Prevention:
- * 1. Context Compaction Checkpoints:
- *    When an Antigravity ACP conversation approaches the context compaction threshold (~110k tokens),
- *    the internal Go harness (localharness_external) registers an in-progress checkpoint in
- *    `executor_metadata` (status = 1 / protobuf varint sequence 0x08 0x01) and sets up an in-memory
- *    Go channel `doneCh`.
- *    If concurrent tool calls, crash, or PC reboot interrupt this checkpoint, `status = 1` remains written to disk.
- *    On every subsequent process boot or session resume, `checkpoint_validation.go` scans `executor_metadata`.
- *    Seeing an active checkpoint without its ephemeral in-memory `doneCh`, it immediately panics with:
- *      "agent executor error: could not find doneCh for checkpoint"
+ * Interrupted checkpoints: when the harness compacts context it writes a
+ * checkpoint step (`step_type` 23) as running and waits on an in-memory Go
+ * channel (`doneCh`). If the process dies first, the step stays running on
+ * disk. Every later prompt on that conversation then fails with
+ * "could not find doneCh for checkpoint", and the harness appends one
+ * `executor_metadata` row carrying that error per attempt. Healthy
+ * conversations finish checkpoints as done (3) or cancelled (5), so a running
+ * checkpoint is marked cancelled.
  *
- * 2. Unhandled Fatal Executor / MCP Crash Steps:
- *    If an executor construction or MCP initialization fails on reboot or cancellation, Antigravity records
- *    a fatal terminal error step (`step_type == 17`) with payload like:
- *      "(Agent execution terminated due to error. failed to construct executor: MCP load failed..."
- *    Resuming a session with this trailing terminal step causes the internal Go executor to hang or stall
- *    on subsequent `session/prompt` calls until the turn watchdog times out.
+ * If the newest `executor_metadata` rows still report the doneCh error and
+ * nothing was left to repair, the last repair did not help, so the
+ * conversation is reported as not resumable. A repair that keeps finding a
+ * running checkpoint is trusted for at most a few failures in a row. Either
+ * way a thread falls back to a fresh conversation instead of looping.
  *
- * This sanitizer neutralizes that poisoned state:
- * 1. Checks `executor_metadata` for any checkpoint row where status == 1 (IN_PROGRESS, 0x08 0x01).
- *    Transitions it to status == 2 (SKIPPED, 0x08 0x02) so the Go validation hook does not expect `doneCh`.
- * 2. Removes any trailing panic or fatal executor termination step (step_type == 17) in `steps`.
+ * Fatal executor steps: an executor or MCP start failure leaves a terminal
+ * error step (`step_type` 17) that stalls later prompts. Those are removed.
  */
 export const sanitizeAntigravitySessionDatabase = Effect.fn("sanitizeAntigravitySessionDatabase")(
-  function* (input: { readonly profileDirectory: string; readonly sessionId: string | undefined }) {
+  function* (input: {
+    readonly profileDirectory: string;
+    readonly sessionId: string | undefined;
+  }): Effect.fn.Return<AntigravitySessionRepair, never, FileSystem.FileSystem | Path.Path> {
     if (input.sessionId === undefined || !isNativeSessionId(input.sessionId)) {
-      return { repairedCheckpoints: 0, removedErrorSteps: 0 };
+      return nothingToRepair;
     }
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -49,47 +68,30 @@ export const sanitizeAntigravitySessionDatabase = Effect.fn("sanitizeAntigravity
 
     const exists = yield* fs.exists(dbPath).pipe(Effect.orElseSucceed(() => false));
     if (!exists) {
-      return { repairedCheckpoints: 0, removedErrorSteps: 0 };
+      return nothingToRepair;
     }
 
-    return yield* Effect.sync(() => {
+    return yield* Effect.sync((): AntigravitySessionRepair => {
       let repairedCheckpoints = 0;
       let removedErrorSteps = 0;
+      let resumable = true;
 
       try {
         const db = new NodeSqlite.DatabaseSync(dbPath);
 
         try {
-          const tableCheck = db
-            .prepare(
-              "SELECT name FROM sqlite_master WHERE type='table' AND name='executor_metadata'",
-            )
-            .get() as { name?: string } | undefined;
+          const hasTable = (name: string) =>
+            db
+              .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?")
+              .get(name) !== undefined;
 
-          if (tableCheck?.name === "executor_metadata") {
-            const rows = db.prepare("SELECT idx, data FROM executor_metadata").all() as Array<{
-              idx: number;
-              data: Uint8Array | Buffer;
-            }>;
+          if (hasTable("steps")) {
+            repairedCheckpoints = Number(
+              db
+                .prepare("UPDATE steps SET status = ? WHERE step_type = ? AND status = ?")
+                .run(STEP_STATUS_CANCELLED, CHECKPOINT_STEP_TYPE, STEP_STATUS_RUNNING).changes,
+            );
 
-            for (const row of rows) {
-              const buf = Buffer.isBuffer(row.data) ? row.data : Buffer.from(row.data);
-              // Protobuf field 1 tag is 0x08 (field 1, wire type 0 varint).
-              // Value 0x01 is status 1 (IN_PROGRESS).
-              if (buf.length >= 2 && buf[0] === 0x08 && buf[1] === 0x01) {
-                // Change status 1 (IN_PROGRESS) to 2 (SKIPPED: 0x08 0x02)
-                buf[1] = 0x02;
-                db.prepare("UPDATE executor_metadata SET data = ? WHERE idx = ?").run(buf, row.idx);
-                repairedCheckpoints++;
-              }
-            }
-          }
-
-          const stepsCheck = db
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='steps'")
-            .get() as { name?: string } | undefined;
-
-          if (stepsCheck?.name === "steps") {
             const lastSteps = db
               .prepare("SELECT idx, step_type, step_payload FROM steps ORDER BY idx DESC LIMIT 10")
               .all() as Array<{
@@ -104,7 +106,7 @@ export const sanitizeAntigravitySessionDatabase = Effect.fn("sanitizeAntigravity
                   ? Buffer.from(step.step_payload).toString("utf8")
                   : "";
                 if (
-                  payloadStr.includes("could not find doneCh for checkpoint") ||
+                  payloadStr.includes(DONE_CH_ERROR) ||
                   payloadStr.includes("agent executor error") ||
                   payloadStr.includes("failed to construct executor") ||
                   payloadStr.includes("Agent execution terminated due to error") ||
@@ -116,6 +118,29 @@ export const sanitizeAntigravitySessionDatabase = Effect.fn("sanitizeAntigravity
               }
             }
           }
+
+          if (hasTable("executor_metadata")) {
+            // Each failed prompt appends one row; the error is a plain protobuf
+            // string, so a byte search finds it.
+            const recent = db
+              .prepare("SELECT data FROM executor_metadata ORDER BY idx DESC LIMIT ?")
+              .all(MAX_CONSECUTIVE_DONE_CH_FAILURES + 1) as Array<{
+              data?: Uint8Array | Buffer | null;
+            }>;
+            let failures = 0;
+            for (const row of recent) {
+              if (!row.data || !Buffer.from(row.data).toString("latin1").includes(DONE_CH_ERROR)) {
+                break;
+              }
+              failures++;
+            }
+            if (
+              failures > 0 &&
+              (repairedCheckpoints === 0 || failures > MAX_CONSECUTIVE_DONE_CH_FAILURES)
+            ) {
+              resumable = false;
+            }
+          }
         } finally {
           db.close();
         }
@@ -123,10 +148,10 @@ export const sanitizeAntigravitySessionDatabase = Effect.fn("sanitizeAntigravity
         // Best effort: if database is temporarily locked or inaccessible, do not abort
       }
 
-      return { repairedCheckpoints, removedErrorSteps };
+      return { repairedCheckpoints, removedErrorSteps, resumable };
     });
   },
-  Effect.orElseSucceed(() => ({ repairedCheckpoints: 0, removedErrorSteps: 0 })),
+  Effect.orElseSucceed(() => nothingToRepair),
 );
 
 /** Call after the process closes. The unique temporary cwd proves which session we own. */

@@ -900,7 +900,7 @@ export function isRetryableAntigravityError(error?: unknown, text?: string): boo
 interface SessionContext {
   readonly threadId: ThreadId;
   readonly cwd: string;
-  readonly nativeSessionId: string;
+  nativeSessionId: string;
   readonly scope: Scope.Closeable;
   runtime: Runtime;
   readonly promptLock: Semaphore.Semaphore;
@@ -2299,6 +2299,14 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
         context.runtime = newRuntime;
         context.disconnected = false;
         context.stopped = false;
+        if (started.sessionId !== context.nativeSessionId) {
+          // The saved conversation could not be resumed, so a fresh one replaced it.
+          context.nativeSessionId = started.sessionId;
+          context.session = {
+            ...context.session,
+            resumeCursor: { schemaVersion: 1, sessionId: started.sessionId },
+          };
+        }
 
         yield* Stream.runForEach(newRuntime.getEvents(), (event) =>
           handleEvent(context, event),
@@ -2447,30 +2455,36 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
               );
             });
 
-          const createAndStartRuntime = (targetSessionId: string | undefined) =>
+          const createAndStartRuntime = (requestedSessionId: string | undefined) =>
             Effect.gen(function* () {
+              let targetSessionId = requestedSessionId;
               if (targetSessionId) {
-                yield* sanitizeAntigravitySessionDatabase({
+                const repair = yield* sanitizeAntigravitySessionDatabase({
                   profileDirectory: options.profileDirectory ?? serverConfig.stateDir,
                   sessionId: targetSessionId,
                 }).pipe(
                   Effect.provideService(FileSystem.FileSystem, fileSystem),
                   Effect.provideService(Path.Path, path),
-                  Effect.tap(({ repairedCheckpoints, removedErrorSteps }) =>
-                    repairedCheckpoints > 0 || removedErrorSteps > 0
-                      ? Effect.logWarning(
-                          "Sanitized corrupt Antigravity session database before resume",
-                          {
-                            threadId: input.threadId,
-                            sessionId: targetSessionId,
-                            repairedCheckpoints,
-                            removedErrorSteps,
-                          },
-                        )
-                      : Effect.void,
-                  ),
-                  Effect.ignore,
                 );
+                if (repair.repairedCheckpoints > 0 || repair.removedErrorSteps > 0) {
+                  yield* Effect.logWarning(
+                    "Sanitized corrupt Antigravity session database before resume",
+                    {
+                      threadId: input.threadId,
+                      sessionId: targetSessionId,
+                      repairedCheckpoints: repair.repairedCheckpoints,
+                      removedErrorSteps: repair.removedErrorSteps,
+                    },
+                  );
+                }
+                if (!repair.resumable) {
+                  // Resuming would fail every prompt with the same harness error.
+                  yield* Effect.logWarning(
+                    "Antigravity conversation cannot be resumed after a failed checkpoint; starting a fresh conversation",
+                    { threadId: input.threadId, sessionId: targetSessionId },
+                  );
+                  targetSessionId = undefined;
+                }
               }
               const r = yield* options.makeRuntime({
                 cwd,
