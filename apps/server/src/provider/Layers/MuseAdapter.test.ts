@@ -2522,6 +2522,99 @@ describe("MuseAdapter transport truncation mitigation", () => {
       }).pipe(Effect.provide(testLayer)),
   );
 
+  it.live("delivers a push-less turn on a host whose view pages are slow", () =>
+    Effect.gen(function* () {
+      mockResumeViewCursor = "";
+      const sessionId = "sess-slow";
+      const turnId = "slow-turn";
+      const c = (n: number) => `v:${sessionId}:${n}`;
+      let inFlight = 0;
+      let maxInFlight = 0;
+      let rereads = 0;
+      let finished = false;
+      mockRequestHandler = async (method, params) => {
+        if (method !== "view/page") return {};
+        if (params.direction === "backward")
+          return {
+            events: [{ method: "session/statusChanged", params: { sessionId, viewCursor: c(5) } }],
+          };
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        try {
+          // Every page is slow, like a single-core host under build load.
+          await Effect.runPromise(Effect.sleep("300 millis"));
+          if (params.cursor !== c(5)) return { events: [], nextCursor: null };
+          rereads++;
+          const events: Array<{ method: string; params: Record<string, unknown> }> = [
+            { method: "turn/started", params: { sessionId, viewCursor: c(6), turnId } },
+          ];
+          if (finished)
+            events.push(
+              {
+                method: "item/completed",
+                params: {
+                  sessionId,
+                  viewCursor: c(7),
+                  item: {
+                    itemId: "slow-reply",
+                    kind: "agentMessage",
+                    revision: 1,
+                    status: "completed",
+                    turnId,
+                    text: "Done.",
+                  },
+                },
+              },
+              {
+                method: "turn/completed",
+                params: { sessionId, viewCursor: c(8), turnId, terminal: "completed" },
+              },
+            );
+          return { events, nextCursor: null };
+        } finally {
+          inFlight--;
+        }
+      };
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+        drainIntervalMs: 20,
+        turnRereadMinIntervalMs: 0,
+      });
+      const threadId = ThreadId.make("thread-test-slow-view");
+      yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId, selectedModel: "default" },
+      });
+      const collected = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "turn.completed" ||
+            (event.type === "item.completed" && String(event.itemId) === "slow-reply"),
+        ),
+        Stream.takeUntil((event) => event.type === "turn.completed"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      mockTurnStartResponse = { status: "accepted", turnId };
+      yield* adapter.sendTurn({ threadId, input: "question" });
+      yield* Effect.sleep("1 second");
+      finished = true;
+
+      const events = yield* Fiber.join(collected).pipe(Effect.timeoutOption("10 seconds"));
+      expect(Option.isSome(events)).toBe(true);
+      expect(Option.getOrThrow(events).map((event) => event.type)).toEqual([
+        "item.completed",
+        "turn.completed",
+      ]);
+      // One read at a time, and re-reads rationed by their cost (3x 300ms),
+      // not one per 20ms poll.
+      expect(maxInFlight).toBe(1);
+      expect(rereads).toBeLessThan(8);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.live("re-reads a push-less turn whose provisional view gets renumbered", () =>
     Effect.gen(function* () {
       mockResumeViewCursor = "";
@@ -2581,6 +2674,7 @@ describe("MuseAdapter transport truncation mitigation", () => {
       const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
         environment: process.env,
         drainIntervalMs: 20,
+        turnRereadMinIntervalMs: 0,
       });
       const threadId = ThreadId.make("thread-test-renumber");
       yield* adapter.startSession({

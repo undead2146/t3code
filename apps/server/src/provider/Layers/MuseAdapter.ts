@@ -229,6 +229,7 @@ interface SessionContext {
   turnViewAnchor?: string | undefined;
   turnViewAnchorTurnId?: string | undefined;
   turnViewSeen?: Set<string> | undefined;
+  nextTurnRereadAt?: number | undefined;
   isPagingView?: boolean;
   // The in-flight view/page drain, so a caller can wait for it instead of skipping.
   pagingPromise?: Promise<void> | undefined;
@@ -264,6 +265,16 @@ const TRANSPORT_TRUNCATION_INTERRUPT_STREAK = 4;
 // hammering it. Deterministic failures (truncation, auth, quota) never
 // consume it.
 const MUSE_TRANSIENT_RETRY_DELAYS_MS = [15_000, 60_000, 300_000];
+// "incremental" reads forward from the last delivered cursor; "turn" re-reads a
+// push-less session's active turn from its start.
+type ViewReadMode = "incremental" | "turn";
+// Muse serve answers view/page in 15-30s on a loaded single-core host; this
+// only exists to notice a dead connection.
+const VIEW_PAGE_TIMEOUT_MS = 120_000;
+// Session start/resume and turn/start load the whole session in Muse, which
+// took 17s+ on a loaded host; the reactor bounds the full start at 3 minutes.
+const MUSE_SESSION_LOAD_TIMEOUT = "150 seconds";
+const MUSE_TURN_START_TIMEOUT = "90 seconds";
 
 // Item kinds whose presence means the turn already acted on the world: an
 // automatic redrive would execute them twice, so those turns fail with
@@ -432,6 +443,7 @@ export function make(
     quietSettleThresholdMs?: number;
     sessionRecordCheckQuietMs?: number;
     viewCatchUpMs?: number;
+    turnRereadMinIntervalMs?: number;
   },
 ) {
   return Effect.gen(function* () {
@@ -465,7 +477,9 @@ export function make(
     const drainIntervalMs = Math.max(1, options?.drainIntervalMs ?? 5_000);
     const quietSettleThresholdMs = Math.max(1, options?.quietSettleThresholdMs ?? 45_000);
     const sessionRecordCheckQuietMs = Math.max(1, options?.sessionRecordCheckQuietMs ?? 10_000);
-    const viewCatchUpMs = Math.max(0, options?.viewCatchUpMs ?? 30_000);
+    const viewCatchUpMs = Math.max(0, options?.viewCatchUpMs ?? 90_000);
+    // A turn re-read runs at most every 3x its own cost, and never more often than this.
+    const turnRereadMinIntervalMs = Math.max(0, options?.turnRereadMinIntervalMs ?? 2_000);
     const requestError = (method: string, cause: unknown) => {
       let detail = "Muse Code rejected the request or its response was invalid.";
       if (typeof cause === "string" && cause.trim().length > 0) {
@@ -493,7 +507,11 @@ export function make(
     const attempt = <A>(
       method: string,
       run: () => Promise<A>,
-      timeoutDuration: Duration.Input = "60 seconds",
+      timeoutDuration: Duration.Input = method === "turn/start"
+        ? MUSE_TURN_START_TIMEOUT
+        : method === "initialize" || method === "session/start" || method === "session/resume"
+          ? MUSE_SESSION_LOAD_TIMEOUT
+          : "60 seconds",
     ) =>
       Effect.tryPromise({ try: run, catch: (cause) => requestError(method, cause) }).pipe(
         Effect.timeoutOrElse({
@@ -608,7 +626,7 @@ export function make(
       ).catch(() => undefined);
     };
 
-    let drainViewPages: (ctx: SessionContext) => Promise<void>;
+    let drainViewPages: (ctx: SessionContext, mode?: ViewReadMode) => Promise<void>;
 
     const settleTurnFromOutcome = (
       ctx: SessionContext,
@@ -784,7 +802,7 @@ export function make(
     // after that drain started are also delivered.
     const drainViewFully = async (ctx: SessionContext): Promise<void> => {
       await ctx.pagingPromise;
-      await drainViewPages(ctx);
+      await drainViewPages(ctx, "turn");
     };
 
     // Pages the view until the turn's own turn/completed arrives, for at most
@@ -807,11 +825,11 @@ export function make(
       }
     };
 
-    drainViewPages = (ctx: SessionContext): Promise<void> => {
+    drainViewPages = (ctx: SessionContext, mode: ViewReadMode = "incremental"): Promise<void> => {
       if (ctx.stopped || !ctx.host || !ctx.sessionId) return Promise.resolve();
       if (ctx.isPagingView) return ctx.pagingPromise ?? Promise.resolve();
       ctx.isPagingView = true;
-      const run = pageView(ctx).finally(() => {
+      const run = pageView(ctx, mode).finally(() => {
         ctx.isPagingView = false;
         ctx.pagingPromise = undefined;
       });
@@ -819,24 +837,33 @@ export function make(
       return run;
     };
 
-    const pageView = async (ctx: SessionContext): Promise<void> => {
+    const pageView = async (ctx: SessionContext, mode: ViewReadMode): Promise<void> => {
       try {
         let currentCursor = ctx.durableViewCursor;
         // Without push, Muse only has a provisional view of the running turn
         // and renumbers it when the turn ends, so a cursor inside the turn can
         // land past events that were not there yet. Re-read the turn from where
-        // it began on every poll; receive() drops what was already delivered.
+        // it began; receive() drops what was already delivered. A re-read costs
+        // the whole turn so far (seconds per page on a loaded host, growing with
+        // the turn), so it is rationed by its own cost and forced only when the
+        // turn ends; the polls in between read forward from the last cursor.
         const activeTurnId = ctx.session.activeTurnId;
         let seen: Set<string> | undefined;
+        let rereading = false;
         if (ctx.pushUnavailable && activeTurnId) {
           if (ctx.turnViewAnchorTurnId !== activeTurnId) {
             ctx.turnViewAnchorTurnId = activeTurnId;
             ctx.turnViewAnchor = ctx.durableViewCursor;
             ctx.turnViewSeen = new Set();
+            ctx.nextTurnRereadAt = 0;
           }
-          currentCursor = ctx.turnViewAnchor;
           seen = ctx.turnViewSeen;
+          if (mode === "turn" || Date.now() >= (ctx.nextTurnRereadAt ?? 0)) {
+            rereading = true;
+            currentCursor = ctx.turnViewAnchor;
+          }
         }
+        const startedAt = Date.now();
         let pageCount = 0;
         const MAX_PAGES = 50;
 
@@ -855,8 +882,11 @@ export function make(
             | undefined
           >;
 
+          // Only a dead connection should end a read. A loaded host takes tens of
+          // seconds per page; abandoning a slow page just re-sends it, piling
+          // concurrent reads onto the same overloaded process.
           const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("view/page timeout")), 10_000),
+            setTimeout(() => reject(new Error("view/page timeout")), VIEW_PAGE_TIMEOUT_MS),
           );
 
           const result = await Promise.race([requestPromise, timeoutPromise]);
@@ -891,6 +921,10 @@ export function make(
             break;
           }
           currentCursor = result.nextCursor;
+        }
+        if (rereading) {
+          ctx.nextTurnRereadAt =
+            Date.now() + Math.max(turnRereadMinIntervalMs, 3 * (Date.now() - startedAt));
         }
       } catch {
         // Best-effort drain: connection close or transient protocol error should not fail session
@@ -2000,7 +2034,7 @@ export function make(
                 ifBusy: "queue",
                 ...(effort ? { reasoningEffort: effort } : {}),
               }),
-            "20 seconds",
+            MUSE_TURN_START_TIMEOUT,
           ).pipe(
             Effect.flatMap(Schema.decodeUnknownEffect(TurnResult)),
             Effect.mapError((cause) => requestError("turn/start", cause)),
