@@ -2522,6 +2522,149 @@ describe("MuseAdapter transport truncation mitigation", () => {
       }).pipe(Effect.provide(testLayer)),
   );
 
+  it.live("shows a queued turn that Muse starts after the previous turn ends", () =>
+    Effect.gen(function* () {
+      mockResumeViewCursor = "";
+      const sessionId = "sess-queued";
+      const c = (n: number) => `v:${sessionId}:${n}`;
+      const view: Array<{ method: string; params: Record<string, unknown> }> = [];
+      mockRequestHandler = async (method, params) => {
+        if (method !== "view/page") return {};
+        if (params.direction === "backward")
+          return {
+            events: [{ method: "session/statusChanged", params: { sessionId, viewCursor: c(5) } }],
+          };
+        const after = params.cursor ? Number(String(params.cursor).split(":").at(-1)) : 0;
+        return {
+          events: view.filter((e) => Number(String(e.params.viewCursor).split(":").at(-1)) > after),
+          nextCursor: null,
+        };
+      };
+      const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+        environment: process.env,
+        drainIntervalMs: 20,
+        turnRereadMinIntervalMs: 0,
+      });
+      const threadId = ThreadId.make("thread-test-queued");
+      yield* adapter.startSession({
+        threadId,
+        cwd: "Z:\\test-workspace",
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId, selectedModel: "default" },
+      });
+      const queuedStart = yield* adapter.streamEvents.pipe(
+        Stream.filter((e) => e.type === "turn.started" && String(e.turnId) === "queued-turn"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      mockTurnStartResponse = { status: "accepted", turnId: "first-turn" };
+      yield* adapter.sendTurn({ threadId, input: "first" });
+      // A second message while the first runs: Muse queues it.
+      mockTurnStartResponse = { status: "accepted", turnId: "queued-turn", disposition: "queued" };
+      yield* adapter.sendTurn({ threadId, input: "second" });
+
+      view.push(
+        { method: "turn/started", params: { sessionId, viewCursor: c(6), turnId: "first-turn" } },
+        {
+          method: "turn/completed",
+          params: { sessionId, viewCursor: c(7), turnId: "first-turn", terminal: "completed" },
+        },
+      );
+      yield* Effect.sleep("300 millis");
+      // Muse drains its queue some time after T3 saw the first turn end.
+      view.push({
+        method: "turn/started",
+        params: { sessionId, viewCursor: c(8), turnId: "queued-turn" },
+      });
+
+      const started = yield* Fiber.join(queuedStart).pipe(Effect.timeoutOption("5 seconds"));
+      expect(Option.isSome(started)).toBe(true);
+      const current = (yield* adapter.listSessions()).find((s) => s.threadId === threadId);
+      expect(current?.status).toBe("running");
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.live("shows the reply from Muse's session record when the view never delivers it", () =>
+    Effect.gen(function* () {
+      mockResumeViewCursor = "";
+      const sessionId = "sess-record-reply";
+      const turnId = "record-reply-turn";
+      mockRequestHandler = async (method, params) => {
+        if (method !== "view/page") return {};
+        if (params.direction === "backward")
+          return {
+            events: [
+              {
+                method: "session/statusChanged",
+                params: { sessionId, viewCursor: `v:${sessionId}:5` },
+              },
+            ],
+          };
+        return { events: [], nextCursor: null };
+      };
+      const museHome = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(process.cwd(), ".muse-home-test-")),
+      );
+      const now = DateTime.toDateUtc(yield* DateTime.now);
+      const dayDir = NodePath.join(
+        museHome,
+        "sessions",
+        String(now.getUTCFullYear()),
+        String(now.getUTCMonth() + 1).padStart(2, "0"),
+        String(now.getUTCDate()).padStart(2, "0"),
+        sessionId,
+      );
+      yield* Effect.promise(() => NodeFSP.mkdir(dayDir, { recursive: true }));
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(
+          NodePath.join(dayDir, "session.jsonl"),
+          `{"payload":{"kind":"run","run_id":"${turnId}","event":{"kind":"assistant_message_committed","message_id":"record-msg","text":"The port is done."}}}\n` +
+            `{"payload":{"kind":"run","run_id":"${turnId}","event":{"kind":"terminal","terminal":"completed"}}}\n`,
+        ),
+      );
+      const priorMuseHome = process.env.MUSE_HOME;
+      process.env.MUSE_HOME = museHome;
+      try {
+        const adapter = yield* MuseAdapter.make(decodeMuseSettings({}), {
+          environment: process.env,
+          drainIntervalMs: 20,
+          sessionRecordCheckQuietMs: 50,
+          viewCatchUpMs: 0,
+        });
+        const threadId = ThreadId.make("thread-test-record-reply");
+        yield* adapter.startSession({
+          threadId,
+          cwd: "Z:\\test-workspace",
+          runtimeMode: "full-access",
+          resumeCursor: { schemaVersion: 1, sessionId, selectedModel: "default" },
+        });
+        const collected = yield* adapter.streamEvents.pipe(
+          Stream.filter(
+            (e) =>
+              e.type === "turn.completed" ||
+              (e.type === "item.completed" && String(e.itemId) === "record-msg"),
+          ),
+          Stream.takeUntil((e) => e.type === "turn.completed"),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        mockTurnStartResponse = { status: "accepted", turnId };
+        yield* adapter.sendTurn({ threadId, input: "finish the port" });
+        const events = yield* Fiber.join(collected).pipe(Effect.timeoutOption("5 seconds"));
+        expect(Option.isSome(events)).toBe(true);
+        expect(Option.getOrThrow(events).map((e) => e.type)).toEqual([
+          "item.completed",
+          "turn.completed",
+        ]);
+      } finally {
+        if (priorMuseHome === undefined) delete process.env.MUSE_HOME;
+        else process.env.MUSE_HOME = priorMuseHome;
+        yield* Effect.promise(() => NodeFSP.rm(museHome, { recursive: true, force: true }));
+      }
+    }).pipe(Effect.provide(testLayer)),
+  );
+
   it.live("delivers a push-less turn on a host whose view pages are slow", () =>
     Effect.gen(function* () {
       mockResumeViewCursor = "";

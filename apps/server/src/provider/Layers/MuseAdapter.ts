@@ -230,6 +230,13 @@ interface SessionContext {
   turnViewAnchorTurnId?: string | undefined;
   turnViewSeen?: Set<string> | undefined;
   nextTurnRereadAt?: number | undefined;
+  // Turns Muse accepted into its queue (turn/start answered "queued"). They
+  // start later without any T3 action, so the view keeps being read until
+  // each one is seen starting, or the thread would look idle while Muse works.
+  queuedTurnIds?: Set<string>;
+  // User sends waiting for the session lock. An automatic redrive that finds
+  // one pending stands down: the user's message supersedes it.
+  pendingUserSends?: number;
   isPagingView?: boolean;
   // The in-flight view/page drain, so a caller can wait for it instead of skipping.
   pagingPromise?: Promise<void> | undefined;
@@ -429,6 +436,56 @@ function checkOnDiskTerminal(
     // Session log not accessible or read error
   }
   return undefined;
+}
+
+// The assistant replies Muse committed for `runId`, read from its session
+// record. Used when a turn settles from the record, so the reply is shown even
+// if the view never delivered it. Message ids match the view's item ids, so a
+// reply that does arrive later through the view is deduplicated.
+export function readCommittedRepliesOnDisk(
+  sessionLogPath: string,
+  runId: string,
+): Array<{ messageId: string; text: string }> {
+  const replies: Array<{ messageId: string; text: string }> = [];
+  try {
+    const stat = NodeFS.statSync(sessionLogPath);
+    const readSize = Math.min(stat.size, 8 * 1024 * 1024);
+    const buffer = Buffer.alloc(readSize);
+    const fd = NodeFS.openSync(sessionLogPath, "r");
+    try {
+      NodeFS.readSync(fd, buffer, 0, readSize, stat.size - readSize);
+    } finally {
+      NodeFS.closeSync(fd);
+    }
+    for (const line of buffer.toString("utf8").split("\n")) {
+      if (!line.includes("assistant_message_committed") || !line.includes(runId)) continue;
+      let parsed: {
+        payload?: {
+          kind?: string;
+          run_id?: string;
+          event?: { kind?: string; message_id?: string; text?: string };
+        };
+      };
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const payload = parsed.payload;
+      const event = payload?.event;
+      if (
+        payload?.kind === "run" &&
+        payload.run_id === runId &&
+        event?.kind === "assistant_message_committed" &&
+        event.message_id &&
+        event.text
+      )
+        replies.push({ messageId: event.message_id, text: event.text });
+    }
+  } catch {
+    // Record unreadable: nothing to recover.
+  }
+  return replies;
 }
 
 export function make(
@@ -704,8 +761,15 @@ export function make(
     const startDrainTimer = (ctx: SessionContext) => {
       if (ctx.drainTimer) return;
       ctx.drainTimer = setInterval(() => {
-        if (ctx.stopped || ctx.session.status !== "running" || !ctx.session.activeTurnId) {
+        if (ctx.stopped) {
           stopDrainTimer(ctx);
+          return;
+        }
+        if (ctx.session.status !== "running" || !ctx.session.activeTurnId) {
+          // Idle but Muse still holds queued turns: keep reading the view so
+          // their turn/started reaches receive(), which makes the turn active.
+          if (ctx.queuedTurnIds?.size) void drainViewPages(ctx);
+          else stopDrainTimer(ctx);
           return;
         }
         void drainViewPages(ctx);
@@ -752,6 +816,27 @@ export function make(
                     ctx.session.activeTurnId !== activeTurnId
                   )
                     return;
+                  // Deliver the replies the record holds before ending the turn.
+                  for (const reply of ctx.sessionLogPath
+                    ? readCommittedRepliesOnDisk(ctx.sessionLogPath, activeTurnId)
+                    : []) {
+                    receive(ctx, {
+                      method: "item/completed",
+                      params: {
+                        sessionId: ctx.sessionId,
+                        viewCursor: ctx.lastViewCursor ?? "",
+                        item: {
+                          itemId: reply.messageId,
+                          kind: "agentMessage",
+                          revision: 1,
+                          status: "completed",
+                          turnId: activeTurnId,
+                          text: reply.text,
+                        },
+                      },
+                    });
+                  }
+                  if (ctx.settledTurns.has(activeTurnId)) return;
                   settleTurnFromOutcome(
                     ctx,
                     activeTurnId,
@@ -819,6 +904,8 @@ export function make(
     };
 
     const stopDrainTimer = (ctx: SessionContext) => {
+      // A live session with queued turns keeps reading (see startDrainTimer).
+      if (!ctx.stopped && ctx.queuedTurnIds?.size) return;
       if (ctx.drainTimer) {
         clearInterval(ctx.drainTimer);
         ctx.drainTimer = undefined;
@@ -1052,6 +1139,7 @@ export function make(
       }
       if (event.method === "userInput/settled") ctx.questions.delete(event.params.userInputId);
       if (event.method === "turn/started") {
+        ctx.queuedTurnIds?.delete(event.params.turnId);
         if (ctx.settledTurns.has(event.params.turnId)) return;
         ctx.lastTurnId = event.params.turnId;
         ctx.session = {
@@ -1070,6 +1158,7 @@ export function make(
         (event.method === "turn/completed" || event.method === "turn/unqueued") &&
         !isInterimIncompleteTurn
       ) {
+        ctx.queuedTurnIds?.delete(event.params.turnId);
         stopDrainTimer(ctx);
         if (ctx.settledTurns.has(event.params.turnId)) return;
         ctx.settledTurns.add(event.params.turnId);
@@ -1890,203 +1979,216 @@ export function make(
 
     const sendTurn: Adapter["sendTurn"] = Effect.fn("MuseAdapter.sendTurn")(function* (input) {
       let ctx = yield* requireSession(input.threadId);
-      return yield* ctx.lock.withPermit(
-        Effect.gen(function* () {
-          cancelTransientRetry(ctx);
-          if (ctx.needsRestart) {
-            yield* restartSession(ctx);
-            ctx = yield* requireSession(input.threadId);
-          }
+      const waiting = ctx;
+      waiting.pendingUserSends = (waiting.pendingUserSends ?? 0) + 1;
+      let released = false;
+      const release = Effect.sync(() => {
+        if (released) return;
+        released = true;
+        waiting.pendingUserSends = Math.max(0, (waiting.pendingUserSends ?? 1) - 1);
+      });
+      return yield* ctx.lock
+        .withPermit(
+          Effect.gen(function* () {
+            yield* release;
+            cancelTransientRetry(ctx);
+            if (ctx.needsRestart) {
+              yield* restartSession(ctx);
+              ctx = yield* requireSession(input.threadId);
+            }
 
-          if (ctx.stopped)
-            return yield* requestError(
-              "turn/start",
-              "Muse Code session has closed. Resume the thread to reconnect.",
-            );
-          if (input.interactionMode === "plan")
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "sendTurn",
-              issue: "Muse Code does not expose a plan mode through MSP.",
-            });
-          const parts: Array<Record<string, unknown>> = [];
-          const runtimeInstructions = buildRuntimeInstructions({ harness: "Muse Code" });
-          // A skill part rejects every text part, so a dispatched skill carries
-          // the runtime instructions, the user text, and file notes inside its
-          // `arguments` instead of as parts. Images stay parts: the host allows
-          // them alongside a skill part.
-          let skillDispatch: MuseSkillDispatch | undefined;
-          if (input.input?.trim()) {
-            const prompt = input.input;
-            if (museSkillMentions(prompt).length > 0) {
-              const catalog = yield* attempt("skill/list", () =>
-                ctx.host.connection.request("skill/list", { sessionId: ctx.sessionId }),
-              ).pipe(
-                Effect.flatMap(Schema.decodeUnknownEffect(MuseSkillCatalog)),
-                Effect.mapError((cause) => requestError("skill/list", cause)),
+            if (ctx.stopped)
+              return yield* requestError(
+                "turn/start",
+                "Muse Code session has closed. Resume the thread to reconnect.",
               );
-              skillDispatch = planMuseSkillDispatch(
-                prompt,
-                new Set(catalog.skills.map((skill) => skill.selector)),
-              );
-            }
-            if (!skillDispatch) {
-              parts.push({
-                type: "text",
-                text: `${runtimeInstructions}\n\n${prompt}`,
-              });
-            }
-          }
-          const skillArgumentSections: string[] = [];
-          for (const attachment of input.attachments ?? []) {
-            const filePath = resolveAttachmentPath({
-              attachmentsDir: config.attachmentsDir,
-              attachment,
-            });
-            if (!filePath)
+            if (input.interactionMode === "plan")
               return yield* new ProviderAdapterValidationError({
                 provider: PROVIDER,
                 operation: "sendTurn",
-                issue: "Muse Code could not resolve the attachment.",
+                issue: "Muse Code does not expose a plan mode through MSP.",
               });
-            if (attachment.type === "image") {
-              const bytes = yield* fs
-                .readFile(filePath)
-                .pipe(Effect.mapError((cause) => requestError("attachment", cause)));
-              parts.push({
-                type: "image",
-                mediaType: attachment.mimeType,
-                base64Data: Buffer.from(bytes).toString("base64"),
-              });
-            } else if (attachment.type === "file") {
-              const note = `Attached file: ${encodePath(filePath)}`;
-              if (skillDispatch) skillArgumentSections.push(note);
-              else
+            const parts: Array<Record<string, unknown>> = [];
+            const runtimeInstructions = buildRuntimeInstructions({ harness: "Muse Code" });
+            // A skill part rejects every text part, so a dispatched skill carries
+            // the runtime instructions, the user text, and file notes inside its
+            // `arguments` instead of as parts. Images stay parts: the host allows
+            // them alongside a skill part.
+            let skillDispatch: MuseSkillDispatch | undefined;
+            if (input.input?.trim()) {
+              const prompt = input.input;
+              if (museSkillMentions(prompt).length > 0) {
+                const catalog = yield* attempt("skill/list", () =>
+                  ctx.host.connection.request("skill/list", { sessionId: ctx.sessionId }),
+                ).pipe(
+                  Effect.flatMap(Schema.decodeUnknownEffect(MuseSkillCatalog)),
+                  Effect.mapError((cause) => requestError("skill/list", cause)),
+                );
+                skillDispatch = planMuseSkillDispatch(
+                  prompt,
+                  new Set(catalog.skills.map((skill) => skill.selector)),
+                );
+              }
+              if (!skillDispatch) {
                 parts.push({
                   type: "text",
-                  text: note,
+                  text: `${runtimeInstructions}\n\n${prompt}`,
                 });
-            } else {
+              }
+            }
+            const skillArgumentSections: string[] = [];
+            for (const attachment of input.attachments ?? []) {
+              const filePath = resolveAttachmentPath({
+                attachmentsDir: config.attachmentsDir,
+                attachment,
+              });
+              if (!filePath)
+                return yield* new ProviderAdapterValidationError({
+                  provider: PROVIDER,
+                  operation: "sendTurn",
+                  issue: "Muse Code could not resolve the attachment.",
+                });
+              if (attachment.type === "image") {
+                const bytes = yield* fs
+                  .readFile(filePath)
+                  .pipe(Effect.mapError((cause) => requestError("attachment", cause)));
+                parts.push({
+                  type: "image",
+                  mediaType: attachment.mimeType,
+                  base64Data: Buffer.from(bytes).toString("base64"),
+                });
+              } else if (attachment.type === "file") {
+                const note = `Attached file: ${encodePath(filePath)}`;
+                if (skillDispatch) skillArgumentSections.push(note);
+                else
+                  parts.push({
+                    type: "text",
+                    text: note,
+                  });
+              } else {
+                return yield* new ProviderAdapterValidationError({
+                  provider: PROVIDER,
+                  operation: "sendTurn",
+                  issue: `Unsupported attachment type: ${attachment.type}`,
+                });
+              }
+            }
+            if (skillDispatch) {
+              if (skillDispatch.argumentsText.trim()) {
+                skillArgumentSections.unshift(skillDispatch.argumentsText);
+              }
+              skillArgumentSections.unshift(runtimeInstructions);
+              parts.unshift({
+                type: "skill",
+                selector: skillDispatch.selector,
+                arguments: skillArgumentSections.join("\n\n"),
+              });
+            }
+            if (!parts.length)
               return yield* new ProviderAdapterValidationError({
                 provider: PROVIDER,
                 operation: "sendTurn",
-                issue: `Unsupported attachment type: ${attachment.type}`,
+                issue: "Muse Code requires text or an image.",
+              });
+            const model = input.modelSelection?.model;
+            if (
+              model &&
+              (model !== ctx.selectedModel ||
+                (model !== MUSE_DEFAULT_MODEL &&
+                  (decodeMuseModelSelection(model)?.modelId ?? model) !== ctx.session.model))
+            ) {
+              const selection = yield* resolveModelSelection(ctx.host, model);
+              yield* attempt("session/setModel", () =>
+                ctx.host.connection.command("session/setModel", {
+                  sessionId: ctx.sessionId,
+                  model: selection,
+                }),
+              );
+              ctx.session = { ...ctx.session, model: selection.modelId };
+            }
+            if (input.modelSelection) {
+              ctx.selectedModel = input.modelSelection.model;
+              ctx.session = {
+                ...ctx.session,
+                resumeCursor: {
+                  schemaVersion: 1,
+                  sessionId: ctx.sessionId,
+                  selectedModel: ctx.selectedModel,
+                },
+              };
+            }
+            const effort = input.modelSelection
+              ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
+              : undefined;
+            ctx.lastTurnStart = {
+              parts,
+              ...(effort ? { reasoningEffort: effort } : {}),
+            };
+            const result = yield* attempt(
+              "turn/start",
+              () =>
+                ctx.host.connection.command("turn/start", {
+                  sessionId: ctx.sessionId,
+                  input: parts,
+                  ifBusy: "queue",
+                  ...(effort ? { reasoningEffort: effort } : {}),
+                }),
+              MUSE_TURN_START_TIMEOUT,
+            ).pipe(
+              Effect.flatMap(Schema.decodeUnknownEffect(TurnResult)),
+              Effect.mapError((cause) => requestError("turn/start", cause)),
+              Effect.tapError((cause) =>
+                Effect.sync(() => {
+                  const message = cause.detail ?? cause.message;
+                  if (
+                    message.includes("conflicts with an existing event") ||
+                    message.includes("event log failed")
+                  ) {
+                    ctx.session = { ...ctx.session, resumeCursor: undefined };
+                    ctx.needsRestart = true;
+                  }
+                  failSession(ctx, `Muse Code failed to start turn: ${message}`);
+                }),
+              ),
+            );
+            if (ctx.stopped)
+              return yield* requestError(
+                "turn/start",
+                ctx.session.lastError ?? "Muse Code disconnected.",
+              );
+            if (result.disposition !== "queued") {
+              ctx.lastTurnId = result.turnId;
+              ctx.settledTurns.delete(result.turnId);
+              emit({
+                ...base(ctx),
+                type: "turn.started",
+                turnId: TurnId.make(result.turnId),
+                payload: {},
               });
             }
-          }
-          if (skillDispatch) {
-            if (skillDispatch.argumentsText.trim()) {
-              skillArgumentSections.unshift(skillDispatch.argumentsText);
+            if (result.disposition === "queued") {
+              (ctx.queuedTurnIds ??= new Set()).add(result.turnId);
+              startDrainTimer(ctx);
+              yield* interruptStaleHostTurn(ctx, result.turnId);
             }
-            skillArgumentSections.unshift(runtimeInstructions);
-            parts.unshift({
-              type: "skill",
-              selector: skillDispatch.selector,
-              arguments: skillArgumentSections.join("\n\n"),
-            });
-          }
-          if (!parts.length)
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "sendTurn",
-              issue: "Muse Code requires text or an image.",
-            });
-          const model = input.modelSelection?.model;
-          if (
-            model &&
-            (model !== ctx.selectedModel ||
-              (model !== MUSE_DEFAULT_MODEL &&
-                (decodeMuseModelSelection(model)?.modelId ?? model) !== ctx.session.model))
-          ) {
-            const selection = yield* resolveModelSelection(ctx.host, model);
-            yield* attempt("session/setModel", () =>
-              ctx.host.connection.command("session/setModel", {
-                sessionId: ctx.sessionId,
-                model: selection,
-              }),
-            );
-            ctx.session = { ...ctx.session, model: selection.modelId };
-          }
-          if (input.modelSelection) {
-            ctx.selectedModel = input.modelSelection.model;
-            ctx.session = {
-              ...ctx.session,
-              resumeCursor: {
-                schemaVersion: 1,
-                sessionId: ctx.sessionId,
-                selectedModel: ctx.selectedModel,
-              },
-            };
-          }
-          const effort = input.modelSelection
-            ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
-            : undefined;
-          ctx.lastTurnStart = {
-            parts,
-            ...(effort ? { reasoningEffort: effort } : {}),
-          };
-          const result = yield* attempt(
-            "turn/start",
-            () =>
-              ctx.host.connection.command("turn/start", {
-                sessionId: ctx.sessionId,
-                input: parts,
-                ifBusy: "queue",
-                ...(effort ? { reasoningEffort: effort } : {}),
-              }),
-            MUSE_TURN_START_TIMEOUT,
-          ).pipe(
-            Effect.flatMap(Schema.decodeUnknownEffect(TurnResult)),
-            Effect.mapError((cause) => requestError("turn/start", cause)),
-            Effect.tapError((cause) =>
-              Effect.sync(() => {
-                const message = cause.detail ?? cause.message;
-                if (
-                  message.includes("conflicts with an existing event") ||
-                  message.includes("event log failed")
-                ) {
-                  ctx.session = { ...ctx.session, resumeCursor: undefined };
-                  ctx.needsRestart = true;
-                }
-                failSession(ctx, `Muse Code failed to start turn: ${message}`);
-              }),
-            ),
-          );
-          if (ctx.stopped)
-            return yield* requestError(
-              "turn/start",
-              ctx.session.lastError ?? "Muse Code disconnected.",
-            );
-          if (result.disposition !== "queued") {
-            ctx.lastTurnId = result.turnId;
-            ctx.settledTurns.delete(result.turnId);
-            emit({
-              ...base(ctx),
-              type: "turn.started",
+            if (result.disposition !== "queued" && !ctx.settledTurns.has(result.turnId)) {
+              ctx.lastActivityAt = Date.now();
+              ctx.session = {
+                ...ctx.session,
+                status: "running",
+                activeTurnId: TurnId.make(result.turnId),
+                updatedAt: nowIso(),
+              };
+              startDrainTimer(ctx);
+            }
+            return {
+              threadId: input.threadId,
               turnId: TurnId.make(result.turnId),
-              payload: {},
-            });
-          }
-          if (result.disposition === "queued") {
-            yield* interruptStaleHostTurn(ctx, result.turnId);
-          }
-          if (result.disposition !== "queued" && !ctx.settledTurns.has(result.turnId)) {
-            ctx.lastActivityAt = Date.now();
-            ctx.session = {
-              ...ctx.session,
-              status: "running",
-              activeTurnId: TurnId.make(result.turnId),
-              updatedAt: nowIso(),
+              resumeCursor: ctx.session.resumeCursor,
             };
-            startDrainTimer(ctx);
-          }
-          return {
-            threadId: input.threadId,
-            turnId: TurnId.make(result.turnId),
-            resumeCursor: ctx.session.resumeCursor,
-          };
-        }),
-      );
+          }),
+        )
+        .pipe(Effect.ensuring(release));
     });
     const interruptTurn: Adapter["interruptTurn"] = Effect.fn("MuseAdapter.interruptTurn")(
       function* (threadId, turnId) {
@@ -2396,6 +2498,8 @@ export function make(
             const live = ctx.lastTurnStart;
             if (!live || ctx.needsRestart) return;
             if (ctx.session.status !== "ready" || ctx.session.activeTurnId) return;
+            // A user message waiting on the lock supersedes this automatic turn.
+            if (ctx.pendingUserSends) return;
             ctx.transientRetryPending = undefined;
             const input = continueWork
               ? [
@@ -2432,6 +2536,8 @@ export function make(
               return;
             }
             const result = started.right;
+            if (result.disposition === "queued")
+              (ctx.queuedTurnIds ??= new Set()).add(result.turnId);
             if (result.disposition !== "queued") {
               ctx.lastTurnId = result.turnId;
               ctx.settledTurns.delete(result.turnId);
@@ -2726,9 +2832,12 @@ export function make(
             const live = ctx.lastTurnStart;
             if (!live || ctx.needsRestart) return;
             if (ctx.session.status !== "ready" || ctx.session.activeTurnId) return;
+            // A user message waiting on the lock supersedes this automatic turn.
+            if (ctx.pendingUserSends) return;
             ctx.transientRetryPending = undefined;
             const reattached = yield* reauditSession(ctx);
             if (!reattached) return;
+            if (ctx.pendingUserSends) return;
             const started = yield* attempt("turn/start", () =>
               ctx.host.connection.command("turn/start", {
                 sessionId: ctx.sessionId,
@@ -2756,6 +2865,8 @@ export function make(
               return;
             }
             const result = started.right;
+            if (result.disposition === "queued")
+              (ctx.queuedTurnIds ??= new Set()).add(result.turnId);
             if (result.disposition !== "queued") {
               ctx.lastTurnId = result.turnId;
               // The redrive consumed the audit retry: if it fails the same
@@ -2835,6 +2946,8 @@ export function make(
             if (ctx.transientRetryPending !== record || record.cancelled) return;
             if (ctx.session.status !== "ready" || ctx.session.activeTurnId) return;
             if (ctx.needsRestart) return;
+            // A user message waiting on the lock supersedes this automatic turn.
+            if (ctx.pendingUserSends) return;
             ctx.transientRetryPending = undefined;
             const runtimeInstructions = buildRuntimeInstructions({ harness: "Muse Code" });
             const started = yield* attempt("turn/start", () =>
@@ -2865,6 +2978,8 @@ export function make(
               return;
             }
             const result = started.right;
+            if (result.disposition === "queued")
+              (ctx.queuedTurnIds ??= new Set()).add(result.turnId);
             if (result.disposition !== "queued") {
               ctx.lastTurnId = result.turnId;
               // The nudge consumed the silent-completion retry: if it ends
