@@ -5,7 +5,9 @@ import {
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   type ProviderSendTurnInput,
   type RuntimeMode,
+  type ServerProviderModel,
 } from "@t3tools/contracts";
+import { createModelCapabilities } from "@t3tools/shared/model";
 import * as Crypto from "effect/Crypto";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -103,6 +105,61 @@ export function antigravityPermissionMode(runtimeMode: RuntimeMode): string {
   }
 }
 
+const EMPTY_MODEL_CAPABILITIES = createModelCapabilities({ optionDescriptors: [] });
+
+export const ANTIGRAVITY_ADDITIONAL_MODELS: ReadonlyArray<ServerProviderModel> = [
+  {
+    slug: "claude-opus-5-5-high",
+    name: "Claude Opus 5.5 (High)",
+    isCustom: false,
+    capabilities: EMPTY_MODEL_CAPABILITIES,
+  },
+  {
+    slug: "claude-opus-5-5-medium",
+    name: "Claude Opus 5.5 (Medium)",
+    isCustom: false,
+    capabilities: EMPTY_MODEL_CAPABILITIES,
+  },
+  {
+    slug: "claude-opus-5-5-low",
+    name: "Claude Opus 5.5 (Low)",
+    isCustom: false,
+    capabilities: EMPTY_MODEL_CAPABILITIES,
+  },
+  {
+    slug: "claude-sonnet-5-5-high",
+    name: "Claude Sonnet 5.5 (High)",
+    isCustom: false,
+    capabilities: EMPTY_MODEL_CAPABILITIES,
+  },
+  {
+    slug: "claude-sonnet-5-5-medium",
+    name: "Claude Sonnet 5.5 (Medium)",
+    isCustom: false,
+    capabilities: EMPTY_MODEL_CAPABILITIES,
+  },
+  {
+    slug: "claude-sonnet-5-5-low",
+    name: "Claude Sonnet 5.5 (Low)",
+    isCustom: false,
+    capabilities: EMPTY_MODEL_CAPABILITIES,
+  },
+];
+
+export const ANTIGRAVITY_ADDITIONAL_MODEL_SLUGS: ReadonlySet<string> = new Set(
+  ANTIGRAVITY_ADDITIONAL_MODELS.map((model) => model.slug),
+);
+
+export function isSupportedAntigravityModel(
+  model: string,
+  options: ReadonlyArray<{ readonly value: string }>,
+): boolean {
+  return (
+    options.some((option) => option.value === model) ||
+    ANTIGRAVITY_ADDITIONAL_MODEL_SLUGS.has(model)
+  );
+}
+
 export function antigravityModelOptions(
   configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>,
 ) {
@@ -126,7 +183,7 @@ export function resolveAntigravityModel(input: {
   const current = modelConfig?.type === "select" ? modelConfig.currentValue : undefined;
   if (input.model && input.model !== ANTIGRAVITY_DEFAULT_MODEL) return input.model;
   const options = antigravityModelOptions(input.configOptions);
-  return input.defaultModel && options.some((option) => option.value === input.defaultModel)
+  return input.defaultModel && isSupportedAntigravityModel(input.defaultModel, options)
     ? input.defaultModel
     : current;
 }
@@ -157,7 +214,7 @@ export const applyAntigravityAcpModelSelection = Effect.fn("applyAntigravityAcpM
     const explicit = Boolean(input.model) && input.model !== ANTIGRAVITY_DEFAULT_MODEL;
     if (resolved === undefined || (!explicit && resolved === current)) return current;
     const options = antigravityModelOptions(configOptions);
-    if (!options.some((option) => option.value === resolved)) {
+    if (!isSupportedAntigravityModel(resolved, options)) {
       return yield* Effect.fail(
         input.mapError(
           EffectAcpErrors.AcpRequestError.invalidParams(
@@ -377,7 +434,7 @@ export const buildAntigravityPrompt = Effect.fn("buildAntigravityPrompt")(functi
       });
       if (decoded.includes("\0")) {
         return yield* EffectAcpErrors.AcpRequestError.invalidParams(
-          `Attachment '${attachment.name}' contains binary data.`,
+          `Attachment '${attachment.name}' contains binary data.` as const,
         );
       }
       blocks.push({ type: "resource", resource: { uri, mimeType, text: decoded } });

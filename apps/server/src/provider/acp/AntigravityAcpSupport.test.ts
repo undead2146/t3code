@@ -14,9 +14,11 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import {
+  ANTIGRAVITY_ADDITIONAL_MODEL_SLUGS,
   antigravityPermissionMode,
   applyAntigravityAcpModelSelection,
   buildAntigravityPrompt,
+  isSupportedAntigravityModel,
 } from "./AntigravityAcpSupport.ts";
 
 const modelConfig = {
@@ -168,6 +170,58 @@ describe("applyAntigravityAcpModelSelection", () => {
       expect(error).toEqual({ operation: "select-model", cause: nativeError });
     }),
   );
+
+  it.effect(
+    "allows selecting supported Claude models even when omitted from native config options",
+    () =>
+      Effect.gen(function* () {
+        const { runtime, selections } = makeModelRuntime([modelConfig]);
+        const model = yield* applyAntigravityAcpModelSelection({
+          runtime,
+          model: "claude-opus-5-5-high",
+          mapError: (cause) => cause,
+        });
+
+        expect(model).toBe("claude-opus-5-5-high");
+        expect(selections).toEqual(["claude-opus-5-5-high"]);
+      }),
+  );
+
+  it.effect(
+    "allows selecting Claude Sonnet models even when omitted from native config options",
+    () =>
+      Effect.gen(function* () {
+        const { runtime, selections } = makeModelRuntime([modelConfig]);
+        const model = yield* applyAntigravityAcpModelSelection({
+          runtime,
+          model: "claude-sonnet-5-5-high",
+          mapError: (cause) => cause,
+        });
+
+        expect(model).toBe("claude-sonnet-5-5-high");
+        expect(selections).toEqual(["claude-sonnet-5-5-high"]);
+      }),
+  );
+});
+
+describe("isSupportedAntigravityModel", () => {
+  it("recognizes all additional Claude models", () => {
+    for (const slug of ANTIGRAVITY_ADDITIONAL_MODEL_SLUGS) {
+      expect(isSupportedAntigravityModel(slug, [])).toBe(true);
+    }
+  });
+
+  it("recognizes native options", () => {
+    expect(
+      isSupportedAntigravityModel("gemini-default", [
+        { value: "gemini-default", name: "Gemini Default" },
+      ]),
+    ).toBe(true);
+  });
+
+  it("rejects unknown arbitrary models", () => {
+    expect(isSupportedAntigravityModel("some-fake-model", [])).toBe(false);
+  });
 });
 
 describe("antigravityPermissionMode", () => {

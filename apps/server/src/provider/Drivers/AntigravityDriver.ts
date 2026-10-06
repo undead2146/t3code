@@ -37,6 +37,7 @@ import {
   type AntigravityAuthConfig,
 } from "../antigravityAuthSupport.ts";
 import {
+  ANTIGRAVITY_ADDITIONAL_MODELS,
   makeAntigravityAcpRuntime,
   type AntigravityAcpRuntimeInput,
 } from "../acp/AntigravityAcpSupport.ts";
@@ -146,9 +147,26 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
       // folds the rest under its legacy section, as it does for Codex.
       const classifyModels = (draft: ServerProviderDraft) =>
         modelManifest.current.pipe(
-          Effect.map((manifest) =>
-            stampIdentity(ModelManifest.applyModelManifest(draft, manifest, DRIVER)),
-          ),
+          Effect.map((manifest) => {
+            if (draft.models.length === 0) {
+              return stampIdentity(ModelManifest.applyModelManifest(draft, manifest, DRIVER));
+            }
+            const seen = new Set(draft.models.map((m) => m.slug));
+            const augmentedModels = [...draft.models];
+            for (const extra of ANTIGRAVITY_ADDITIONAL_MODELS) {
+              if (!seen.has(extra.slug)) {
+                seen.add(extra.slug);
+                augmentedModels.push(extra);
+              }
+            }
+            return stampIdentity(
+              ModelManifest.applyModelManifest(
+                { ...draft, models: augmentedModels },
+                manifest,
+                DRIVER,
+              ),
+            );
+          }),
         );
 
       const makeRuntime = Effect.fn("AntigravityDriver.makeRuntime")(function* (
