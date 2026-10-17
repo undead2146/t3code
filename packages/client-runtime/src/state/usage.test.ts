@@ -8,12 +8,17 @@ import {
   type UsageSummary,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type { EnvironmentPresentation } from "../connection/presentation.ts";
 import { EnvironmentRpcUnavailableError } from "../rpc/client.ts";
-import { needsCursorKeychainAccess, refreshUsage, refreshUsageLimits } from "./usage.ts";
+import {
+  cursorKeychainAccessEnvironments,
+  needsCursorKeychainAccess,
+  refreshUsage,
+  refreshUsageLimits,
+} from "./usage.ts";
 
 const input = {
   sinceDay: UsageDay.make("2026-09-05"),
@@ -70,6 +75,8 @@ function harness(ids = ["a"]) {
         get(environmentId).query,
       refreshUsageRates: {
         label: "test:rates",
+        requiredScopes: () => [],
+        permissionAtom: () => Atom.make(true),
         run: (
           _registry: AtomRegistry.AtomRegistry,
           { environmentId }: { environmentId: EnvironmentId },
@@ -284,5 +291,35 @@ describe("needsCursorKeychainAccess", () => {
     expect(needsCursorKeychainAccess(cursorPrompt, [])).toBe(false);
     expect(needsCursorKeychainAccess(cursorPrompt, null)).toBe(false);
     expect(needsCursorKeychainAccess(summary, [cursor("ready")])).toBe(false);
+  });
+
+  it("stops offering access once any environment reads the Cursor account", () => {
+    const off = { summary: cursorPrompt, needsCursorKeychainAccess: true };
+    const account: UsageSummary = {
+      ...summary,
+      sources: [
+        {
+          fingerprint: {
+            hostId: "cursor.com",
+            provider: "cursor",
+            resolvedHomePath: "cursor-account:abc",
+            volumeId: "abc",
+          },
+          status: "ok",
+          scannedFiles: 1,
+          skippedFiles: 0,
+          malformedRecords: 0,
+          distinctSessions: 1,
+          message: null,
+        },
+      ],
+    };
+    expect(cursorKeychainAccessEnvironments([off, off])).toEqual([off, off]);
+    expect(
+      cursorKeychainAccessEnvironments([
+        off,
+        { summary: account, needsCursorKeychainAccess: false },
+      ]),
+    ).toEqual([]);
   });
 });

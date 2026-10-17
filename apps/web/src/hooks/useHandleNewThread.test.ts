@@ -4,6 +4,7 @@ import type { RuntimeMode } from "@t3tools/contracts";
 const testState = vi.hoisted(() => {
   let completeProjectFileRead: (value: null) => void = () => undefined;
   let projectFileRead = Promise.resolve<null>(null);
+  let projectRemoved = false;
   let targetSettings = {
     defaultThreadEnvMode: "local" as "local" | "worktree",
     newWorktreesStartFromOrigin: false,
@@ -16,10 +17,6 @@ const testState = vi.hoisted(() => {
     readonly promotedTo: null;
     readonly threadId: string;
   } | null = null;
-  let activeRouteTarget: { readonly kind: "draft"; readonly draftId: string } | null = null;
-  let activeDraftSession: Record<string, unknown> | null = null;
-  let threadShell: Record<string, unknown> | null = null;
-  const markPromotedDraftThreadByRef = vi.fn();
   const router = {
     state: {
       location: { href: "/" },
@@ -32,7 +29,7 @@ const testState = vi.hoisted(() => {
   const draftStore = {
     getComposerDraft: vi.fn(() => ({})),
     getDraftSessionByLogicalProjectKey: vi.fn(() => storedDraft),
-    getDraftSession: vi.fn(() => activeDraftSession),
+    getDraftSession: vi.fn(() => null),
     getDraftThread: vi.fn(() => null),
     applyStickyState: vi.fn(),
     setDraftThreadContext: vi.fn(),
@@ -43,27 +40,14 @@ const testState = vi.hoisted(() => {
   return {
     completeProjectFileRead: (value: null) => completeProjectFileRead(value),
     draftStore,
-    markPromotedDraftThreadByRef,
-    get activeRouteTarget() {
-      return activeRouteTarget;
-    },
-    set activeRouteTarget(value: typeof activeRouteTarget) {
-      activeRouteTarget = value;
-    },
-    get activeDraftSession() {
-      return activeDraftSession;
-    },
-    set activeDraftSession(value: typeof activeDraftSession) {
-      activeDraftSession = value;
-    },
-    get threadShell() {
-      return threadShell;
-    },
-    set threadShell(value: typeof threadShell) {
-      threadShell = value;
-    },
     get projectFileRead() {
       return projectFileRead;
+    },
+    get projectRemoved() {
+      return projectRemoved;
+    },
+    removeProject() {
+      projectRemoved = true;
     },
     get targetSettings() {
       return targetSettings;
@@ -76,9 +60,7 @@ const testState = vi.hoisted(() => {
       },
     ) {
       storedDraft = nextStoredDraft;
-      activeRouteTarget = null;
-      activeDraftSession = null;
-      threadShell = null;
+      projectRemoved = false;
       targetSettings = {
         defaultThreadEnvMode: workspaceDefaults.envMode,
         newWorktreesStartFromOrigin: workspaceDefaults.startFromOrigin,
@@ -87,7 +69,6 @@ const testState = vi.hoisted(() => {
       };
       router.state.location.href = "/";
       router.navigate.mockClear();
-      markPromotedDraftThreadByRef.mockClear();
       draftStore.setDraftThreadContext.mockClear();
       draftStore.setLogicalProjectDraftThreadId.mockClear();
       projectFileRead = new Promise<null>((resolve) => {
@@ -125,9 +106,6 @@ vi.mock("@t3tools/contracts", () => ({
   DEFAULT_SERVER_SETTINGS: {},
 }));
 vi.mock("@t3tools/shared/projectSettings", () => ({
-  // Environment settings pass through; the tests set project fields on the
-  // project record, which the hook still honors until the server folds them.
-  // With a file argument the env mode resolves like the real chain.
   resolveProjectSettings: (
     settings: Record<string, unknown>,
     _projectId: unknown,
@@ -145,6 +123,9 @@ vi.mock("@t3tools/shared/projectSettings", () => ({
     sources: { defaultModelSelection: "environment", defaultThreadEnvMode: "environment" },
     overrides: {},
   }),
+  resolveNewThreadEnvMode: (input: {
+    projectSettings: { settings: { defaultThreadEnvMode: "local" | "worktree" } };
+  }) => input.projectSettings.settings.defaultThreadEnvMode,
 }));
 vi.mock("@tanstack/react-router", () => ({
   useParams: () => null,
@@ -161,8 +142,7 @@ vi.mock("../composerDraftStore", () => {
   });
   return {
     composerDraftHasUserContent: () => false,
-    markPromotedDraftThreadByRef: (...args: unknown[]) =>
-      testState.markPromotedDraftThreadByRef(...args),
+    markPromotedDraftThreadByRef: vi.fn(),
     useComposerDraftStore,
   };
 });
@@ -183,27 +163,28 @@ vi.mock("../logicalProject", () => ({
   getProjectOrderKey: () => "remote-project",
   selectProjectGroupingSettings: () => ({}),
 }));
-vi.mock("../state/entities", () => ({
-  readProjects: () => [
-    {
-      id: "project-remote",
-      environmentId: "environment-ssh",
-      workspaceRoot: "/remote/project",
-      defaultThreadEnvMode: null,
-      defaultModelSelection: null,
-    },
-  ],
-  readThreadShell: () => testState.threadShell,
-  useProjects: () => [],
-  useThread: () => null,
-}));
+vi.mock("../state/entities", () => {
+  const project = {
+    id: "project-remote",
+    environmentId: "environment-ssh",
+    workspaceRoot: "/remote/project",
+    defaultThreadEnvMode: null,
+    defaultModelSelection: null,
+  };
+  return {
+    readProject: () => (testState.projectRemoved ? null : project),
+    readProjects: () => (testState.projectRemoved ? [] : [project]),
+    readThreadShell: () => null,
+    readThreadShells: () => [],
+    useProjects: () => [],
+    useThread: () => null,
+  };
+});
 vi.mock("../state/server", () => ({
   environmentServerConfigsAtom: {},
   primaryServerSettingsAtom: "primary-settings",
 }));
-vi.mock("../threadRoutes", () => ({
-  resolveThreadRouteTarget: () => testState.activeRouteTarget,
-}));
+vi.mock("../threadRoutes", () => ({ resolveThreadRouteTarget: () => null }));
 vi.mock("../uiStateStore", () => ({
   legacyProjectCwdPreferenceKey: () => "remote-project",
   useUiStateStore: () => [],
@@ -263,44 +244,19 @@ describe.each([
     expect(testState.draftStore.setLogicalProjectDraftThreadId).not.toHaveBeenCalled();
   });
 
-  it("mints a fresh draft when the current route draft thread already exists on the server", async () => {
-    const existingDraft = {
-      draftId: "draft-existing",
-      environmentId: "environment-ssh",
-      projectId: "project-remote",
-      logicalProjectKey: "remote-project",
-      promotedTo: null,
-      threadId: "thread-existing",
-      createdAt: "2026-03-29T00:00:00.000Z",
-      runtimeMode: "default",
-      interactionMode: "default",
-    };
-    testState.reset(null);
-    testState.activeRouteTarget = { kind: "draft", draftId: "draft-existing" };
-    testState.activeDraftSession = existingDraft;
-    testState.threadShell = {
-      environmentId: "environment-ssh",
-      id: "thread-existing",
-      title: "Existing",
-    } as never;
+  it("abandons a delayed draft open when the project is removed meanwhile", async () => {
+    testState.reset(draft);
+    const pendingOpen = useNewThreadHandler()(
+      { environmentId: "environment-ssh", projectId: "project-remote" } as never,
+      { replace: true },
+    );
 
-    const openThread = useNewThreadHandler();
+    testState.removeProject();
     testState.completeProjectFileRead(null);
-    const result = await openThread({
-      environmentId: "environment-ssh",
-      projectId: "project-remote",
-    } as never);
 
-    expect(testState.markPromotedDraftThreadByRef).toHaveBeenCalledWith({
-      environmentId: "environment-ssh",
-      threadId: "thread-existing",
-    });
-    expect(result).toEqual({ draftId: "draft-delayed", threadId: "thread-delayed" });
-    expect(testState.router.navigate).toHaveBeenCalledWith({
-      to: "/draft/$draftId",
-      params: { draftId: "draft-delayed" },
-      replace: false,
-    });
+    await expect(pendingOpen).resolves.toBeNull();
+    expect(testState.router.navigate).not.toHaveBeenCalled();
+    expect(testState.draftStore.setLogicalProjectDraftThreadId).not.toHaveBeenCalled();
   });
 
   it.each([true, false])(

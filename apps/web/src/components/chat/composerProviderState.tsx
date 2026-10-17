@@ -1,5 +1,6 @@
 import {
   type ModelCapabilities,
+  type ModelSelection,
   type ProviderDriverKind,
   type ProviderInstanceId,
   type ProviderOptionSelection,
@@ -48,6 +49,7 @@ type TraitsRenderInput = {
   model: string;
   models: ReadonlyArray<ServerProviderModel>;
   modelOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
+  reportedModelSelection?: ModelSelection | null | undefined;
   prompt: string;
   onPromptChange: (prompt: string) => void;
   planModeEnabled: boolean;
@@ -64,9 +66,6 @@ export function getComposerPromptInjectionState(prompt: string): ComposerPromptI
 /**
  * Cursor ACP can report `fastMode: true` as the provider default. T3 only
  * treats Fast as selected when the user chose it (draft/sticky/settings).
- * Otherwise inject an explicit `false` so new chats stay Normal and the
- * send path can overwrite a prior Fast session — descriptor defaults are
- * otherwise omitted by `buildExplicitProviderOptionSelectionsFromDescriptors`.
  */
 export function withImplicitFastModeDefault(
   caps: ModelCapabilities,
@@ -170,6 +169,7 @@ function renderTraitsControl(
     model,
     models,
     modelOptions,
+    reportedModelSelection,
     prompt,
     onPromptChange,
     planModeEnabled,
@@ -208,6 +208,7 @@ function renderTraitsControl(
       {...(draftId ? { draftId } : {})}
       model={model}
       modelOptions={resolvedModelOptions}
+      reportedModelSelection={reportedModelSelection}
       prompt={prompt}
       onPromptChange={onPromptChange}
       planModeEnabled={planModeEnabled}
