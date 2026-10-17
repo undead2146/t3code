@@ -64,6 +64,7 @@ export const MuseDriver: ProviderDriver<MuseSettings, MuseDriverEnv> = {
       const { cwd } = yield* ServerConfig.ServerConfig;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const processEnv = mergeProviderInstanceEnvironment(environment);
       const effectiveConfig = { ...config, enabled };
@@ -96,6 +97,8 @@ export const MuseDriver: ProviderDriver<MuseSettings, MuseDriverEnv> = {
           buildInitialMuseProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
         checkProvider: checkMuseProviderStatus(effectiveConfig, processEnv, cwd).pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
           Effect.map(stampIdentity),
         ),
       });

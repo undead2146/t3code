@@ -846,4 +846,18 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
       expect(yield* fs.exists(path.join(destSkill, "SKILL.md"))).toBe(true);
     }),
   );
+
+  it.effect("defaults tempDirectory to a short path on Windows to avoid MAX_PATH limits", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const temporaryDirectory = yield* fs.makeTempDirectoryScoped();
+      const profile = yield* prepareAntigravityProfile({
+        profileDirectory: path.join(temporaryDirectory, "profile"),
+        platform: "win32",
+      });
+      expect(profile.tempDirectory).toContain("t3-agy");
+      expect(profile.tempDirectory.length).toBeLessThan(profile.acpDirectory.length);
+    }),
+  );
 });

@@ -13,7 +13,9 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import { HttpClient } from "effect/unstable/http";
@@ -24,7 +26,9 @@ import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import {
   AUTH_PROBE_TIMEOUT_MS,
   buildServerProvider,
+  cliProbeMissingMessage,
   COMPACT_SLASH_COMMAND,
+  diagnoseCliCommand,
   isCommandMissingCause,
   parseGenericCliVersion,
   providerModelsFromSettings,
@@ -370,7 +374,7 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
 ): Effect.fn.Return<
   ServerProviderDraft,
   never,
-  ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto
+  ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto | FileSystem.FileSystem | Path.Path
 > {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const fallbackModels = grokModelsFromSettings(grokSettings.customModels);
@@ -398,8 +402,16 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
 
   if (Result.isFailure(versionResult)) {
     const error = versionResult.failure;
+    const missing = isCommandMissingCause(error);
+    const command = grokSettings.binaryPath || "grok";
+    const diagnosis = missing
+      ? yield* diagnoseCliCommand(command, environment)
+      : { kind: "unknown" as const };
     yield* Effect.logWarning("Grok CLI health check failed.", {
       errorTag: error._tag,
+      ...(diagnosis.kind === "dangling-symlink"
+        ? { linkPath: diagnosis.linkPath, target: diagnosis.target }
+        : {}),
     });
     return buildServerProvider({
       presentation: GROK_PRESENTATION,
@@ -407,12 +419,17 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
       checkedAt,
       models: fallbackModels,
       probe: {
-        installed: !isCommandMissingCause(error),
+        installed: !missing,
         version: null,
         status: "error",
         auth: { status: "unknown" },
-        message: isCommandMissingCause(error)
-          ? "Grok CLI (`grok`) is not installed or not on PATH."
+        message: missing
+          ? cliProbeMissingMessage({
+              missingMessage: "Grok CLI (`grok`) is not installed or not on PATH.",
+              binaryLabel: `Grok CLI (\`${command}\`)`,
+              reinstallHint: "Reinstall the Grok CLI, then refresh the provider.",
+              diagnosis,
+            })
           : "Failed to execute Grok CLI health check.",
       },
     });

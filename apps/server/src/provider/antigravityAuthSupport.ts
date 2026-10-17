@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import type { AntigravityAuthMethod, ProviderInstanceId } from "@t3tools/contracts";
@@ -467,7 +468,9 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   const geminiHome = path.resolve(input.profileDirectory);
   const acpDirectory = path.join(geminiHome, "antigravity-acp");
   const configSkillsDirectory = path.join(geminiHome, "config", "skills");
-  const tempDirectory = input.tempDirectory ?? path.join(acpDirectory, "tmp");
+  const tempDirectory =
+    input.tempDirectory ??
+    (platform === "win32" ? path.join(NodeOS.tmpdir(), "t3-agy") : path.join(acpDirectory, "tmp"));
   const profile: AntigravityProfile = {
     platform,
     geminiHome,

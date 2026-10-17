@@ -1,20 +1,27 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import type { ModelCapabilities } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import {
+  cliProbeMissingMessage,
+  diagnoseCliCommand,
   isCommandMissingCause,
   parseGenericCliVersion,
   providerModelsFromSettings,
   spawnAndCollect,
 } from "./providerSnapshot.ts";
+
+const windowsHost = HostProcessPlatform.defaultValue() === "win32";
 
 const OPENCODE_CUSTOM_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [
@@ -178,4 +185,114 @@ describe("ProviderCommandNotFoundError", () => {
       expect(error.message).not.toContain("secret-token-value");
     });
   });
+});
+
+describe("cliProbeMissingMessage", () => {
+  it("keeps the driver's message when the binary is simply absent", () => {
+    expect(
+      cliProbeMissingMessage({
+        missingMessage: "Kiro CLI (`kiro-cli`) is not installed or not on PATH.",
+        binaryLabel: "Kiro CLI (`kiro-cli`)",
+        reinstallHint: "Reinstall the Kiro CLI, then refresh the provider.",
+        diagnosis: { kind: "missing" },
+      }),
+    ).toBe("Kiro CLI (`kiro-cli`) is not installed or not on PATH.");
+  });
+
+  it("names the link and its absent target for a dangling symlink", () => {
+    expect(
+      cliProbeMissingMessage({
+        missingMessage: "Cursor CLI command `cursor-agent` was not found.",
+        binaryLabel: "Cursor CLI command `cursor-agent`",
+        reinstallHint: "Reinstall the Cursor CLI, then refresh the provider.",
+        docsUrl: "https://cursor.com/docs/cli/installation",
+        diagnosis: {
+          kind: "dangling-symlink",
+          linkPath: "/usr/local/bin/cursor-agent",
+          target: "/home/ubuntu/.local/bin/cursor-agent",
+        },
+      }),
+    ).toBe(
+      "Cursor CLI command `cursor-agent` is broken: `/usr/local/bin/cursor-agent` is a symlink to " +
+        "`/home/ubuntu/.local/bin/cursor-agent`, which no longer exists. " +
+        "Reinstall the Cursor CLI, then refresh the provider. " +
+        "See https://cursor.com/docs/cli/installation.",
+    );
+  });
+});
+
+it.layer(NodeServices.layer)("diagnoseCliCommand", (it) => {
+  it.effect("reports a bare command missing from every PATH entry", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-cli-diagnosis-" });
+      expect(yield* diagnoseCliCommand("t3-definitely-not-a-cli", { PATH: dir })).toEqual({
+        kind: "missing",
+      });
+      expect(yield* diagnoseCliCommand("   ", { PATH: dir })).toEqual({ kind: "missing" });
+    }),
+  );
+
+  it.effect("reports an absolute path missing from disk", () =>
+    Effect.gen(function* () {
+      expect(
+        yield* diagnoseCliCommand("/definitely/not/installed/t3-cursor-agent", {
+          PATH: "/nonexistent",
+        }),
+      ).toEqual({ kind: "missing" });
+    }),
+  );
+
+  it.effect("finds a regular file on PATH", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-cli-diagnosis-" });
+      const binary = path.join(dir, "t3-fake-cli");
+      yield* fs.writeFileString(binary, "#!/bin/sh\nexit 0\n");
+      expect(yield* diagnoseCliCommand("t3-fake-cli", { PATH: dir })).toEqual({
+        kind: "found",
+        path: binary,
+      });
+    }),
+  );
+
+  // Symlink fixtures need elevated privileges on Windows.
+  it.effect.skipIf(windowsHost)("names a dangling symlink and its absent target", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-cli-diagnosis-" });
+      const linkPath = path.join(dir, "t3-dangling-cli");
+      const target = path.join(dir, "deleted-target", "t3-dangling-cli");
+      yield* fs.symlink(target, linkPath);
+      expect(yield* diagnoseCliCommand("t3-dangling-cli", { PATH: dir })).toEqual({
+        kind: "dangling-symlink",
+        linkPath,
+        target,
+      });
+      expect(yield* diagnoseCliCommand(linkPath, { PATH: "" })).toEqual({
+        kind: "dangling-symlink",
+        linkPath,
+        target,
+      });
+    }),
+  );
+
+  it.effect.skipIf(windowsHost)("prefers a working later PATH entry like execvp does", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const first = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-cli-diagnosis-a-" });
+      const second = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-cli-diagnosis-b-" });
+      yield* fs.symlink(path.join(first, "gone"), path.join(first, "t3-shadowed-cli"));
+      const binary = path.join(second, "t3-shadowed-cli");
+      yield* fs.writeFileString(binary, "#!/bin/sh\nexit 0\n");
+      expect(
+        yield* diagnoseCliCommand("t3-shadowed-cli", {
+          PATH: `${first}${path.sep === "\\" ? ";" : ":"}${second}`,
+        }),
+      ).toEqual({ kind: "found", path: binary });
+    }),
+  );
 });

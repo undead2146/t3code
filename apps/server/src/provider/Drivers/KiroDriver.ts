@@ -66,6 +66,8 @@ export const KiroDriver: ProviderDriver<KiroSettings, KiroDriverEnv> = {
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettingsService;
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
       const eventLoggers = yield* ProviderEventLoggers;
       const processEnv = mergeProviderInstanceEnvironment(environment);
       const effectiveConfig = { ...config, enabled };
@@ -99,6 +101,8 @@ export const KiroDriver: ProviderDriver<KiroSettings, KiroDriverEnv> = {
           buildInitialKiroProviderSnapshot(settings.provider).pipe(Effect.map(stampIdentity)),
         checkProvider: checkKiroProviderStatus(effectiveConfig, processEnv).pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
           Effect.map(stampIdentity),
         ),
       });

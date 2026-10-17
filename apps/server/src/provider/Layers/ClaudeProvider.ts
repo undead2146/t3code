@@ -25,8 +25,10 @@ import {
 
 import {
   buildServerProvider,
+  cliProbeMissingMessage,
   COMPACT_SLASH_COMMAND,
   DEFAULT_TIMEOUT_MS,
+  diagnoseCliCommand,
   isCommandMissingCause,
   parseGenericCliVersion,
   providerModelsFromSettings,
@@ -466,8 +468,15 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
 
   if (Result.isFailure(versionProbe)) {
     const error = versionProbe.failure;
+    const missing = isCommandMissingCause(error);
+    const diagnosis = missing
+      ? yield* diagnoseCliCommand(claudeSettings.binaryPath, resolvedEnvironment)
+      : { kind: "unknown" as const };
     yield* Effect.logWarning("Claude Agent CLI health check failed.", {
       errorTag: error._tag,
+      ...(diagnosis.kind === "dangling-symlink"
+        ? { linkPath: diagnosis.linkPath, target: diagnosis.target }
+        : {}),
     });
     return buildServerProvider({
       presentation: CLAUDE_PRESENTATION,
@@ -475,12 +484,17 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
       checkedAt,
       models: allModels,
       probe: {
-        installed: !isCommandMissingCause(error),
+        installed: !missing,
         version: null,
         status: "error",
         auth: { status: "unknown" },
-        message: isCommandMissingCause(error)
-          ? "Claude Agent CLI (`claude`) was not found on PATH."
+        message: missing
+          ? cliProbeMissingMessage({
+              missingMessage: "Claude Agent CLI (`claude`) was not found on PATH.",
+              binaryLabel: `Claude Agent CLI (\`${claudeSettings.binaryPath}\`)`,
+              reinstallHint: "Reinstall the Claude Agent CLI, then refresh the provider.",
+              diagnosis,
+            })
           : "Failed to execute Claude Agent CLI health check.",
       },
     });

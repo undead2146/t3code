@@ -730,6 +730,39 @@ describe("checkCursorProviderStatus", () => {
     });
   });
 
+  // Symlink fixtures need elevated privileges on Windows.
+  it.skipIf(windowsHost)(
+    "names the broken link when the Cursor CLI is a dangling symlink",
+    async () => {
+      const { provider, linkPath, target } = await runNode(
+        Effect.gen(function* () {
+          const fileSystem = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const dir = yield* fileSystem.makeTempDirectory({
+            directory: NodeOS.tmpdir(),
+            prefix: "cursor-dangling-cli-",
+          });
+          const linkPath = path.join(dir, "cursor-agent");
+          const target = path.join(dir, "removed", "cursor-agent");
+          yield* fileSystem.symlink(target, linkPath);
+          const provider = yield* checkCursorProviderStatus({
+            enabled: true,
+            binaryPath: linkPath,
+            apiEndpoint: "",
+            customModels: [],
+          });
+          return { provider, linkPath, target };
+        }),
+      );
+
+      expect(provider.installed).toBe(false);
+      expect(provider.status).toBe("error");
+      expect(provider.message).toContain("is broken");
+      expect(provider.message).toContain(linkPath);
+      expect(provider.message).toContain(target);
+    },
+  );
+
   it("passes the injected environment to ACP model discovery", async () => {
     const { requestLogPath, wrapperPath } = await runNode(makeProviderStatusEnvFixture());
 

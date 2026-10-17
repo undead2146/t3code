@@ -2395,11 +2395,16 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           sessionScope = yield* Scope.make("sequential");
         }
 
-        yield* prewarm(cwd).pipe(
-          Effect.provideService(Scope.Scope, ownerScope),
-          Effect.ignore,
-          Effect.forkIn(ownerScope),
-        );
+        // Replenish warm standby immediately if we just claimed it.
+        // For cold starts, defer prewarm until this session is ready to prevent
+        // competing PyInstaller extractions from exceeding the start timeout.
+        if (usedStandby) {
+          yield* prewarm(cwd).pipe(
+            Effect.provideService(Scope.Scope, ownerScope),
+            Effect.ignore,
+            Effect.forkIn(ownerScope),
+          );
+        }
 
         let transferred = false;
         let context: SessionContext | undefined;
@@ -2558,6 +2563,13 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
           });
           yield* runtime.setMode(antigravityPermissionMode(input.runtimeMode));
           yield* options.onSessionStarted?.(started, cwd) ?? Effect.void;
+          if (!usedStandby) {
+            yield* prewarm(cwd).pipe(
+              Effect.provideService(Scope.Scope, ownerScope),
+              Effect.ignore,
+              Effect.forkIn(ownerScope),
+            );
+          }
           const createdAt = yield* nowIso;
           const session: ProviderSession = {
             provider: PROVIDER,

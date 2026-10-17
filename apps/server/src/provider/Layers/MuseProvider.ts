@@ -20,6 +20,8 @@ import {
 } from "../muse/MuseModels.ts";
 import {
   buildServerProvider,
+  cliProbeMissingMessage,
+  diagnoseCliCommand,
   providerModelsFromSettings,
   spawnAndCollect,
 } from "../providerSnapshot.ts";
@@ -156,24 +158,40 @@ export const checkMuseProviderStatus = Effect.fn("checkMuseProviderStatus")(func
   }).pipe(Effect.timeout("10 seconds"), Effect.scoped);
   return yield* probe.pipe(
     Effect.catch((error) =>
-      Effect.logWarning("Muse Code provider probe failed.", { errorTag: error._tag }).pipe(
-        Effect.as(
-          buildServerProvider({
-            presentation: PRESENTATION,
-            enabled: true,
-            checkedAt,
-            models: providerModelsFromSettings(DEFAULT_MODELS, settings.customModels, CAPABILITIES),
-            probe: {
-              installed: false,
-              version: null,
-              status: "error",
-              auth: { status: "unknown" },
-              message:
-                "Could not connect to Muse Code. Install and sign in to a build supporting muse serve.",
-            },
-          }),
-        ),
-      ),
+      Effect.gen(function* () {
+        // The SDK handshake swallows spawn failures (dangling symlinks and
+        // deleted binaries all surface as a generic connection error), so ask
+        // the filesystem what actually happened before rendering the message.
+        const command = settings.binaryPath || "muse";
+        const diagnosis = yield* diagnoseCliCommand(command, environment);
+        yield* Effect.logWarning("Muse Code provider probe failed.", {
+          errorTag: error._tag,
+          ...(diagnosis.kind === "dangling-symlink"
+            ? { linkPath: diagnosis.linkPath, target: diagnosis.target }
+            : {}),
+        });
+        return buildServerProvider({
+          presentation: PRESENTATION,
+          enabled: true,
+          checkedAt,
+          models: providerModelsFromSettings(DEFAULT_MODELS, settings.customModels, CAPABILITIES),
+          probe: {
+            installed: diagnosis.kind === "found",
+            version: null,
+            status: "error",
+            auth: { status: "unknown" },
+            message:
+              diagnosis.kind === "missing" || diagnosis.kind === "dangling-symlink"
+                ? cliProbeMissingMessage({
+                    missingMessage: "Muse CLI (`muse`) is not installed or not on PATH.",
+                    binaryLabel: `Muse CLI (\`${command}\`)`,
+                    reinstallHint: "Reinstall Muse Code, then refresh the provider.",
+                    diagnosis,
+                  })
+                : "Could not connect to Muse Code. Install and sign in to a build supporting muse serve.",
+          },
+        });
+      }),
     ),
   );
 });

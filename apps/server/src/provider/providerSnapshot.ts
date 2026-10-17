@@ -11,7 +11,11 @@ import type {
   ServerProviderUsageLimits,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
@@ -87,6 +91,139 @@ export function nonEmptyTrimmed(value: string | undefined): string | undefined {
 export function isCommandMissingCause(error: unknown): boolean {
   if (isProviderCommandNotFoundError(error)) return true;
   return error instanceof PlatformError.PlatformError && error.reason._tag === "NotFound";
+}
+
+const isNotFoundError = (error: unknown): boolean =>
+  error instanceof PlatformError.PlatformError && error.reason._tag === "NotFound";
+
+/**
+ * Why a provider CLI failed to spawn with a missing-command error.
+ *
+ * A bare `spawn ENOENT` cannot tell "never installed" apart from "was
+ * installed, then deleted" — and on posix it cannot even tell a missing
+ * binary apart from a dangling symlink on PATH (both surface as ENOENT).
+ * Probes run this diagnosis in their missing-command branch so the snapshot
+ * message names the actual filesystem state instead of guessing.
+ */
+export type CliCommandDiagnosis =
+  | { readonly kind: "missing" }
+  | { readonly kind: "dangling-symlink"; readonly linkPath: string; readonly target: string }
+  | { readonly kind: "found"; readonly path: string }
+  | { readonly kind: "unknown" };
+
+const diagnoseCliCandidate = (
+  candidatePath: string,
+): Effect.Effect<CliCommandDiagnosis, never, FileSystem.FileSystem> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    // `readLink` succeeds only for symlinks; the following `stat` (which
+    // follows links) then separates a healthy link from a dangling one.
+    const linkTarget = yield* fs.readLink(candidatePath).pipe(Effect.option);
+    const statResult = yield* fs.stat(candidatePath).pipe(Effect.result);
+    if (Result.isSuccess(statResult)) {
+      return { kind: "found", path: candidatePath } as const;
+    }
+    const statError = statResult.failure;
+    if (Option.isSome(linkTarget) && isNotFoundError(statError)) {
+      return {
+        kind: "dangling-symlink",
+        linkPath: candidatePath,
+        target: linkTarget.value,
+      } as const;
+    }
+    if (Option.isNone(linkTarget) && isNotFoundError(statError)) {
+      return { kind: "missing" } as const;
+    }
+    return { kind: "unknown" } as const;
+  });
+
+const WINDOWS_EXECUTABLE_EXTENSIONS = [".exe", ".cmd", ".bat", ".com", ".ps1"] as const;
+
+/**
+ * Resolve `command` the way the OS spawner does and report what the
+ * filesystem says. Bare names are searched across `environment.PATH` in
+ * order; anything containing a separator is examined directly.
+ *
+ * The scan mimics `execvp` selection: the first `found` candidate wins even
+ * when an earlier directory holds a dangling link, because the spawner skips
+ * past ENOENT entries. Total: every unexpected failure collapses to
+ * `missing` (nothing matched) or `unknown` so probes never fail to report.
+ */
+export const diagnoseCliCommand = (
+  command: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): Effect.Effect<CliCommandDiagnosis, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const path = yield* Path.Path;
+    const trimmed = command.trim();
+    if (trimmed.length === 0) {
+      return { kind: "missing" } as const;
+    }
+    const isPathLike = trimmed.includes("/") || trimmed.includes("\\") || path.isAbsolute(trimmed);
+    // Effect's `Path` service exposes no `delimiter`; the separator implies it (`\` only on Windows).
+    const isWindowsPaths = path.sep === "\\";
+    const pathDelimiter = isWindowsPaths ? ";" : ":";
+    const directories = isPathLike
+      ? []
+      : (environment.PATH ?? process.env.PATH ?? "")
+          .split(pathDelimiter)
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.length > 0);
+    const candidates = isPathLike
+      ? [trimmed]
+      : directories.map((directory) => path.join(directory, trimmed));
+    const withWindowsFallbacks =
+      isWindowsPaths && !isPathLike
+        ? candidates.flatMap((candidate) => [
+            candidate,
+            ...WINDOWS_EXECUTABLE_EXTENSIONS.map((extension) => `${candidate}${extension}`),
+          ])
+        : candidates;
+    let sawUnknown = false;
+    let firstDangling: Extract<CliCommandDiagnosis, { kind: "dangling-symlink" }> | undefined;
+    for (const candidate of withWindowsFallbacks) {
+      const diagnosis = yield* diagnoseCliCandidate(candidate);
+      if (diagnosis.kind === "found") {
+        return diagnosis;
+      }
+      if (diagnosis.kind === "dangling-symlink") {
+        firstDangling ??= diagnosis;
+      } else if (diagnosis.kind === "unknown") {
+        sawUnknown = true;
+      }
+    }
+    if (firstDangling !== undefined) {
+      return firstDangling;
+    }
+    return sawUnknown ? ({ kind: "unknown" } as const) : ({ kind: "missing" } as const);
+  });
+
+export interface CliProbeMissingMessageInput {
+  /** The driver's existing "not installed" sentence, kept when nothing on PATH explains the failure. */
+  readonly missingMessage: string;
+  /** Short CLI label, e.g. "Kiro CLI (`kiro-cli`)". */
+  readonly binaryLabel: string;
+  /** Remediation, e.g. "Reinstall the Kiro CLI, then refresh the provider." */
+  readonly reinstallHint: string;
+  readonly docsUrl?: string | undefined;
+  readonly diagnosis: CliCommandDiagnosis;
+}
+
+/**
+ * Render the probe message for a missing-command failure. A dangling
+ * symlink gets its own sentence naming the link and its absent target —
+ * the plain "not found / check PATH" text actively misleads there, since
+ * the command *is* on PATH and only its target is gone.
+ */
+export function cliProbeMissingMessage(input: CliProbeMissingMessageInput): string {
+  if (input.diagnosis.kind === "dangling-symlink") {
+    const docs = input.docsUrl ? ` See ${input.docsUrl}.` : "";
+    return (
+      `${input.binaryLabel} is broken: \`${input.diagnosis.linkPath}\` is a symlink to ` +
+      `\`${input.diagnosis.target}\`, which no longer exists. ${input.reinstallHint}${docs}`
+    );
+  }
+  return input.missingMessage;
 }
 
 export const spawnAndCollect = (binaryPath: string, command: ChildProcess.Command) =>

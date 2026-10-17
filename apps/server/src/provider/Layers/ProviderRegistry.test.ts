@@ -44,6 +44,7 @@ import * as OpenCodeRuntime from "../opencodeRuntime.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./ProviderInstanceRegistryHydration.ts";
 import {
+  detectProviderInstallRegression,
   mergeProviderSnapshot,
   upsertProviderWorkspaceSnapshot,
   ProviderRegistryLive,
@@ -1305,6 +1306,63 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               auth: { status: "unknown", type: "oauth-personal" },
             }).auth,
             signedIn.auth,
+          );
+        });
+      });
+
+      describe("detectProviderInstallRegression", () => {
+        const working = {
+          instanceId: ProviderInstanceId.make("cursor"),
+          driver: ProviderDriverKind.make("cursor"),
+          status: "ready",
+          enabled: true,
+          installed: true,
+          auth: { status: "authenticated" },
+          checkedAt: "2026-09-29T21:00:00.000Z",
+          version: "2026.09.28-64d2043",
+          models: [],
+          slashCommands: [],
+          skills: [],
+        } as const satisfies ServerProvider;
+
+        it("reports installed -> missing flips with the last-known version", () => {
+          assert.deepStrictEqual(
+            detectProviderInstallRegression(working, {
+              ...working,
+              status: "error",
+              installed: false,
+              version: null,
+              checkedAt: "2026-09-29T22:06:03.000Z",
+              message: "Cursor CLI command `cursor-agent` was not found.",
+            }),
+            {
+              instanceId: ProviderInstanceId.make("cursor"),
+              driver: ProviderDriverKind.make("cursor"),
+              previousVersion: "2026.09.28-64d2043",
+              previousCheckedAt: "2026-09-29T21:00:00.000Z",
+            },
+          );
+        });
+
+        it("stays quiet without a previous snapshot, while broken, or when disabled", () => {
+          const broken = {
+            ...working,
+            status: "error",
+            installed: false,
+            version: null,
+          } as const satisfies ServerProvider;
+          assert.equal(detectProviderInstallRegression(undefined, broken), undefined);
+          // Still broken on the next refresh: no repeat alarm.
+          assert.equal(detectProviderInstallRegression(broken, broken), undefined);
+          // Disabling an instance also clears `installed`; that is not a regression.
+          assert.equal(
+            detectProviderInstallRegression(working, { ...broken, enabled: false }),
+            undefined,
+          );
+          // Staying installed is not a regression either.
+          assert.equal(
+            detectProviderInstallRegression(working, { ...working, status: "warning" }),
+            undefined,
           );
         });
       });
@@ -2645,6 +2703,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                 "codex",
                 "cursor",
                 "grok",
+                "kiro",
                 "muse",
                 "opencode",
               ]);

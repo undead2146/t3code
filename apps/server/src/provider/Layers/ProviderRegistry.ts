@@ -233,6 +233,40 @@ const haveProvidersChanged = (
   nextProviders: ReadonlyArray<ServerProvider>,
 ): boolean => !Equal.equals(previousProviders, nextProviders);
 
+export interface ProviderInstallRegression {
+  readonly instanceId: ProviderInstanceId;
+  readonly driver: ProviderDriverKind;
+  readonly previousVersion: string | null;
+  readonly previousCheckedAt: string;
+}
+
+/**
+ * Detect a provider whose CLI was installed and working but now reports
+ * missing — the signature of a deleted binary or a broken PATH, not of a
+ * machine that never had the CLI. Disabled instances are excluded: their
+ * snapshots always carry `installed: false`, so toggling one off must not
+ * read as a regression.
+ */
+export const detectProviderInstallRegression = (
+  previousProvider: ServerProvider | undefined,
+  nextProvider: ServerProvider,
+): ProviderInstallRegression | undefined => {
+  if (
+    previousProvider === undefined ||
+    !previousProvider.installed ||
+    !nextProvider.enabled ||
+    nextProvider.installed
+  ) {
+    return undefined;
+  }
+  return {
+    instanceId: nextProvider.instanceId,
+    driver: nextProvider.driver,
+    previousVersion: previousProvider.version,
+    previousCheckedAt: previousProvider.checkedAt,
+  };
+};
+
 const correlateSnapshotWithSource = (
   source: ProviderSnapshotSource,
   snapshot: ServerProvider,
@@ -480,6 +514,29 @@ export const ProviderRegistryLive = Layer.effect(
       );
 
       if (haveProvidersChanged(previousProviders, providers)) {
+        // A CLI that probed installed and now reports missing means something
+        // outside T3 deleted or unlinked the binary. That must be impossible
+        // to miss in the logs, so it escalates past the probe's own warning.
+        // Gated on `haveProvidersChanged`: the follow-up refresh sees an
+        // already-broken previous snapshot and stays quiet.
+        const previousByInstance = new Map(
+          previousProviders.map((provider) => [snapshotInstanceKey(provider), provider] as const),
+        );
+        for (const nextProvider of providersToPersist) {
+          const regression = detectProviderInstallRegression(
+            previousByInstance.get(snapshotInstanceKey(nextProvider)),
+            nextProvider,
+          );
+          if (regression !== undefined) {
+            yield* Effect.logError("Provider CLI install regression detected.", {
+              instanceId: regression.instanceId,
+              driver: regression.driver,
+              previousVersion: regression.previousVersion ?? "unknown",
+              previousCheckedAt: regression.previousCheckedAt,
+              message: nextProvider.message ?? "no probe detail",
+            });
+          }
+        }
         if (options?.persist !== false) {
           yield* Effect.forEach(providersToPersist, persistProvider, {
             concurrency: "unbounded",

@@ -7,7 +7,9 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
@@ -17,6 +19,8 @@ import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import {
   AUTH_PROBE_TIMEOUT_MS,
   buildServerProvider,
+  cliProbeMissingMessage,
+  diagnoseCliCommand,
   isCommandMissingCause,
   parseGenericCliVersion,
   providerModelsFromSettings,
@@ -176,7 +180,11 @@ const runKiroCliCommand = (
 export const checkKiroProviderStatus = Effect.fn("checkKiroProviderStatus")(function* (
   kiroSettings: KiroSettings,
   environment: NodeJS.ProcessEnv = process.env,
-): Effect.fn.Return<ServerProviderDraft, never, ChildProcessSpawner.ChildProcessSpawner> {
+): Effect.fn.Return<
+  ServerProviderDraft,
+  never,
+  ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path
+> {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const fallbackModels = kiroModelsFromSettings(kiroSettings.customModels);
 
@@ -189,8 +197,16 @@ export const checkKiroProviderStatus = Effect.fn("checkKiroProviderStatus")(func
 
   if (Result.isFailure(versionResult)) {
     const error = versionResult.failure;
+    const missing = isCommandMissingCause(error);
+    const command = kiroSettings.binaryPath || "kiro-cli";
+    const diagnosis = missing
+      ? yield* diagnoseCliCommand(command, environment)
+      : { kind: "unknown" as const };
     yield* Effect.logWarning("Kiro CLI health check failed.", {
       errorTag: error._tag,
+      ...(diagnosis.kind === "dangling-symlink"
+        ? { linkPath: diagnosis.linkPath, target: diagnosis.target }
+        : {}),
     });
     return buildServerProvider({
       presentation: KIRO_PRESENTATION,
@@ -198,12 +214,17 @@ export const checkKiroProviderStatus = Effect.fn("checkKiroProviderStatus")(func
       checkedAt,
       models: fallbackModels,
       probe: {
-        installed: !isCommandMissingCause(error),
+        installed: !missing,
         version: null,
         status: "error",
         auth: { status: "unknown" },
-        message: isCommandMissingCause(error)
-          ? "Kiro CLI (`kiro-cli`) is not installed or not on PATH."
+        message: missing
+          ? cliProbeMissingMessage({
+              missingMessage: "Kiro CLI (`kiro-cli`) is not installed or not on PATH.",
+              binaryLabel: `Kiro CLI (\`${command}\`)`,
+              reinstallHint: "Reinstall the Kiro CLI, then refresh the provider.",
+              diagnosis,
+            })
           : "Failed to execute Kiro CLI health check.",
       },
     });

@@ -40,8 +40,10 @@ import {
   buildBooleanOptionDescriptor,
   buildSelectOptionDescriptor,
   buildServerProvider,
+  cliProbeMissingMessage,
   COMPACT_SLASH_COMMAND,
   collectStreamAsString,
+  diagnoseCliCommand,
   isCommandMissingCause,
   providerModelsFromSettings,
   type CommandResult,
@@ -1139,8 +1141,16 @@ export const checkCursorProviderStatus = Effect.fn("checkCursorProviderStatus")(
 
   if (Result.isFailure(aboutProbe)) {
     const error = aboutProbe.failure;
+    const missing = isCommandMissingCause(error);
+    const command = cursorSettings.binaryPath.trim() || "cursor-agent";
+    const diagnosis = missing
+      ? yield* diagnoseCliCommand(command, environment ?? process.env)
+      : { kind: "unknown" as const };
     yield* Effect.logWarning("Cursor Agent CLI health check failed.", {
       errorTag: error._tag,
+      ...(diagnosis.kind === "dangling-symlink"
+        ? { linkPath: diagnosis.linkPath, target: diagnosis.target }
+        : {}),
     });
     return buildServerProvider({
       presentation: CURSOR_PRESENTATION,
@@ -1148,12 +1158,18 @@ export const checkCursorProviderStatus = Effect.fn("checkCursorProviderStatus")(
       checkedAt,
       models: fallbackModels,
       probe: {
-        installed: !isCommandMissingCause(error),
+        installed: !missing,
         version: null,
         status: "error",
         auth: { status: "unknown" },
-        message: isCommandMissingCause(error)
-          ? buildCursorCliCommandMissingMessage(cursorSettings.binaryPath)
+        message: missing
+          ? cliProbeMissingMessage({
+              missingMessage: buildCursorCliCommandMissingMessage(cursorSettings.binaryPath),
+              binaryLabel: `Cursor CLI command \`${command}\``,
+              reinstallHint: "Reinstall the Cursor CLI, then refresh the provider.",
+              docsUrl: CURSOR_CLI_INSTALLATION_DOCS_URL,
+              diagnosis,
+            })
           : "Failed to execute Cursor Agent CLI health check.",
       },
     });

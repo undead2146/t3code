@@ -130,7 +130,7 @@ const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 // Longest a provider session start (spawn, handshake, resume) may take before
 // the turn start fails instead of leaving the thread "starting" indefinitely.
-const PROVIDER_SESSION_START_TIMEOUT = Duration.minutes(3);
+const PROVIDER_SESSION_START_TIMEOUT = Duration.minutes(5);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 
 function providerErrorLabel(value: string | undefined): string {

@@ -1,3 +1,5 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -486,6 +488,18 @@ export const make = (
         ),
       );
 
+    const killChildProcessTree = Effect.gen(function* () {
+      const pid = Number(child.pid);
+      if (process.platform === "win32" && !Number.isNaN(pid) && pid > 0) {
+        try {
+          NodeChildProcess.spawnSync("taskkill.exe", ["/pid", String(pid), "/t", "/f"], {
+            stdio: "ignore",
+          });
+        } catch {}
+      }
+      yield* child.kill({ forceKillAfter: "1 second" }).pipe(Effect.ignore);
+    });
+
     yield* child.stderr.pipe(
       Stream.decodeText(),
       Stream.runForEach((chunk) =>
@@ -497,7 +511,7 @@ export const make = (
             Effect.gen(function* () {
               yield* Deferred.fail(stderrFailure, error);
               yield* recordTermination(error);
-              yield* child.kill({ forceKillAfter: "1 second" }).pipe(Effect.ignore);
+              yield* killChildProcessTree;
             }),
           ),
         ),
@@ -603,7 +617,7 @@ export const make = (
         [
           Ref.set(stoppingRef, true),
           Deferred.succeed(runtimeClosed, undefined),
-          child.kill({ forceKillAfter: "1 second" }).pipe(Effect.ignore),
+          killChildProcessTree,
         ],
         { discard: true },
       ),
@@ -973,7 +987,7 @@ export const make = (
       error: EffectAcpErrors.AcpError,
     ) {
       yield* recordTermination(error);
-      yield* child.kill({ forceKillAfter: "1 second" }).pipe(Effect.ignore);
+      yield* killChildProcessTree;
     });
 
     const cancel = Effect.gen(function* () {

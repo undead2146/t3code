@@ -1,7 +1,9 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { KiroSettings } from "@t3tools/contracts";
 
@@ -14,6 +16,7 @@ import {
 import { writeFakeCli } from "../../testUtils/fakeCli.ts";
 
 const decodeKiroSettings = Schema.decodeSync(KiroSettings);
+const windowsHost = HostProcessPlatform.defaultValue() === "win32";
 
 const LOGGED_IN_WHOAMI = '{"accountType":"SocialGoogle","email":"dev@example.com"}\n';
 const LIST_MODELS_OUTPUT = JSON.stringify({
@@ -122,6 +125,29 @@ it.layer(NodeServices.layer)("checkKiroProviderStatus", (it) => {
       expect(snapshot.status).toBe("error");
       expect(snapshot.message).toMatch(/not installed|not on PATH|Failed to execute/);
     }),
+  );
+
+  // Symlink fixtures need elevated privileges on Windows.
+  it.effect.skipIf(windowsHost)(
+    "names the broken link when the binary path is a dangling symlink",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-kiro-dangling-" });
+        const linkPath = path.join(dir, "kiro-cli");
+        const target = path.join(dir, "removed", "kiro-cli");
+        yield* fs.symlink(target, linkPath);
+        const snapshot = yield* checkKiroProviderStatus(
+          decodeKiroSettings({ enabled: true, binaryPath: linkPath }),
+        );
+        expect(snapshot.installed).toBe(false);
+        expect(snapshot.status).toBe("error");
+        expect(snapshot.message).toContain("is broken");
+        expect(snapshot.message).toContain(linkPath);
+        expect(snapshot.message).toContain(target);
+        expect(snapshot.message).toContain("Reinstall the Kiro CLI");
+      }),
   );
 
   it.effect("reports ready with the CLI's models when logged in", () =>
