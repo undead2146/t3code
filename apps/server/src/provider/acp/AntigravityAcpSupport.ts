@@ -109,6 +109,30 @@ const EMPTY_MODEL_CAPABILITIES = createModelCapabilities({ optionDescriptors: []
 
 export const ANTIGRAVITY_ADDITIONAL_MODELS: ReadonlyArray<ServerProviderModel> = [
   {
+    slug: "gemini-4-argon",
+    name: "Gemini 4 Argon",
+    isCustom: false,
+    capabilities: EMPTY_MODEL_CAPABILITIES,
+  },
+  {
+    slug: "gemini-4-argon-high",
+    name: "Gemini 4 Argon (High)",
+    isCustom: false,
+    capabilities: EMPTY_MODEL_CAPABILITIES,
+  },
+  {
+    slug: "gemini-4-argon-medium",
+    name: "Gemini 4 Argon (Medium)",
+    isCustom: false,
+    capabilities: EMPTY_MODEL_CAPABILITIES,
+  },
+  {
+    slug: "gemini-4-argon-low",
+    name: "Gemini 4 Argon (Low)",
+    isCustom: false,
+    capabilities: EMPTY_MODEL_CAPABILITIES,
+  },
+  {
     slug: "claude-opus-5-5-high",
     name: "Claude Opus 5.5 (High)",
     isCustom: false,

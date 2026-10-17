@@ -202,10 +202,26 @@ describe("applyAntigravityAcpModelSelection", () => {
         expect(selections).toEqual(["claude-sonnet-5-5-high"]);
       }),
   );
+
+  it.effect(
+    "allows selecting Gemini 4 Argon models even when omitted from native config options",
+    () =>
+      Effect.gen(function* () {
+        const { runtime, selections } = makeModelRuntime([modelConfig]);
+        const model = yield* applyAntigravityAcpModelSelection({
+          runtime,
+          model: "gemini-4-argon-high",
+          mapError: (cause) => cause,
+        });
+
+        expect(model).toBe("gemini-4-argon-high");
+        expect(selections).toEqual(["gemini-4-argon-high"]);
+      }),
+  );
 });
 
 describe("isSupportedAntigravityModel", () => {
-  it("recognizes all additional Claude models", () => {
+  it("recognizes all additional models including Gemini 4 Argon and Claude", () => {
     for (const slug of ANTIGRAVITY_ADDITIONAL_MODEL_SLUGS) {
       expect(isSupportedAntigravityModel(slug, [])).toBe(true);
     }
