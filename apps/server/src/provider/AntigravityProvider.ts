@@ -126,6 +126,9 @@ interface AntigravityProviderOptions {
   readonly supportsTextGeneration: Effect.Effect<boolean>;
   readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
   readonly clearUsage?: Effect.Effect<void>;
+  readonly readCachedModels?: Effect.Effect<ReadonlyArray<ServerProviderModel>>;
+  readonly writeCachedModels?: (models: ReadonlyArray<ServerProviderModel>) => Effect.Effect<void>;
+  readonly checkAuthenticated?: Effect.Effect<boolean>;
   readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
   readonly auth?: { readonly type: string; readonly label: string };
 }
@@ -135,17 +138,28 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   options: AntigravityProviderOptions,
 ) {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
+  const cachedModels = options.readCachedModels
+    ? yield* options.readCachedModels.pipe(Effect.orElseSucceed(() => []))
+    : [];
+  const initialSavedAuth =
+    settings.enabled && options.checkAuthenticated
+      ? yield* options.checkAuthenticated.pipe(Effect.orElseSucceed(() => false))
+      : false;
   const initialDraft = {
     ...buildServerProvider({
       presentation: { displayName: "Antigravity", showInteractionModeToggle: false },
       enabled: settings.enabled,
       checkedAt,
-      models: [],
+      models: cachedModels,
       probe: {
         installed: false,
         version: null,
         status: "warning",
-        auth: { status: "unknown", ...(options.auth ? { type: options.auth.type } : {}) },
+        auth: {
+          status: initialSavedAuth ? "authenticated" : "unknown",
+          ...(options.auth ? { type: options.auth.type } : {}),
+          ...(initialSavedAuth && options.auth ? { label: options.auth.label } : {}),
+        },
         message: settings.enabled
           ? "Checking Antigravity availability."
           : "Antigravity is disabled in T3 Code settings.",
@@ -177,6 +191,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     );
     const initialized =
       Result.isSuccess(result) && Option.isSome(result.success) ? result.success.value : undefined;
+    const version = initialized?.agentInfo?.version;
     const failure = Result.isFailure(result) ? result.failure : undefined;
     const missingInstallation = failure !== undefined && isMissingInstallation(failure);
     const errorMessage =
@@ -191,13 +206,19 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
               : `Antigravity did not respond to its local health check within ${HEALTH_CHECK_TIMEOUT}.`;
     const supportsTextGeneration =
       initialized !== undefined ? yield* options.supportsTextGeneration : false;
+    const isSavedAuth =
+      initialized !== undefined && options.checkAuthenticated
+        ? yield* options.checkAuthenticated.pipe(Effect.orElseSucceed(() => false))
+        : false;
     const usageLimits =
       initialized !== undefined && options.probeUsage ? yield* options.probeUsage : undefined;
     const updatedAt = DateTime.formatIso(yield* DateTime.now);
     const next = yield* SubscriptionRef.updateAndGet(metadata, (state) => {
       if (state.authRevision !== before.authRevision) return state;
       const { message: _previousMessage, ...draft } = state.draft;
-      const authenticated = draft.auth.status === "authenticated";
+      const authenticated =
+        draft.auth.status === "authenticated" ||
+        (draft.auth.status !== "unauthenticated" && isSavedAuth);
       const message =
         errorMessage ??
         (authenticated
@@ -210,8 +231,17 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
         draft: {
           ...draft,
           installed: !missingInstallation,
-          version: initialized?.agentInfo?.version || draft.version,
+          // Custom launchers have no static version; their lightweight probe
+          // must not erase the version learned from a real ACP handshake.
+          version: version === "unknown" ? draft.version : version || draft.version,
           status: errorMessage ? "error" : authenticated ? "ready" : "warning",
+          auth: authenticated
+            ? {
+                status: "authenticated",
+                type: options.auth?.type ?? "oauth-personal",
+                label: options.auth?.label ?? "Google account",
+              }
+            : draft.auth,
           checkedAt: updatedAt,
           usageLimits: missingInstallation
             ? undefined
@@ -219,9 +249,9 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
                 published: draft.usageLimits,
                 probed: usageLimits ?? draft.usageLimits,
               }),
+          models: missingInstallation ? [] : draft.models.length > 0 ? draft.models : cachedModels,
           ...(missingInstallation
             ? {
-                models: [],
                 slashCommands: [],
                 skills: [],
                 workspaceSnapshots: [],
@@ -269,6 +299,10 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     if (!settings.enabled) return;
     const before = yield* SubscriptionRef.get(metadata);
     const supportsTextGeneration = yield* options.supportsTextGeneration;
+    const sessionModels = buildAntigravityModelsFromSession(started.sessionSetupResult);
+    if (options.writeCachedModels && sessionModels.length > 0) {
+      yield* options.writeCachedModels(sessionModels).pipe(Effect.ignore);
+    }
     const usageLimits =
       options.probeUsage && (!before.draft.usageLimits || before.draft.usageLimits.unavailable)
         ? yield* options.probeUsage
@@ -301,7 +335,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             published: draft.usageLimits,
             probed: usageLimits ?? draft.usageLimits,
           }),
-          models: buildAntigravityModelsFromSession(started.sessionSetupResult),
+          models: sessionModels,
           supportsTextGeneration,
           ...(cwd
             ? {

@@ -106,7 +106,7 @@ export const discoverMuseModels = Effect.fn("discoverMuseModels")(function* (
         ...(environment ? { environment } : {}),
         ...(cwd ? { cwd } : {}),
         readOnly: true,
-        startupTimeoutMs: 8_000,
+        startupTimeoutMs: 20_000,
       },
       createHost,
     ),
@@ -119,17 +119,40 @@ export const discoverMuseModels = Effect.fn("discoverMuseModels")(function* (
     return yield* new MuseCatalogError({ detail: "Muse returned a catalog for another provider." });
   }
   const seen = new Set<string>();
-  return catalog.models.flatMap((model): ServerProviderModel[] => {
+  const discovered = catalog.models.flatMap((model): ServerProviderModel[] => {
     if (model.providerId !== "meta" || seen.has(model.modelId)) return [];
     seen.add(model.modelId);
+    const label = model.displayLabel.trim() || model.modelId;
+    const name =
+      label === model.modelId && label.startsWith("muse-")
+        ? label.replaceAll("-", " ").replace(/\b[a-z]/g, (letter) => letter.toUpperCase())
+        : label;
     return [
       {
         slug: model.modelId,
-        name: model.displayLabel.trim() || model.modelId,
+        name,
         isCustom: false,
         isDefault: model.isDefault,
         capabilities: museModelCapabilities(model),
       },
     ];
   });
+  if (
+    seen.has("muse-wonder-1.0") &&
+    seen.has("muse-wonder-1.0-contributor") &&
+    !seen.has("muse-wonder-full-1.0")
+  ) {
+    const wonder = discovered.find((model) => model.slug === "muse-wonder-1.0");
+    if (wonder) {
+      const wonderIndex = discovered.indexOf(wonder);
+      discovered.splice(wonderIndex + 1, 0, {
+        slug: "muse-wonder-full-1.0",
+        name: "Muse Wonder Full 1.0",
+        isCustom: false,
+        isDefault: false,
+        capabilities: wonder.capabilities,
+      });
+    }
+  }
+  return discovered;
 });

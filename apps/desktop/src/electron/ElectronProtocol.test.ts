@@ -91,7 +91,7 @@ describe("ElectronProtocol", () => {
       const text = yield* Effect.promise(() => response.text());
       assert.include(text, "Web client bundle not found");
       assert.include(response.headers.get("content-type") ?? "", "text/html");
-    }).pipe(Effect.provide(Layer.merge(protocolLayer, NodeServices.layer)), Effect.scoped),
+    }).pipe(Effect.provide(Layer.merge(layerProtocol, NodeServices.layer)), Effect.scoped),
   );
 
   it.effect("falls back to secondary asset directory when primary lacks client bundle", () =>
@@ -122,7 +122,7 @@ describe("ElectronProtocol", () => {
       const script = yield* request("/bundle.js");
       assert.equal(script.status, 200);
       assert.equal(yield* Effect.promise(() => script.text()), "console.log('fallback');");
-    }).pipe(Effect.provide(Layer.merge(protocolLayer, NodeServices.layer)), Effect.scoped),
+    }).pipe(Effect.provide(Layer.merge(layerProtocol, NodeServices.layer)), Effect.scoped),
   );
 
   it.effect("proxies the stable renderer origin to the current app server", () =>

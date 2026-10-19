@@ -55,7 +55,7 @@ export class ElectronProtocolUnregistrationError extends Schema.TaggedError<Elec
 export type DesktopProtocolRegistrationInput = {
   readonly scheme: string;
   readonly clerkFrontendApiHostname: string | undefined;
-} & ({ readonly targetOrigin: URL } | { readonly assetDirectory: string });
+} & ({ readonly targetOrigin: URL } | { readonly assetDirectory: string | readonly string[] });
 
 export class ElectronProtocol extends Context.Service<
   ElectronProtocol,
@@ -209,7 +209,7 @@ const proxyRequest = Effect.fn("desktop.protocol.proxyRequest")(function* (
 
 const serveDesktopAsset = Effect.fn("desktop.protocol.serveAsset")(function* (
   request: Request,
-  assetDirectory: string,
+  assetDirectory: string | readonly string[],
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -222,27 +222,53 @@ const serveDesktopAsset = Effect.fn("desktop.protocol.serveAsset")(function* (
     Effect.orElseSucceed(() => null),
   );
   if (pathname === null || pathname.includes("\0")) return new Response(null, { status: 400 });
-  const root = path.resolve(assetDirectory);
-  const assetPath = path.resolve(root, `.${pathname}`);
-  if (assetPath !== root && !assetPath.startsWith(root + path.sep)) {
-    return new Response(null, { status: 404 });
-  }
-  const stat = yield* fileSystem.stat(assetPath).pipe(Effect.orElseSucceed(() => null));
-  let filePath = assetPath;
-  if (stat?.type !== "File") {
-    const wantsHtml = request.headers.get("accept")?.includes("text/html") ?? false;
-    if (path.extname(assetPath) !== "" && !wantsHtml) {
-      return new Response(null, { status: 404 });
+
+  const directories = typeof assetDirectory === "string" ? [assetDirectory] : assetDirectory;
+  let triedHtmlPath: string | null = null;
+  let primaryRoot: string | null = null;
+
+  for (const dir of directories) {
+    const root = path.resolve(dir);
+    if (primaryRoot === null) primaryRoot = root;
+    const assetPath = path.resolve(root, `.${pathname}`);
+    if (assetPath !== root && !assetPath.startsWith(root + path.sep)) {
+      continue;
     }
-    filePath = path.join(root, "index.html");
+    const stat = yield* fileSystem.stat(assetPath).pipe(Effect.orElseSucceed(() => null));
+    let filePath = assetPath;
+    if (stat?.type !== "File") {
+      const wantsHtml = request.headers.get("accept")?.includes("text/html") ?? false;
+      if (path.extname(assetPath) !== "" && !wantsHtml) {
+        continue;
+      }
+      filePath = path.join(root, "index.html");
+      triedHtmlPath = filePath;
+    }
+    const contents = yield* fileSystem.readFile(filePath).pipe(Effect.orElseSucceed(() => null));
+    if (contents !== null) {
+      return new Response(request.method === "HEAD" ? null : new Uint8Array(contents), {
+        headers: {
+          "content-type": Option.getOrElse(
+            Mime.getType(filePath),
+            () => "application/octet-stream",
+          ),
+        },
+      });
+    }
   }
-  const contents = yield* fileSystem.readFile(filePath).pipe(Effect.orElseSucceed(() => null));
-  if (contents === null) return new Response(null, { status: 404 });
-  return new Response(request.method === "HEAD" ? null : new Uint8Array(contents), {
-    headers: {
-      "content-type": Option.getOrElse(Mime.getType(filePath), () => "application/octet-stream"),
-    },
-  });
+
+  if (triedHtmlPath !== null) {
+    const rootDescription =
+      directories.length > 1
+        ? directories.map((d) => `<code>${path.resolve(d)}</code>`).join(" or ")
+        : `<code>${primaryRoot ?? ""}</code>`;
+    const fallbackHtml = `<!doctype html><html><head><meta charset="utf-8"><title>T3 Code - Client Not Found</title><style>body{background:#0a0a0a;color:#f87171;font-family:system-ui,-apple-system,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;padding:24px;box-sizing:border-box;text-align:center}h2{margin-bottom:8px}code{background:#18181b;color:#e4e4e7;padding:3px 8px;border-radius:4px;font-size:0.9em}p{color:#a1a1aa;max-width:540px;line-height:1.5}</style></head><body><h2>Web client bundle not found</h2><p>Expected client assets at ${rootDescription}.</p><p>Build the desktop client with <code>pnpm build:desktop</code>, or start dev mode with <code>pnpm dev:desktop</code>.</p></body></html>`;
+    return new Response(request.method === "HEAD" ? null : fallbackHtml, {
+      status: 404,
+      headers: { "content-type": "text/html; charset=utf-8" },
+    });
+  }
+  return new Response(null, { status: 404 });
 });
 
 /** @public Service construction is part of the canonical Effect module API. */

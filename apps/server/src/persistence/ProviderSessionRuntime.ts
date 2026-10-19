@@ -389,6 +389,7 @@ export const make = Effect.gen(function* () {
                   { threadId: input.threadId },
                 ),
               ),
+              Effect.asSome,
               Effect.catch((cause) =>
                 Effect.logWarning("provider.session.runtime.decode-failed-clearing-stale", {
                   threadId: input.threadId,
@@ -400,7 +401,6 @@ export const make = Effect.gen(function* () {
                   Effect.as(Option.none<ProviderSessionRuntime>()),
                 ),
               ),
-              Effect.asSome,
             ),
         }),
       ),

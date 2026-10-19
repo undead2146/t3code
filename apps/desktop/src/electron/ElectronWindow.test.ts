@@ -109,7 +109,7 @@ describe("ElectronWindow", () => {
         if (Option.isSome(found)) {
           assert.strictEqual(found.value, mainWindow);
         }
-      }).pipe(Effect.provide(TestLayer)),
+      }).pipe(Effect.provide(layerTest)),
     );
 
     it.effect("finds a secondary window from all windows by its webContents id", () =>
@@ -125,7 +125,7 @@ describe("ElectronWindow", () => {
         if (Option.isSome(found)) {
           assert.strictEqual(found.value, secondaryWindow);
         }
-      }).pipe(Effect.provide(TestLayer)),
+      }).pipe(Effect.provide(layerTest)),
     );
 
     it.effect("returns none when the window is destroyed or does not match", () =>
@@ -139,7 +139,7 @@ describe("ElectronWindow", () => {
 
         assert.isTrue(Option.isNone(foundDestroyed));
         assert.isTrue(Option.isNone(foundMissing));
-      }).pipe(Effect.provide(TestLayer)),
+      }).pipe(Effect.provide(layerTest)),
     );
   });
 

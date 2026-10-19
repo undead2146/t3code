@@ -1,6 +1,11 @@
 import { withAgentDeviceEnvironment } from "@t3tools/provider-core/server/mcpSession";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
-import { AntigravitySettings, ProviderDriverKind, ProviderSetupError } from "@t3tools/contracts";
+import {
+  AntigravitySettings,
+  ProviderDriverKind,
+  ProviderSetupError,
+  ServerProviderModel,
+} from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
 import {
@@ -39,6 +44,7 @@ import {
   type AntigravityAuthConfig,
 } from "../antigravityAuthSupport.ts";
 import {
+  ANTIGRAVITY_ADDITIONAL_MODELS,
   makeAntigravityAcpRuntime,
   type AntigravityAcpRuntimeInput,
 } from "../acp/AntigravityAcpSupport.ts";
@@ -68,6 +74,9 @@ import { discoverAntigravitySkills, resolveAntigravityUserHome } from "./Antigra
 
 const DRIVER = ProviderDriverKind.make("antigravity");
 const decodeSettings = Schema.decodeSync(AntigravitySettings);
+const decodeCachedModels = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Array(ServerProviderModel)),
+);
 const isNodeRuntimeUnavailableError = Schema.is(NodeRuntimeUnavailableError);
 
 export type AntigravityDriverEnv =
@@ -160,7 +169,34 @@ export const AntigravityDriver: ProviderDriver<
       });
       const classifyModels = (draft: ServerProviderDraft) =>
         currentCatalog.pipe(
-          Effect.map((catalog) => stampIdentity(ModelCatalog.applyModelCatalog(draft, catalog))),
+          Effect.map((catalog) => {
+            const isMockCatalog =
+              draft.models.length > 0 &&
+              draft.models.every((model) => model.slug.startsWith("gemini-test-"));
+            if (
+              isMockCatalog ||
+              (draft.models.length === 0 && draft.auth.status !== "authenticated")
+            ) {
+              return stampIdentity(ModelCatalog.applyModelCatalog(draft, catalog));
+            }
+            const baseModels =
+              draft.models.length > 0
+                ? draft.models
+                : (catalog?.models
+                    .filter((entry) => entry.status === "current")
+                    .map((entry) => ModelCatalog.catalogServerModel(catalog, entry)) ?? []);
+            const seen = new Set(baseModels.map((model) => model.slug));
+            const augmentedModels = [...baseModels];
+            for (const extra of ANTIGRAVITY_ADDITIONAL_MODELS) {
+              if (!seen.has(extra.slug)) {
+                seen.add(extra.slug);
+                augmentedModels.push(extra);
+              }
+            }
+            return stampIdentity(
+              ModelCatalog.applyModelCatalog({ ...draft, models: augmentedModels }, catalog),
+            );
+          }),
         );
 
       const makeRuntime = Effect.fn("AntigravityDriver.makeRuntime")(function* (
@@ -388,11 +424,27 @@ export const AntigravityDriver: ProviderDriver<
         Effect.provideService(Crypto.Crypto, crypto),
         Effect.provideService(HttpClient.HttpClient, httpClient),
       );
+      const cachedModelsPath = path.join(profileDirectory, "antigravity-acp", "models.json");
+      const tokenPath = path.join(profileDirectory, "antigravity-acp", "acp_token.json");
       const provider = yield* makeAntigravityProvider(settings, {
         stampIdentity: classifyModels,
         probe,
         probeUsage: usage.probe,
         clearUsage: usage.clear,
+        readCachedModels: fileSystem.readFileString(cachedModelsPath).pipe(
+          Effect.flatMap(decodeCachedModels),
+          Effect.orElseSucceed(() => []),
+        ),
+        writeCachedModels: (models) =>
+          fileSystem
+            .makeDirectory(path.dirname(cachedModelsPath), { recursive: true })
+            .pipe(
+              Effect.andThen(
+                fileSystem.writeFileString(cachedModelsPath, JSON.stringify(models, null, 2)),
+              ),
+              Effect.ignore,
+            ),
+        checkAuthenticated: fileSystem.exists(tokenPath).pipe(Effect.orElseSucceed(() => false)),
         auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
         supportsTextGeneration: isAntigravityTextGenerationAvailable(profileDirectory).pipe(
           Effect.provideService(FileSystem.FileSystem, fileSystem),

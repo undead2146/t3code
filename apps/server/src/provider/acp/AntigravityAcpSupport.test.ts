@@ -228,11 +228,7 @@ describe("isSupportedAntigravityModel", () => {
   });
 
   it("recognizes native options", () => {
-    expect(
-      isSupportedAntigravityModel("gemini-default", [
-        { value: "gemini-default", name: "Gemini Default" },
-      ]),
-    ).toBe(true);
+    expect(isSupportedAntigravityModel("gemini-default", [{ value: "gemini-default" }])).toBe(true);
   });
 
   it("rejects unknown arbitrary models", () => {

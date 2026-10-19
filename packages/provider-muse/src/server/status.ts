@@ -119,7 +119,7 @@ export const checkMuseProviderStatus = Effect.fn("checkMuseProviderStatus")(func
 
   const catalog = yield* discoverMuseModels(settings, museEnvironment, cwd, createHost).pipe(
     Effect.scoped,
-    Effect.timeoutOption(12_000),
+    Effect.timeoutOption(25_000),
     Effect.result,
   );
   if (Result.isFailure(catalog) || Option.isNone(catalog.success)) {
